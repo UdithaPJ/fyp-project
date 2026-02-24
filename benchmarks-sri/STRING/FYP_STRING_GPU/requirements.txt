@@ -1,0 +1,8 @@
+pandas
+numpy
+scipy
+networkx
+python-louvain
+matplotlib
+cudf
+cugraph
