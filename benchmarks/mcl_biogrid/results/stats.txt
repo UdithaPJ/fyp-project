@@ -1,0 +1,8 @@
+BIOGRID PPI STATS (for MCL)
+--------------------------
+TAXID_FILTER: 9606
+Nodes: 20,420
+Undirected edges: 932,560
+CSR nnz (directed): 1,865,120
+Average degree (directed): 91.34
+Density: 0.004473

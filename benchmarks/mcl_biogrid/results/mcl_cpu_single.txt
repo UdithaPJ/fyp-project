@@ -1,0 +1,27 @@
+Loaded CSR: n=20,420 nnz=1,865,120 load_time=0.10s
+Params: R=2.0 TAU=1e-06 MAX_ITERS=60 TOL=1e-09
+iter=01 nnz=2,636,407 err=1.000e+00 iter_time=6.85s
+iter=02 nnz=2,594,135 err=5.840e-01 iter_time=2.08s
+iter=03 nnz=1,109,509 err=7.203e-01 iter_time=1.59s
+iter=04 nnz=313,588 err=8.127e-01 iter_time=0.31s
+iter=05 nnz=106,543 err=7.777e-01 iter_time=0.04s
+iter=06 nnz=47,966 err=6.162e-01 iter_time=0.01s
+iter=07 nnz=29,706 err=6.619e-01 iter_time=0.01s
+iter=08 nnz=23,766 err=4.896e-01 iter_time=0.01s
+iter=09 nnz=21,461 err=4.001e-01 iter_time=0.01s
+iter=10 nnz=20,432 err=4.001e-01 iter_time=0.01s
+iter=11 nnz=19,961 err=2.800e-01 iter_time=0.01s
+iter=12 nnz=19,746 err=4.000e-01 iter_time=0.01s
+iter=13 nnz=19,648 err=3.351e-01 iter_time=0.00s
+iter=14 nnz=19,593 err=2.805e-01 iter_time=0.01s
+iter=15 nnz=19,499 err=3.910e-01 iter_time=0.01s
+iter=16 nnz=19,475 err=1.600e-01 iter_time=0.00s
+iter=17 nnz=19,469 err=1.182e-01 iter_time=0.00s
+iter=18 nnz=19,468 err=1.373e-01 iter_time=0.01s
+iter=19 nnz=19,404 err=1.365e-01 iter_time=0.00s
+iter=20 nnz=19,404 err=4.715e-02 iter_time=0.00s
+iter=21 nnz=19,404 err=2.744e-03 iter_time=0.00s
+iter=22 nnz=19,403 err=7.629e-06 iter_time=0.01s
+iter=23 nnz=19,403 err=0.000e+00 iter_time=0.00s
+
+CPU SINGLE DONE | final nnz=19,403 | total_time=10.99s
