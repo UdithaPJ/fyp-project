@@ -1,0 +1,8 @@
+=== MCL CPU MULTI (8 threads) ===
+CSR: data_processed/humanppi_80_csr.npz
+Nodes: 12298
+NNZ: 58514
+Clusters: 10427
+Largest cluster: 3
+Mean cluster: 1.1794
+Runtime_sec: 3.270065

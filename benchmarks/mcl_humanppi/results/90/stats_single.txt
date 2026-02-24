@@ -1,0 +1,8 @@
+=== MCL CPU SINGLE ===
+CSR: data_processed/humanppi_90_csr.npz
+Nodes: 9806
+NNZ: 35698
+Clusters: 8251
+Largest cluster: 4
+Mean cluster: 1.1885
+Runtime_sec: 3.842075
