@@ -1,0 +1,6 @@
+TRRUST HUMAN GRN STATS (for BFS)
+-------------------------------
+Nodes: 2,861
+Edges (directed): 8,403
+Avg out-degree: 2.94
+Max out-degree: 472

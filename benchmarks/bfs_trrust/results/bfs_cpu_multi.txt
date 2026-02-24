@@ -1,0 +1,10 @@
+Loaded CSR: n=2,861 nnz=8,403 load_time=0.00s
+Workload: NUM_SOURCES=2048 SOURCE_MODE=top_degree N_PROCS=4
+Selected sources: 2048
+
+CPU MULTI BFS SUMMARY
+Total BFS runs: 2048
+Total visited (sum over runs): 1,071,245
+Avg depth (per run): 1.91
+Max depth seen: 11
+Total BFS time: 2.92s

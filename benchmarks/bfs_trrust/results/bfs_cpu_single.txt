@@ -1,0 +1,20 @@
+Loaded CSR: n=2,861 nnz=8,403 load_time=0.00s
+Workload: NUM_SOURCES=1024 SOURCE_MODE=top_degree SEED=42
+Selected sources: 1024
+progress 100/1024 | last_visited=2280 last_depth=8
+progress 200/1024 | last_visited=2278 last_depth=9
+progress 300/1024 | last_visited=2282 last_depth=8
+progress 400/1024 | last_visited=4 last_depth=1
+progress 500/1024 | last_visited=2279 last_depth=8
+progress 600/1024 | last_visited=2 last_depth=1
+progress 700/1024 | last_visited=2 last_depth=1
+progress 800/1024 | last_visited=1 last_depth=0
+progress 900/1024 | last_visited=1 last_depth=0
+progress 1000/1024 | last_visited=1 last_depth=0
+
+CPU SINGLE BFS SUMMARY
+Total BFS runs: 1024
+Total visited (sum over runs): 1,070,221
+Avg depth (per run): 3.81
+Max depth seen: 11
+Total BFS time: 3.35s
