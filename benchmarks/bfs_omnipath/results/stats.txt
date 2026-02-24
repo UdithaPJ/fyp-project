@@ -1,0 +1,48 @@
+OMNIPATH HUMAN GRN STATS (for MBFS)
+----------------------------------
+RAW_FILE: data_raw/omnipath/omnipathdb.org.tsv
+TOTAL CLEAN EDGES: 15,267
+TOTAL NODES: 5,273
+
+[grn_all]
+  nodes=5,273 edges=15,267
+  avg_out=2.90 max_out=727 density=0.00054919
+  top_hubs(node_id,out_deg)=[(1863, 727), (3270, 620), (1323, 589), (1838, 563), (1862, 555)]
+  build_time=0.03s
+
+[grn_directed]
+  nodes=5,273 edges=15,267
+  avg_out=2.90 max_out=727 density=0.00054919
+  top_hubs(node_id,out_deg)=[(1863, 727), (3270, 620), (1323, 589), (1838, 563), (1862, 555)]
+  build_time=0.03s
+
+[grn_stimulation]
+  nodes=5,273 edges=4,855
+  avg_out=0.92 max_out=361 density=0.00017464
+  top_hubs(node_id,out_deg)=[(850, 361), (1541, 325), (918, 189), (949, 157), (1, 157)]
+  build_time=0.01s
+
+[grn_inhibition]
+  nodes=5,273 edges=941
+  avg_out=0.18 max_out=67 density=0.00003385
+  top_hubs(node_id,out_deg)=[(918, 67), (1898, 41), (949, 33), (3270, 32), (2204, 32)]
+  build_time=0.01s
+
+[grn_consensus_direction]
+  nodes=5,273 edges=5,490
+  avg_out=1.04 max_out=377 density=0.00019749
+  top_hubs(node_id,out_deg)=[(850, 377), (1541, 333), (918, 233), (1863, 171), (1, 167)]
+  build_time=0.01s
+
+[grn_consensus_stimulation]
+  nodes=5,273 edges=4,756
+  avg_out=0.90 max_out=353 density=0.00017108
+  top_hubs(node_id,out_deg)=[(850, 353), (1541, 321), (918, 178), (949, 155), (1, 155)]
+  build_time=0.01s
+
+[grn_consensus_inhibition]
+  nodes=5,273 edges=738
+  avg_out=0.14 max_out=55 density=0.00002655
+  top_hubs(node_id,out_deg)=[(918, 55), (3270, 31), (2204, 31), (850, 24), (4810, 22)]
+  build_time=0.01s
+

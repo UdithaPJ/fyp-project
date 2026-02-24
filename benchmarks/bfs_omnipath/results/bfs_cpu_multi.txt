@@ -1,0 +1,34 @@
+CPU MULTI MBFS (multiprocessing)
+NUM_SOURCES=4096 SOURCE_MODE=top_degree SEED=42 N_PROCS=4
+VARIANTS=['grn_all.npz', 'grn_directed.npz', 'grn_stimulation.npz', 'grn_inhibition.npz', 'grn_consensus_direction.npz', 'grn_consensus_stimulation.npz', 'grn_consensus_inhibition.npz']
+
+
+[grn_all.npz] n=5,273 edges=15,267 runs=4096
+  total_visited_sum=872,444 avg_depth=0.33 max_depth=10
+  variant_time=2.73s
+
+[grn_directed.npz] n=5,273 edges=15,267 runs=4096
+  total_visited_sum=872,444 avg_depth=0.33 max_depth=10
+  variant_time=2.43s
+
+[grn_stimulation.npz] n=5,273 edges=4,855 runs=4096
+  total_visited_sum=241,752 avg_depth=0.29 max_depth=13
+  variant_time=1.43s
+
+[grn_inhibition.npz] n=5,273 edges=941 runs=4096
+  total_visited_sum=14,932 avg_depth=0.13 max_depth=9
+  variant_time=1.19s
+
+[grn_consensus_direction.npz] n=5,273 edges=5,490 runs=4096
+  total_visited_sum=329,993 avg_depth=0.37 max_depth=13
+  variant_time=1.68s
+
+[grn_consensus_stimulation.npz] n=5,273 edges=4,756 runs=4096
+  total_visited_sum=195,637 avg_depth=0.25 max_depth=11
+  variant_time=1.50s
+
+[grn_consensus_inhibition.npz] n=5,273 edges=738 runs=4096
+  total_visited_sum=8,764 avg_depth=0.10 max_depth=9
+  variant_time=1.59s
+
+TOTAL CPU MULTI TIME (sum variants): 12.55s
