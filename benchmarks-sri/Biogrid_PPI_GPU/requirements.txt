@@ -4,3 +4,5 @@ scipy
 cudf
 cugraph
 matplotlib
+networkx
+python-louvain

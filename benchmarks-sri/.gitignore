@@ -1,9 +1,5 @@
-biogrid_homoshapheains/BIOGRID-ORGANISM-5.0.254.tab3
-biogrid_homoshapheains/BIOGRID-ORGANISM-5.0.254.tab3.zip
-biogrid_homoshapheains/python_files/protein_venv
-biogrid_homoshapheains/python_files/FYP_PPI_GPU/data
-
 STRING/compressed_data_file
 STRING/FYP_STRING_GPU/data
 
-
+Biogrid_PPI_GPU/FYP_PPI_GPU_venv
+Biogrid_PPI_GPU/data

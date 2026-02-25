@@ -47,6 +47,32 @@ def preprocess_biogrid(input_path, output_dir):
 
     node2id = {node: i for i, node in enumerate(unique_nodes)}
 
+    # Save reverse mapping
+    id2node = {i: node for node, i in node2id.items()}
+
+    # Save reverse mapping
+    id2node = {i: node for node, i in node2id.items()}
+
+    mapping_df = pd.DataFrame({
+        "Node_ID": list(id2node.keys()),
+        "Protein": list(id2node.values())
+    })
+
+    mapping_df.to_csv(
+        os.path.join(output_dir, "id_to_protein.csv"),
+        index=False
+    )
+
+    mapping_df = pd.DataFrame({
+        "Node_ID": list(id2node.keys()),
+        "Protein": list(id2node.values())
+    })
+
+    mapping_df.to_csv(
+        os.path.join(output_dir, "id_to_protein.csv"),
+        index=False
+    )
+
     ppi["src"] = ppi.iloc[:, 0].map(node2id)
     ppi["dst"] = ppi.iloc[:, 1].map(node2id)
 
