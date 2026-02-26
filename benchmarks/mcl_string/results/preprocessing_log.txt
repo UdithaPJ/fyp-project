@@ -1,3 +1,63 @@
+STRING PPI PREPROCESSING LOG
+============================================================
+
+
+======================================================================
+STRING PROTEIN-PROTEIN INTERACTION PREPROCESSING
+======================================================================
+
+
+Configuration:
+  Raw file: data_raw/string/9606.protein.links.full.v12.0.txt
+  Output dir: data_processed/ppi_mcl
+  Results dir: results
+  Score minimum: 0
+  Max edges: unlimited
+  Save edges CSV: True
+
+
+[1/7] Detecting STRING columns...
+  Columns found: protein1, protein2, neighborhood, neighborhood_transferred, fusion, cooccurence, homology, coexpression, coexpression_transferred, experiments, experiments_transferred, database, database_transferred, textmining, textmining_transferred, combined_score
+
+[2/7] Loading STRING data...
+  Rows loaded: 13,715,404
+  Time: 17.82s
+  Memory: 263.9 MB
+
+[3/7] Filtering data...
+  Initial rows: 13,715,404
+  After species filter: 13,715,404 (removed 0)
+  After score filter (>=0): 13,715,404 (removed 0)
+  Time: 6.98s
+
+[4/7] Building undirected edge list...
+  Self-loops removed: 0
+  Duplicate edges removed: 6,857,702
+  Final undirected edges: 6,857,702
+  Time: 18.36s
+
+[5/7] Creating node mapping...
+  Unique nodes: 19,622
+  Time: 0.84s
+
+[6/7] Saving edges CSV...
+  Saved: data_processed/ppi_mcl/ppi_edges.csv
+  Size: 313.92 MB
+  Time: 90.66s
+
+[7/7] Building and saving CSR matrix...
+  Saved: data_processed/ppi_mcl/node_map.json
+  Size: 621.5 KB
+  Time: 0.10s
+
+[8/8] Building weighted CSR adjacency matrix...
+  Saved: data_processed/ppi_mcl/ppi_csr.npz
+  NNZ (non-zero): 13,715,404
+  Size: 46.66 MB
+  Time: 7.79s
+
+[STATS] Computing network statistics...
+
 ======================================================================
 STRING HUMAN PPI NETWORK FOR MCL CLUSTERING
 ======================================================================
@@ -64,3 +124,10 @@ NOTES
 - Edge weights normalized to [0,1] range for MCL algorithm
 - All proteins are homo sapiens with 9606. prefix
 ======================================================================
+
+
+✓ PREPROCESSING COMPLETE
+  - All output files saved to: data_processed/ppi_mcl and results
+  - JSON stats available: results/stats.json
+  - Full logs available: results/preprocessing_log.txt
+

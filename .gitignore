@@ -1,2 +1,5 @@
 venv/
 .venv/
+
+IMPLEMENTATION_SUMMARY.md
+OUTPUT_FILES_GUIDE.md

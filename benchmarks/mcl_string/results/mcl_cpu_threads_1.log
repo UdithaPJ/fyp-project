@@ -1,0 +1,96 @@
+================================================================================
+MCL ALGORITHM - CPU WORKER PROCESS
+================================================================================
+
+Configuration:
+  Threads: 1
+    OMP_NUM_THREADS: 1
+    MKL_NUM_THREADS: 1
+    OPENBLAS_NUM_THREADS: 1
+    BLIS_NUM_THREADS: 1
+    NUMEXPR_NUM_THREADS: 1
+
+MCL Parameters:
+  Inflation (R): 2.0
+  Pruning threshold (TAU): 1e-06
+  Max iterations: 60
+  Convergence tolerance: 1e-09
+
+Input/Output:
+  CSR file: data_processed/ppi_mcl/ppi_csr.npz
+  Results dir: results
+
+Loading data...
+✓ Loaded: 19,622 nodes, 13,715,404 edges
+  Load time: 0.400s
+  Memory: 104.8 MB
+
+Running MCL algorithm...
+
+  iter=01 | nnz=329,541 | err=1.000e+00 | time=42.925s
+  iter=02 | nnz=601,422 | err=7.823e-01 | time=0.074s
+  iter=03 | nnz=361,392 | err=7.682e-01 | time=0.118s
+  iter=04 | nnz=157,146 | err=8.549e-01 | time=0.045s
+  iter=05 | nnz=77,846 | err=9.456e-01 | time=0.013s
+  iter=06 | nnz=48,939 | err=8.730e-01 | time=0.006s
+  iter=07 | nnz=33,410 | err=7.395e-01 | time=0.004s
+  iter=08 | nnz=28,554 | err=5.093e-01 | time=0.003s
+  iter=09 | nnz=23,442 | err=4.804e-01 | time=0.003s
+  iter=10 | nnz=21,059 | err=3.951e-01 | time=0.003s
+  iter=11 | nnz=20,097 | err=2.976e-01 | time=0.003s
+  iter=12 | nnz=19,683 | err=1.501e-01 | time=0.003s
+  iter=13 | nnz=19,615 | err=3.084e-01 | time=0.003s
+  iter=14 | nnz=19,585 | err=3.205e-01 | time=0.004s
+  iter=15 | nnz=19,571 | err=1.501e-01 | time=0.003s
+  iter=16 | nnz=19,565 | err=1.403e-01 | time=0.003s
+  iter=17 | nnz=19,563 | err=1.411e-01 | time=0.003s
+  iter=18 | nnz=19,557 | err=5.474e-02 | time=0.003s
+  iter=19 | nnz=19,556 | err=3.845e-03 | time=0.003s
+  iter=20 | nnz=19,555 | err=1.502e-05 | time=0.003s
+  iter=21 | nnz=19,555 | err=0.000e+00 | time=0.003s
+  Converged at iteration 21
+
+================================================================================
+MCL CLUSTERING RESULTS
+================================================================================
+Final matrix NNZ: 19,555
+MCL time: 43.230s
+Total time: 43.630s
+Peak memory: 105.0 MB
+
+Extracting clusters...
+✓ Found 6726 clusters
+  Cluster sizes (top 10): [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+  Min cluster size: 1
+  Max cluster size: 1
+  Avg cluster size: 1.0
+  Analysis time: 2.405s
+
+Ranking top proteins by cluster influence...
+Top 20 proteins by cluster influence:
+--------------------------------------------------------------------------------
+Rank  Protein ID                     Cluster  Cluster Size   Influence   
+--------------------------------------------------------------------------------
+1     9606.ENSP00000001008           2        1              2.000000
+2     9606.ENSP00000004531           11       1              2.000000
+3     9606.ENSP00000004982           12       1              2.000000
+4     9606.ENSP00000005286           18       1              2.000000
+5     9606.ENSP00000005386           20       1              2.000000
+6     9606.ENSP00000005587           21       1              2.000000
+7     9606.ENSP00000005995           18868    1              2.000000
+8     9606.ENSP00000006526           26       1              2.000000
+9     9606.ENSP00000006658           27       1              2.000000
+10    9606.ENSP00000006724           28       1              2.000000
+11    9606.ENSP00000006777           29       1              2.000000
+12    9606.ENSP00000007390           30       1              2.000000
+13    9606.ENSP00000007414           31       1              2.000000
+14    9606.ENSP00000007699           32       1              2.000000
+15    9606.ENSP00000008391           34       1              2.000000
+16    9606.ENSP00000008527           4108     1              2.000000
+17    9606.ENSP00000009105           38       1              2.000000
+18    9606.ENSP00000009530           14564    1              2.000000
+19    9606.ENSP00000010299           40       1              2.000000
+20    9606.ENSP00000011473           42       1              2.000000
+--------------------------------------------------------------------------------
+
+Saving results...

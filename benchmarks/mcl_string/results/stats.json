@@ -1,0 +1,52 @@
+{
+  "metadata": {
+    "algorithm": "MCL (Markov Clustering)",
+    "database": "STRING v12.0 Human PPI",
+    "timestamp": "2026-02-26T14:47:14.329606",
+    "organism": "Homo sapiens (NCBI ID: 9606)"
+  },
+  "input": {
+    "raw_file": "data_raw/string/9606.protein.links.full.v12.0.txt",
+    "file_size_mb": "data_raw/string/9606.protein.links.full.v12.0.txt"
+  },
+  "parameters": {
+    "score_minimum": 0,
+    "max_edges": "unlimited"
+  },
+  "output_files": {
+    "csr_matrix": "data_processed/ppi_mcl/ppi_csr.npz",
+    "node_mapping": "data_processed/ppi_mcl/node_map.json",
+    "edge_list": "data_processed/ppi_mcl/ppi_edges.csv",
+    "statistics": "results/stats.txt",
+    "logs": "results/preprocessing_log.txt"
+  },
+  "network": {
+    "nodes": 19622,
+    "undirected_edges": 6857702,
+    "csr_nnz_directed": 13715404,
+    "density": 0.035624124140537804,
+    "connected_components": 1
+  },
+  "degrees": {
+    "min": 1,
+    "max": 9357,
+    "mean": 698.9809397614922,
+    "median": 546.0,
+    "std_dev": 587.4568441340004
+  },
+  "edge_weights": {
+    "combined_score_min": 150.0,
+    "combined_score_quantile_25": 171.0,
+    "combined_score_median": 209.0,
+    "combined_score_quantile_75": 298.0,
+    "combined_score_max": 999.0,
+    "combined_score_mean": 268.6240539550781,
+    "combined_score_std": 156.98280334472656,
+    "normalized_to_0_1": true
+  },
+  "performance": {
+    "total_time_seconds": 143.14849357099956,
+    "peak_memory_mb": 948.5940942764282,
+    "statistics_time_seconds": 0.6000528160002432
+  }
+}
