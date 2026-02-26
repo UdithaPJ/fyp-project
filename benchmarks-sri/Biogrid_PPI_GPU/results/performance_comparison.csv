@@ -1,3 +1,3 @@
-Algorithm,CPU Time (s),GPU Time (s),Speedup (x),Improvement (%),CPU Modularity,GPU Modularity
-PageRank,2.2481,0.0805,27.93,96.42,-,-
-Louvain,29.7187,1.4666,20.26,95.07,0.2997,0.3025
+Algorithm,CPU Best Threads,CPU Time (s),GPU Time (s),GPU Speedup vs Best CPU
+PageRank,1,3.05,0.0333,91.69
+Louvain,8,27.012,1.2997,20.78

@@ -1,13 +1,14 @@
 
-===== NETWORK SUMMARY =====
-Total Proteins (Nodes): 27295
-Total Interactions (Edges): 997442
+    ===== NETWORK SUMMARY =====
+    Total Proteins (Nodes): 27295
+    Total Interactions (Edges): 997442
 
-===== LOUVAIN SUMMARY =====
-Number of Communities: 10
-Largest Community Size: 5604
-Average Community Size: 2729.50
+    ===== LOUVAIN SUMMARY =====
+    Number of Communities: 10
+    Largest Community Size: 5604
+    Average Community Size: 2729.50
 
-===== PERFORMANCE =====
-PageRank Speedup: 27.93x
-Louvain Speedup: 20.26x
+    ===== PERFORMANCE =====
+    PageRank Speedup (vs Best CPU): 91.69x
+    Louvain Speedup (vs Best CPU): 20.78x
+    

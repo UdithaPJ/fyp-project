@@ -22,16 +22,20 @@ def main():
 
     mapping_df = pd.read_csv("data/processed/id_to_protein.csv")
 
-    comparison_df, pr_cpu, pr_gpu, part_cpu, part_gpu = benchmark_all(
+    comparison_df, pr_gpu, part_gpu = benchmark_all(
         csr,
         run_cpu_pagerank,
         run_gpu_pagerank,
         run_cpu_louvain,
-        run_gpu_louvain
+        run_gpu_louvain,
+        thread_list=[1, 2, 4, 8]
     )
 
     print("\n=== Performance Comparison ===")
     print(comparison_df)
+    print("\n=== CPU Thread Scaling Details ===")
+    cpu_thread_df = pd.read_csv("results/cpu_thread_scaling_raw.csv")
+    print(cpu_thread_df)
 
     comparison_df.to_csv(
         os.path.join(RESULTS_DIR, "performance_comparison.csv"),
@@ -72,10 +76,42 @@ def main():
     # LOUVAIN SECTION
     # ===========================
 
-    part_gpu.to_csv(
-        os.path.join(RESULTS_DIR, "gpu_louvain_communities.csv"),
+    # Merge community assignments with protein names
+    part_gpu_named = part_gpu.merge(
+        mapping_df,
+        left_on="vertex",
+        right_on="Node_ID",
+        how="left"
+    )
+
+    # Clean columns
+    part_gpu_named = part_gpu_named[["Protein", "partition"]]
+    part_gpu_named.columns = ["Protein", "Community"]
+
+    # Save named communities
+    part_gpu_named.to_csv(
+        os.path.join(RESULTS_DIR, "gpu_louvain_communities_named.csv"),
         index=False
     )
+
+    # Compute community sizes
+    gpu_community_sizes = part_gpu_named["Community"].value_counts()
+    gpu_community_sizes = gpu_community_sizes.reset_index()
+    gpu_community_sizes.columns = ["Community", "Size"]
+
+    gpu_community_sizes.to_csv(
+        os.path.join(RESULTS_DIR, "gpu_louvain_community_sizes.csv"),
+        index=False
+    )
+
+    num_communities = len(gpu_community_sizes)
+    largest_community = gpu_community_sizes["Size"].max()
+    avg_community_size = gpu_community_sizes["Size"].mean()
+
+    print("\n=== Louvain Summary (GPU) ===")
+    print(f"Number of Communities: {num_communities}")
+    print(f"Largest Community Size: {largest_community}")
+    print(f"Average Community Size: {avg_community_size:.2f}")
 
     gpu_community_sizes = part_gpu["partition"].value_counts()
     gpu_community_sizes = gpu_community_sizes.reset_index()
@@ -108,20 +144,22 @@ def main():
     # PERFORMANCE PLOTS
     # ===========================
 
+    # PageRank
     plt.figure()
-    plt.bar(["CPU", "GPU"],
+    plt.bar(["Best CPU", "GPU"],
             [comparison_df.loc[0, "CPU Time (s)"],
-             comparison_df.loc[0, "GPU Time (s)"]])
-    plt.title("PageRank: CPU vs GPU Execution Time")
+            comparison_df.loc[0, "GPU Time (s)"]])
+    plt.title("PageRank: Best CPU vs GPU Execution Time")
     plt.ylabel("Time (seconds)")
     plt.savefig(os.path.join(RESULTS_DIR, "pagerank_performance.png"))
     plt.close()
 
+    # Louvain
     plt.figure()
-    plt.bar(["CPU", "GPU"],
+    plt.bar(["Best CPU", "GPU"],
             [comparison_df.loc[1, "CPU Time (s)"],
-             comparison_df.loc[1, "GPU Time (s)"]])
-    plt.title("Louvain: CPU vs GPU Execution Time")
+            comparison_df.loc[1, "GPU Time (s)"]])
+    plt.title("Louvain: Best CPU vs GPU Execution Time")
     plt.ylabel("Time (seconds)")
     plt.savefig(os.path.join(RESULTS_DIR, "louvain_performance.png"))
     plt.close()
@@ -134,19 +172,19 @@ def main():
     num_edges = csr.nnz // 2
 
     summary = f"""
-===== NETWORK SUMMARY =====
-Total Proteins (Nodes): {num_nodes}
-Total Interactions (Edges): {num_edges}
+    ===== NETWORK SUMMARY =====
+    Total Proteins (Nodes): {num_nodes}
+    Total Interactions (Edges): {num_edges}
 
-===== LOUVAIN SUMMARY =====
-Number of Communities: {num_communities}
-Largest Community Size: {largest_community}
-Average Community Size: {avg_community_size:.2f}
+    ===== LOUVAIN SUMMARY =====
+    Number of Communities: {num_communities}
+    Largest Community Size: {largest_community}
+    Average Community Size: {avg_community_size:.2f}
 
-===== PERFORMANCE =====
-PageRank Speedup: {comparison_df.loc[0, "Speedup (x)"]}x
-Louvain Speedup: {comparison_df.loc[1, "Speedup (x)"]}x
-"""
+    ===== PERFORMANCE =====
+    PageRank Speedup (vs Best CPU): {comparison_df.loc[0, "GPU Speedup vs Best CPU"]}x
+    Louvain Speedup (vs Best CPU): {comparison_df.loc[1, "GPU Speedup vs Best CPU"]}x
+    """
 
     print(summary)
 
