@@ -1,0 +1,581 @@
+================================================================================
+MCL ALGORITHM - CPU WORKER PROCESS
+================================================================================
+
+Configuration:
+  Threads: 2
+    OMP_NUM_THREADS: 2
+    MKL_NUM_THREADS: 2
+    OPENBLAS_NUM_THREADS: 2
+    BLIS_NUM_THREADS: 2
+    NUMEXPR_NUM_THREADS: 2
+
+MCL Parameters:
+  Inflation (R): 3
+  Pruning threshold (TAU): 1e-12
+  Max iterations: 500
+  Convergence tolerance: 0.0
+
+Input/Output:
+  CSR file: data_processed/ppi_mcl/ppi_csr.npz
+  Results dir: results_cpu_20260226_203708
+
+Loading data...
+✓ Loaded: 19,622 nodes, 13,715,404 edges
+  Load time: 0.404s
+  Memory: 104.8 MB
+
+Running MCL algorithm...
+
+  iter=01 | nnz=45,965,358 | err=1.000e+00 | time=44.720s
+  iter=02 | nnz=23,958,157 | err=9.176e-01 | time=248.551s
+  iter=03 | nnz=2,333,758 | err=9.449e-01 | time=73.519s
+  iter=04 | nnz=269,669 | err=9.953e-01 | time=0.979s
+  iter=05 | nnz=59,251 | err=9.914e-01 | time=0.030s
+  iter=06 | nnz=31,197 | err=7.625e-01 | time=0.006s
+  iter=07 | nnz=23,981 | err=7.741e-01 | time=0.003s
+  iter=08 | nnz=20,004 | err=3.591e-01 | time=0.003s
+  iter=09 | nnz=19,670 | err=4.736e-01 | time=0.003s
+  iter=10 | nnz=19,637 | err=2.264e-01 | time=0.003s
+  iter=11 | nnz=19,625 | err=2.030e-01 | time=0.002s
+  iter=12 | nnz=19,624 | err=1.576e-01 | time=0.003s
+  iter=13 | nnz=19,623 | err=7.699e-03 | time=0.003s
+  iter=14 | nnz=19,622 | err=5.364e-07 | time=0.002s
+  iter=15 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=16 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=17 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=18 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=19 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=20 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=21 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=22 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=23 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=24 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=25 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=26 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=27 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=28 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=29 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=30 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=31 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=32 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=33 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=34 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=35 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=36 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=37 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=38 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=39 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=40 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=41 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=42 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=43 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=44 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=45 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=46 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=47 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=48 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=49 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=50 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=51 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=52 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=53 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=54 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=55 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=56 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=57 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=58 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=59 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=60 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=61 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=62 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=63 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=64 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=65 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=66 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=67 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=68 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=69 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=70 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=71 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=72 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=73 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=74 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=75 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=76 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=77 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=78 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=79 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=80 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=81 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=82 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=83 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=84 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=85 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=86 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=87 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=88 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=89 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=90 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=91 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=92 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=93 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=94 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=95 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=96 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=97 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=98 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=99 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=100 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=101 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=102 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=103 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=104 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=105 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=106 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=107 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=108 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=109 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=110 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=111 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=112 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=113 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=114 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=115 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=116 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=117 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=118 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=119 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=120 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=121 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=122 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=123 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=124 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=125 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=126 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=127 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=128 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=129 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=130 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=131 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=132 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=133 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=134 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=135 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=136 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=137 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=138 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=139 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=140 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=141 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=142 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=143 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=144 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=145 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=146 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=147 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=148 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=149 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=150 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=151 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=152 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=153 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=154 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=155 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=156 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=157 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=158 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=159 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=160 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=161 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=162 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=163 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=164 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=165 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=166 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=167 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=168 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=169 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=170 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=171 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=172 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=173 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=174 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=175 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=176 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=177 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=178 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=179 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=180 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=181 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=182 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=183 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=184 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=185 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=186 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=187 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=188 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=189 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=190 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=191 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=192 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=193 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=194 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=195 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=196 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=197 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=198 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=199 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=200 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=201 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=202 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=203 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=204 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=205 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=206 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=207 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=208 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=209 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=210 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=211 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=212 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=213 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=214 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=215 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=216 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=217 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=218 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=219 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=220 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=221 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=222 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=223 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=224 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=225 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=226 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=227 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=228 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=229 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=230 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=231 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=232 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=233 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=234 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=235 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=236 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=237 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=238 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=239 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=240 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=241 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=242 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=243 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=244 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=245 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=246 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=247 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=248 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=249 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=250 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=251 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=252 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=253 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=254 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=255 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=256 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=257 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=258 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=259 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=260 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=261 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=262 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=263 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=264 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=265 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=266 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=267 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=268 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=269 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=270 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=271 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=272 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=273 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=274 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=275 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=276 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=277 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=278 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=279 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=280 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=281 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=282 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=283 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=284 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=285 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=286 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=287 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=288 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=289 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=290 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=291 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=292 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=293 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=294 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=295 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=296 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=297 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=298 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=299 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=300 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=301 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=302 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=303 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=304 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=305 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=306 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=307 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=308 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=309 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=310 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=311 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=312 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=313 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=314 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=315 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=316 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=317 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=318 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=319 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=320 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=321 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=322 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=323 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=324 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=325 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=326 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=327 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=328 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=329 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=330 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=331 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=332 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=333 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=334 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=335 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=336 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=337 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=338 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=339 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=340 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=341 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=342 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=343 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=344 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=345 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=346 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=347 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=348 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=349 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=350 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=351 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=352 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=353 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=354 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=355 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=356 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=357 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=358 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=359 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=360 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=361 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=362 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=363 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=364 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=365 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=366 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=367 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=368 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=369 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=370 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=371 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=372 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=373 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=374 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=375 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=376 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=377 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=378 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=379 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=380 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=381 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=382 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=383 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=384 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=385 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=386 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=387 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=388 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=389 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=390 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=391 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=392 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=393 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=394 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=395 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=396 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=397 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=398 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=399 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=400 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=401 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=402 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=403 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=404 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=405 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=406 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=407 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=408 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=409 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=410 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=411 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=412 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=413 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=414 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=415 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=416 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=417 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=418 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=419 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=420 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=421 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=422 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=423 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=424 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=425 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=426 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=427 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=428 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=429 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=430 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=431 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=432 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=433 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=434 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=435 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=436 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=437 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=438 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=439 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=440 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=441 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=442 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=443 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=444 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=445 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=446 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=447 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=448 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=449 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=450 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=451 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=452 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=453 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=454 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=455 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=456 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=457 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=458 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=459 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=460 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=461 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=462 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=463 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=464 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=465 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=466 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=467 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=468 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=469 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=470 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=471 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=472 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=473 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=474 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=475 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=476 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=477 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=478 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=479 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=480 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=481 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=482 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=483 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=484 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=485 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=486 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=487 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=488 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=489 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=490 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=491 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=492 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=493 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=494 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=495 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=496 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=497 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=498 | nnz=19,622 | err=0.000e+00 | time=0.003s
+  iter=499 | nnz=19,622 | err=0.000e+00 | time=0.002s
+  iter=500 | nnz=19,622 | err=0.000e+00 | time=0.002s
+
+================================================================================
+MCL CLUSTERING RESULTS
+================================================================================
+Final matrix NNZ: 19,622
+MCL time: 369.065s
+Total time: 369.468s
+Peak memory: 105.2 MB
+
+Extracting clusters...
+✓ Found 5361 clusters
+  Cluster sizes (top 10): [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+  Min cluster size: 1
+  Max cluster size: 1
+  Avg cluster size: 1.0
+  Analysis time: 2.042s
+
+Ranking top proteins by cluster influence...
+Top 20 proteins by cluster influence:
+--------------------------------------------------------------------------------
+Rank  Protein ID                     Cluster  Cluster Size   Influence   
+--------------------------------------------------------------------------------
+1     9606.ENSP00000002165           5        1              2.000000
+2     9606.ENSP00000005226           14       1              2.000000
+3     9606.ENSP00000005286           18       1              2.000000
+4     9606.ENSP00000005995           22       1              2.000000
+5     9606.ENSP00000006526           26       1              2.000000
+6     9606.ENSP00000006658           27       1              2.000000
+7     9606.ENSP00000006724           28       1              2.000000
+8     9606.ENSP00000006777           29       1              2.000000
+9     9606.ENSP00000007414           31       1              2.000000
+10    9606.ENSP00000008391           34       1              2.000000
+11    9606.ENSP00000009041           37       1              2.000000
+12    9606.ENSP00000010299           40       1              2.000000
+13    9606.ENSP00000011473           42       1              2.000000
+14    9606.ENSP00000011619           43       1              2.000000
+15    9606.ENSP00000011898           45       1              2.000000
+16    9606.ENSP00000012049           46       1              2.000000
+17    9606.ENSP00000013222           50       1              2.000000
+18    9606.ENSP00000014930           53       1              2.000000
+19    9606.ENSP00000016913           19131    1              2.000000
+20    9606.ENSP00000016946           56       1              2.000000
+--------------------------------------------------------------------------------
+
+Saving results...
+✓ Saved log: results_cpu_20260226_203708/mcl_cpu_threads_2.log
+✓ Saved summary: results_cpu_20260226_203708/summary_threads_2.txt
+✓ Saved cluster stats: results_cpu_20260226_203708/cluster_stats_threads_2.json
+
+================================================================================
+MCL WORKER COMPLETE
+================================================================================

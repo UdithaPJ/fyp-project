@@ -1,0 +1,1 @@
+threads=12 n=19622 nnz_in=13715404 nnz_out=19622 load_time_s=0.403781 total_time_s=345.565094 analysis_time_s=2.031642

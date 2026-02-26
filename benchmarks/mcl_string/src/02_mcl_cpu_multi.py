@@ -44,13 +44,15 @@ from typing import Dict, Tuple, List
 THREAD_LIST = [1, 2, 4, 8, 12]
 
 # MCL algorithm parameters
-MCL_INFLATION = 2.0
-MCL_TAU = 1e-6
-MCL_MAX_ITERS = 60
-MCL_TOL = 1e-9
+MCL_INFLATION = 3
+MCL_TAU = 1e-13
+MCL_MAX_ITERS = 5000
+MCL_TOL = 0.0
 
-# Output directory (fixed name, no timestamp)
-RESULTS_DIR = Path("results")
+# Output directory
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+RESULTS_DIR = Path(f"results_cpu_{timestamp}")
+# RESULTS_DIR = Path("results")
 RESULTS_DIR.mkdir(exist_ok=True, parents=True)
 
 # Logging verbosity

@@ -41,10 +41,15 @@ from scipy import sparse
 # ==============================
 
 # MCL Algorithm Parameters
-R = 2.0                 # Inflation parameter (Markov parameter)
-TAU = 1e-6              # Pruning threshold
-MAX_ITERS = 60          # Maximum iterations
-TOL = 1e-9              # Convergence tolerance
+# R = 2.0                 # Inflation parameter (Markov parameter)
+# TAU = 1e-6              # Pruning threshold
+# MAX_ITERS = 60          # Maximum iterations
+# TOL = 1e-9              # Convergence tolerance
+
+R = 3
+TAU = 1e-12
+MAX_ITERS = 500
+TOL = 0.0
 
 # Output Options
 VERBOSE = True
@@ -171,10 +176,10 @@ def rank_top_proteins_by_influence(
 
 def mcl_cpu(
     A: sparse.csr_matrix,
-    r: float = 2.0,
-    tau: float = 1e-6,
-    max_iters: int = 60,
-    tol: float = 1e-9,
+    r: float = 3,
+    tau: float = 1e-12,
+    max_iters: int = 500,
+    tol: float = 0.0,
     logger: Logger = None
 ) -> Tuple[sparse.csr_matrix, float, List[str]]:
     """
@@ -228,9 +233,9 @@ def mcl_cpu(
         logger.log(msg)
         iter_logs.append(msg)
         
-        if err < tol:
-            logger.log(f"  Converged at iteration {it}")
-            break
+        # if err < tol:
+        #     logger.log(f"  Converged at iteration {it}")
+        #     break
     
     total_time = time.perf_counter() - t_start
     

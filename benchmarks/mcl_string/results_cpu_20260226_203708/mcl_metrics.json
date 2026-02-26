@@ -1,0 +1,122 @@
+{
+  "metadata": {
+    "algorithm": "MCL (Markov Clustering)",
+    "database": "STRING v12.0 Human PPI",
+    "timestamp": "2026-02-26T20:37:08.623584",
+    "thread_counts": [
+      1,
+      2,
+      4,
+      8,
+      12
+    ],
+    "mcl_parameters": {
+      "inflation": 3,
+      "tau": 1e-13,
+      "max_iterations": 5000,
+      "tolerance": 0.0
+    }
+  },
+  "results": [
+    {
+      "threads": 1,
+      "load_time": 0.406436,
+      "total_time": 373.030344,
+      "wall_time": 377.6907603589989,
+      "speedup": 1.0,
+      "efficiency": 1.0,
+      "nnz_in": 13715404,
+      "nnz_out": 19622,
+      "n_nodes": 19622,
+      "summary": {
+        "threads": 1,
+        "n": 19622,
+        "nnz_in": 13715404,
+        "nnz_out": 19622,
+        "load_time_s": 0.406436,
+        "total_time_s": 373.030344,
+        "analysis_time_s": 2.165109
+      }
+    },
+    {
+      "threads": 2,
+      "load_time": 0.403534,
+      "total_time": 369.468199,
+      "wall_time": 374.00063663400033,
+      "speedup": 1.0096412763253813,
+      "efficiency": 0.5048206381626906,
+      "nnz_in": 13715404,
+      "nnz_out": 19622,
+      "n_nodes": 19622,
+      "summary": {
+        "threads": 2,
+        "n": 19622,
+        "nnz_in": 13715404,
+        "nnz_out": 19622,
+        "load_time_s": 0.403534,
+        "total_time_s": 369.468199,
+        "analysis_time_s": 2.04207
+      }
+    },
+    {
+      "threads": 4,
+      "load_time": 0.405713,
+      "total_time": 368.374161,
+      "wall_time": 372.8838929909998,
+      "speedup": 1.0126398197619513,
+      "efficiency": 0.2531599549404878,
+      "nnz_in": 13715404,
+      "nnz_out": 19622,
+      "n_nodes": 19622,
+      "summary": {
+        "threads": 4,
+        "n": 19622,
+        "nnz_in": 13715404,
+        "nnz_out": 19622,
+        "load_time_s": 0.405713,
+        "total_time_s": 368.374161,
+        "analysis_time_s": 2.033031
+      }
+    },
+    {
+      "threads": 8,
+      "load_time": 0.40401,
+      "total_time": 368.606109,
+      "wall_time": 373.08955002199946,
+      "speedup": 1.0120026089963692,
+      "efficiency": 0.12650032612454615,
+      "nnz_in": 13715404,
+      "nnz_out": 19622,
+      "n_nodes": 19622,
+      "summary": {
+        "threads": 8,
+        "n": 19622,
+        "nnz_in": 13715404,
+        "nnz_out": 19622,
+        "load_time_s": 0.40401,
+        "total_time_s": 368.606109,
+        "analysis_time_s": 2.02546
+      }
+    },
+    {
+      "threads": 12,
+      "load_time": 0.403781,
+      "total_time": 345.565094,
+      "wall_time": 350.05547328099965,
+      "speedup": 1.0794792369856663,
+      "efficiency": 0.08995660308213886,
+      "nnz_in": 13715404,
+      "nnz_out": 19622,
+      "n_nodes": 19622,
+      "summary": {
+        "threads": 12,
+        "n": 19622,
+        "nnz_in": 13715404,
+        "nnz_out": 19622,
+        "load_time_s": 0.403781,
+        "total_time_s": 345.565094,
+        "analysis_time_s": 2.031642
+      }
+    }
+  ]
+}

@@ -55,7 +55,7 @@ else:
 NODE_MAP_FILE = Path("data_processed/ppi_mcl/node_map.json")
 
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-RESULTS_DIR = Path(f"results_{timestamp}")
+RESULTS_DIR = Path(f"results_gpu_{timestamp}")
 RESULTS_DIR.mkdir(exist_ok=True, parents=True)
 
 # ---- MCL Algorithm Parameters ----
@@ -447,112 +447,188 @@ def main():
     log("Generating result files...")
     log("-" * 80)
     
-    # 1. Timing Results
+    # 1. Timing Results with Cluster Rankings
     timing_file = RESULTS_DIR / "mcl_gpu_timing.txt"
     with open(timing_file, 'w', encoding='utf-8') as f:
         f.write("MCL GPU TIMING ANALYSIS\n")
-        f.write("=" * 60 + "\n\n")
+        f.write("=" * 80 + "\n\n")
         f.write(f"Generated: {datetime.now().isoformat()}\n")
-        f.write(f"Results directory: {RESULTS_DIR}\n\n")
+        f.write(f"Results directory: {RESULTS_DIR}\n")
+        f.write(f"Dataset: STRING PPI Network\n")
+        f.write(f"Input size: {A.shape[0]:,} nodes, {A.nnz:,} edges\n\n")
+        
         f.write("TIMING BREAKDOWN (seconds)\n")
-        f.write("-" * 60 + "\n")
+        f.write("=" * 80 + "\n")
         f.write(f"Data loading:              {load_time:10.4f}s\n")
         f.write(f"GPU transfer (upload):     {transfer_time:10.4f}s\n")
         f.write(f"MCL initialization:        {mcl_timing['initialization']:10.4f}s\n")
         f.write(f"MCL iterations:            {mcl_timing['total']:10.4f}s\n")
         f.write(f"GPU transfer (download):   {transfer_back_time:10.4f}s\n")
-        f.write(f"{'TOTAL EXECUTION':30s} {load_time + transfer_time + mcl_timing['initialization'] + mcl_timing['total'] + transfer_back_time:10.4f}s\n")
-        f.write("\nPER-ITERATION TIMING\n")
-        f.write("-" * 60 + "\n")
+        f.write(f"{'TOTAL EXECUTION':30s} {load_time + transfer_time + mcl_timing['initialization'] + mcl_timing['total'] + transfer_back_time:10.4f}s\n\n")
+        
+        f.write("PER-ITERATION TIMING\n")
+        f.write("=" * 80 + "\n")
         f.write("Iteration | Time (s)      | Cumulative (s)\n")
-        f.write("-" * 60 + "\n")
+        f.write("-" * 80 + "\n")
         cumulative = 0.0
         for i, iter_time in enumerate(mcl_timing['iterations'], 1):
             cumulative += iter_time
-            f.write(f"{i:9d} | {iter_time:10.4f} | {cumulative:10.4f}\n")
+            f.write(f"{i:9d} | {iter_time:13.4f} | {cumulative:13.4f}\n")
+        
+        f.write("\n")
+        f.write("CLUSTERING RESULTS\n")
+        f.write("=" * 80 + "\n")
+        f.write(f"Total clusters found: {len(clusters)}\n")
+        f.write(f"Total proteins assigned: {sum(len(c) for c in clusters.values())}\n\n")
+        
+        f.write("TOP 20 CLUSTERS BY SIZE AND CONNECTIVITY\n")
+        f.write("-" * 80 + "\n")
+        f.write("Rank | Cluster ID |   Size | Internal Edges |   Density | Avg Weight |  Connectivity\n")
+        f.write("-" * 80 + "\n")
+        
+        # Sort clusters by metrics for ranking
+        sorted_clusters = []
+        for cluster_id, nodes_in_cluster in clusters.items():
+            cluster_size = len(nodes_in_cluster)
+            
+            # Calculate internal edges and metrics
+            internal_edges = 0
+            total_weight = 0.0
+            for node_i in nodes_in_cluster:
+                row = M_cpu.getrow(node_i)
+                for j in row.nonzero()[1]:
+                    if j in nodes_in_cluster:
+                        internal_edges += 1
+                        val = row.data[row.nonzero()[1] == j]
+                        if len(val) > 0:
+                            total_weight += float(val[0])
+            
+            max_edges = cluster_size * (cluster_size - 1) if cluster_size > 1 else 1
+            density = internal_edges / max_edges
+            avg_weight = total_weight / max(internal_edges, 1)
+            connectivity = cluster_size * density  # Combined metric
+            
+            sorted_clusters.append({
+                'id': cluster_id,
+                'size': cluster_size,
+                'internal_edges': internal_edges,
+                'density': density,
+                'avg_weight': avg_weight,
+                'connectivity': connectivity
+            })
+        
+        # Sort by connectivity (size * density)
+        sorted_clusters.sort(key=lambda x: x['connectivity'], reverse=True)
+        
+        for rank, cluster in enumerate(sorted_clusters[:20], 1):
+            f.write(f"{rank:4d} | {cluster['id']:10d} | {cluster['size']:6d} | {cluster['internal_edges']:14d} | "
+                   f"{cluster['density']:9.4f} | {cluster['avg_weight']:10.6f} | {cluster['connectivity']:13.4f}\n")
+        
+        f.write("\n")
+        f.write("TOP 20 CLUSTERS BY SIZE ONLY\n")
+        f.write("-" * 80 + "\n")
+        f.write("Rank | Cluster ID |   Size | Metric: Size\n")
+        f.write("-" * 80 + "\n")
+        
+        size_sorted = sorted(sorted_clusters, key=lambda x: x['size'], reverse=True)
+        for rank, cluster in enumerate(size_sorted[:20], 1):
+            f.write(f"{rank:4d} | {cluster['id']:10d} | {cluster['size']:6d} | {cluster['size']}\n")
+        
+        f.write("\n")
+        f.write("ALGORITHM PARAMETERS\n")
+        f.write("=" * 80 + "\n")
+        f.write(f"Inflation parameter (R):   {R}\n")
+        f.write(f"Pruning threshold (TAU):   {TAU}\n")
+        f.write(f"Max iterations:            {MAX_ITERS}\n")
+        f.write(f"Convergence tolerance:     {TOL}\n")
+        f.write(f"Actual iterations run:     {len(mcl_timing['iterations'])}\n")
+        f.write(f"Final matrix nnz:          {M_gpu.nnz:,}\n")
     
-    log(f"[OK] Timing results: {timing_file}")
+    log(f"[✓] Timing results with cluster rankings: {timing_file}")
     
     # 2. Iteration Logs
     iter_log_file = RESULTS_DIR / "mcl_gpu_iterations.txt"
     with open(iter_log_file, 'w', encoding='utf-8') as f:
         f.write("MCL ALGORITHM ITERATION LOGS\n")
-        f.write("=" * 60 + "\n\n")
+        f.write("=" * 80 + "\n\n")
         f.write(f"Generated: {datetime.now().isoformat()}\n")
         f.write(f"Parameters: R={R}, TAU={TAU}, MAX_ITERS={MAX_ITERS}, TOL={TOL}\n")
         f.write(f"Input matrix: n={A.shape[0]:,}, nnz={A.nnz:,}\n\n")
         f.write("ITERATION DETAILS\n")
-        f.write("-" * 60 + "\n")
+        f.write("=" * 80 + "\n")
         for log_line in iteration_logs:
             f.write(log_line + "\n")
     
-    log(f"✓ Iteration logs: {iter_log_file}")
+    log(f"[✓] Iteration logs: {iter_log_file}")
     
     # 3. Cluster Statistics (JSON)
     stats_json_file = RESULTS_DIR / "cluster_stats.json"
     with open(stats_json_file, 'w') as f:
         json.dump(cluster_stats, f, indent=2)
-    log(f"[OK] Cluster statistics (JSON): {stats_json_file}")
+    log(f"[✓] Cluster statistics (JSON): {stats_json_file}")
     
-    # 4. Top Proteins Ranking
+    # 4. Top Proteins Ranking (Top 100)
     top_proteins_file = RESULTS_DIR / "top_proteins.txt"
     with open(top_proteins_file, 'w', encoding='utf-8') as f:
         f.write("TOP PROTEINS RANKING BY INFLUENCE\n")
-        f.write("=" * 80 + "\n\n")
+        f.write("=" * 100 + "\n\n")
         f.write(f"Generated: {datetime.now().isoformat()}\n")
         f.write(f"Total clusters found: {len(clusters)}\n")
-        f.write(f"Ranked by: Cluster size x Connection strength\n\n")
-        f.write("PROTEIN RANKINGS\n")
-        f.write("-" * 80 + "\n")
-        f.write("Rank | Protein ID                  | Cluster | Cluster Size | Connection | Influence\n")
-        f.write("-" * 80 + "\n")
+        f.write(f"Ranked by: Cluster size × Connection strength\n")
+        f.write(f"Total proteins ranked: {len(top_proteins)}\n\n")
+        f.write("TOP PROTEIN RANKINGS\n")
+        f.write("=" * 100 + "\n")
+        f.write("Rank | Protein ID                  | Cluster | Cluster Size | Connection | Influence Score\n")
+        f.write("-" * 100 + "\n")
         for rank, (protein_id, cluster_id, cluster_size, conn_strength, influence) in enumerate(top_proteins, 1):
             f.write(f"{rank:4d} | {protein_id:27s} | {cluster_id:7d} | {cluster_size:12d} | "
-                   f"{conn_strength:10.4f} | {influence:10.4f}\n")
+                   f"{conn_strength:10.4f} | {influence:15.6f}\n")
     
-    log(f"[OK] Top proteins ranking: {top_proteins_file}")
+    log(f"[✓] Top proteins ranking (top 100): {top_proteins_file}")
     
     # 5. All Protein Clusters Assignment
     protein_clusters_file = RESULTS_DIR / "protein_clusters.txt"
     with open(protein_clusters_file, 'w', encoding='utf-8') as f:
         f.write("PROTEIN CLUSTER ASSIGNMENTS\n")
-        f.write("=" * 80 + "\n\n")
+        f.write("=" * 100 + "\n\n")
         f.write(f"Generated: {datetime.now().isoformat()}\n")
         f.write(f"Total proteins: {A.shape[0]:,}\n")
         f.write(f"Total clusters: {len(clusters)}\n\n")
         
-        for cluster_id in sorted(clusters.keys()):
+        for rank, cluster_id in enumerate(sorted(clusters.keys(), key=lambda c: len(clusters[c]), reverse=True), 1):
             nodes = sorted(clusters[cluster_id])
             proteins = [idx_to_protein.get(n, f"node_{n}") for n in nodes]
-            f.write(f"CLUSTER {cluster_id}: {len(proteins)} proteins\n")
-            f.write("-" * 80 + "\n")
+            f.write(f"[CLUSTER #{rank}] ID {cluster_id}: {len(proteins)} proteins\n")
+            f.write("-" * 100 + "\n")
             for protein in proteins:
                 f.write(f"  {protein}\n")
             f.write("\n")
     
-    log(f"[OK] Protein cluster assignments: {protein_clusters_file}")
+    log(f"[✓] Protein cluster assignments: {protein_clusters_file}")
     
-    # 6. Cluster Details by Size
+    # 6. Cluster Details by Size (Top 20 clusters)
     cluster_details_file = RESULTS_DIR / "cluster_details.txt"
     with open(cluster_details_file, 'w', encoding='utf-8') as f:
-        f.write("DETAILED CLUSTER ANALYSIS\n")
-        f.write("=" * 80 + "\n\n")
-        f.write(f"Generated: {datetime.now().isoformat()}\n\n")
+        f.write("DETAILED CLUSTER ANALYSIS (Top 20 Clusters)\n")
+        f.write("=" * 100 + "\n\n")
+        f.write(f"Generated: {datetime.now().isoformat()}\n")
+        f.write(f"Sorted by: Cluster size (descending)\n")
+        f.write(f"Total clusters in dataset: {len(cluster_stats['cluster_details'])}\n\n")
         
-        for i, cluster_info in enumerate(cluster_stats["cluster_details"], 1):
-            f.write(f"CLUSTER #{i}\n")
-            f.write("-" * 80 + "\n")
+        for i, cluster_info in enumerate(cluster_stats["cluster_details"][:20], 1):
+            f.write(f"[ CLUSTER #{i} ]\n")
+            f.write("-" * 100 + "\n")
             f.write(f"  ID:                  {cluster_info['cluster_id']}\n")
             f.write(f"  Size:                {cluster_info['size']} proteins\n")
             f.write(f"  Internal edges:      {cluster_info['internal_edges']}\n")
-            f.write(f"  Density:             {cluster_info['density']:.4f}\n")
-            f.write(f"  Avg internal weight: {cluster_info['avg_internal_weight']:.6f}\n")
+            f.write(f"  Network density:     {cluster_info['density']:.6f}\n")
+            f.write(f"  Avg internal weight: {cluster_info['avg_internal_weight']:.8f}\n")
             f.write(f"  Sample proteins (first 20):\n")
             for protein in cluster_info['proteins']:
-                f.write(f"    - {protein}\n")
+                f.write(f"    • {protein}\n")
             f.write("\n")
     
-    log(f"[OK] Cluster details: {cluster_details_file}")
+    log(f"[✓] Cluster details (top 20): {cluster_details_file}")
     
     # 7. Summary Statistics
     summary_file = RESULTS_DIR / "summary.txt"
@@ -562,35 +638,35 @@ def main():
         avg_iter_time = mcl_timing['total'] / total_iterations if total_iterations > 0 else 0
         
         f.write("MCL GPU ANALYSIS SUMMARY\n")
-        f.write("=" * 80 + "\n\n")
+        f.write("=" * 100 + "\n\n")
         f.write(f"Generated: {datetime.now().isoformat()}\n")
         f.write(f"Results directory: {RESULTS_DIR}\n\n")
         
         f.write("INPUT DATA\n")
-        f.write("-" * 80 + "\n")
-        f.write(f"  Nodes:                {A.shape[0]:,}\n")
-        f.write(f"  Edges:                {A.nnz:,}\n")
+        f.write("=" * 100 + "\n")
+        f.write(f"  Nodes (proteins):     {A.shape[0]:,}\n")
+        f.write(f"  Edges (interactions): {A.nnz:,}\n")
         f.write(f"  Sparsity:             {(1 - A.nnz / (A.shape[0] * A.shape[0])) * 100:.2f}%\n\n")
         
         f.write("MCL PARAMETERS\n")
-        f.write("-" * 80 + "\n")
+        f.write("=" * 100 + "\n")
         f.write(f"  Inflation (R):        {R}\n")
         f.write(f"  Pruning threshold:    {TAU}\n")
         f.write(f"  Max iterations:       {MAX_ITERS}\n")
         f.write(f"  Convergence tol:      {TOL}\n\n")
         
         f.write("EXECUTION TIMING (seconds)\n")
-        f.write("-" * 80 + "\n")
-        f.write(f"  Data loading:              {load_time:10.4f}\n")
-        f.write(f"  GPU transfer (upload):     {transfer_time:10.4f}\n")
-        f.write(f"  MCL initialization:        {mcl_timing['initialization']:10.4f}\n")
-        f.write(f"  MCL iterations ({total_iterations}):         {mcl_timing['total']:10.4f}\n")
-        f.write(f"  GPU transfer (download):   {transfer_back_time:10.4f}\n")
-        f.write(f"  {'TOTAL':30s} {total_time:10.4f}\n")
-        f.write(f"  Avg time per iteration:    {avg_iter_time:10.4f}\n\n")
+        f.write("=" * 100 + "\n")
+        f.write(f"  Data loading:                  {load_time:12.4f}s\n")
+        f.write(f"  GPU transfer (upload):         {transfer_time:12.4f}s\n")
+        f.write(f"  MCL initialization:            {mcl_timing['initialization']:12.4f}s\n")
+        f.write(f"  MCL iterations ({total_iterations:2d}):                {mcl_timing['total']:12.4f}s\n")
+        f.write(f"  GPU transfer (download):       {transfer_back_time:12.4f}s\n")
+        f.write(f"  {'TOTAL EXECUTION TIME':40s} {total_time:12.4f}s\n")
+        f.write(f"  Average time per iteration:    {avg_iter_time:12.4f}s\n\n")
         
         f.write("CLUSTERING RESULTS\n")
-        f.write("-" * 80 + "\n")
+        f.write("=" * 100 + "\n")
         f.write(f"  Total clusters:       {len(clusters)}\n")
         if len(clusters) > 0:
             cluster_sizes = [len(c) for c in clusters.values()]
@@ -598,25 +674,26 @@ def main():
             f.write(f"  Smallest cluster:     {min(cluster_sizes):,} proteins\n")
             f.write(f"  Average cluster size: {np.mean(cluster_sizes):.1f}\n")
             f.write(f"  Median cluster size:  {np.median(cluster_sizes):.1f}\n")
+            f.write(f"  Std. dev. cluster:    {np.std(cluster_sizes):.1f}\n")
         else:
-            f.write(f"  WARNING: No clusters found. Matrix may have converged to zero.\n")
+            f.write(f"  ⚠ WARNING: No clusters found. Matrix may have converged to zero.\n")
             f.write(f"  Final matrix nnz: {M_gpu.nnz}\n")
         f.write("\n")
         
         f.write("OUTPUT FILES GENERATED\n")
-        f.write("-" * 80 + "\n")
-        f.write(f"  mcl_gpu_timing.txt        - Detailed timing breakdown\n")
-        f.write(f"  mcl_gpu_iterations.txt    - Per-iteration logs\n")
-        f.write(f"  cluster_stats.json        - Cluster statistics (JSON format)\n")
-        f.write(f"  top_proteins.txt          - Top 100 proteins by influence\n")
-        f.write(f"  protein_clusters.txt      - All protein assignments\n")
-        f.write(f"  cluster_details.txt       - Detailed cluster analysis\n")
-        f.write(f"  summary.txt               - This summary file\n")
+        f.write("=" * 100 + "\n")
+        f.write(f"  ✓ mcl_gpu_timing.txt        - Timing breakdown + top 20 cluster rankings\n")
+        f.write(f"  ✓ mcl_gpu_iterations.txt    - Per-iteration algorithm logs\n")
+        f.write(f"  ✓ cluster_stats.json        - Cluster statistics in JSON format\n")
+        f.write(f"  ✓ top_proteins.txt          - Top 100 proteins ranked by influence\n")
+        f.write(f"  ✓ protein_clusters.txt      - Complete protein cluster assignments\n")
+        f.write(f"  ✓ cluster_details.txt       - Detailed analysis of top 20 clusters\n")
+        f.write(f"  ✓ summary.txt               - This comprehensive summary\n")
     
-    log(f"[OK] Summary: {summary_file}")
+    log(f"[✓] Summary: {summary_file}")
     
     log("-" * 80)
-    log("\n[OK] All result files generated successfully!")
+    log("\n[✓] All result files generated successfully!")
     log(f"Results location: {RESULTS_DIR}\n")
     
     # Also save the full log
@@ -624,7 +701,7 @@ def main():
     with open(full_log_file, 'w', encoding='utf-8') as f:
         f.write("\n".join(log_lines))
     
-    log(f"[OK] Full execution log: {full_log_file}")
+    log(f"[✓] Full execution log: {full_log_file}")
 
 if __name__ == "__main__":
     main()

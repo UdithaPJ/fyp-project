@@ -1,0 +1,405 @@
+DETAILED CLUSTER ANALYSIS
+================================================================================
+
+Generated: 2026-02-26T20:11:09.837049
+
+CLUSTER #1
+--------------------------------------------------------------------------------
+  ID:                  2007
+  Size:                1 proteins
+  Internal edges:      1
+  Density:             1.0000
+  Avg internal weight: 1.000000
+  Sample proteins (first 20):
+    - 9606.ENSP00000258704
+
+CLUSTER #2
+--------------------------------------------------------------------------------
+  ID:                  5787
+  Size:                1 proteins
+  Internal edges:      1
+  Density:             1.0000
+  Avg internal weight: 1.000000
+  Sample proteins (first 20):
+    - 9606.ENSP00000310801
+
+CLUSTER #3
+--------------------------------------------------------------------------------
+  ID:                  7258
+  Size:                1 proteins
+  Internal edges:      1
+  Density:             1.0000
+  Avg internal weight: 1.000000
+  Sample proteins (first 20):
+    - 9606.ENSP00000330945
+
+CLUSTER #4
+--------------------------------------------------------------------------------
+  ID:                  7244
+  Size:                1 proteins
+  Internal edges:      1
+  Density:             1.0000
+  Avg internal weight: 1.000000
+  Sample proteins (first 20):
+    - 9606.ENSP00000332790
+
+CLUSTER #5
+--------------------------------------------------------------------------------
+  ID:                  7551
+  Size:                1 proteins
+  Internal edges:      1
+  Density:             1.0000
+  Avg internal weight: 1.000000
+  Sample proteins (first 20):
+    - 9606.ENSP00000334186
+
+CLUSTER #6
+--------------------------------------------------------------------------------
+  ID:                  6505
+  Size:                1 proteins
+  Internal edges:      1
+  Density:             1.0000
+  Avg internal weight: 1.000000
+  Sample proteins (first 20):
+    - 9606.ENSP00000334329
+
+CLUSTER #7
+--------------------------------------------------------------------------------
+  ID:                  7616
+  Size:                1 proteins
+  Internal edges:      1
+  Density:             1.0000
+  Avg internal weight: 1.000000
+  Sample proteins (first 20):
+    - 9606.ENSP00000334853
+
+CLUSTER #8
+--------------------------------------------------------------------------------
+  ID:                  7677
+  Size:                1 proteins
+  Internal edges:      1
+  Density:             1.0000
+  Avg internal weight: 1.000000
+  Sample proteins (first 20):
+    - 9606.ENSP00000335358
+
+CLUSTER #9
+--------------------------------------------------------------------------------
+  ID:                  7692
+  Size:                1 proteins
+  Internal edges:      1
+  Density:             1.0000
+  Avg internal weight: 1.000000
+  Sample proteins (first 20):
+    - 9606.ENSP00000335560
+
+CLUSTER #10
+--------------------------------------------------------------------------------
+  ID:                  7693
+  Size:                1 proteins
+  Internal edges:      1
+  Density:             1.0000
+  Avg internal weight: 1.000000
+  Sample proteins (first 20):
+    - 9606.ENSP00000335565
+
+CLUSTER #11
+--------------------------------------------------------------------------------
+  ID:                  7708
+  Size:                1 proteins
+  Internal edges:      1
+  Density:             1.0000
+  Avg internal weight: 1.000000
+  Sample proteins (first 20):
+    - 9606.ENSP00000335651
+
+CLUSTER #12
+--------------------------------------------------------------------------------
+  ID:                  10208
+  Size:                1 proteins
+  Internal edges:      1
+  Density:             1.0000
+  Avg internal weight: 1.000000
+  Sample proteins (first 20):
+    - 9606.ENSP00000358535
+
+CLUSTER #13
+--------------------------------------------------------------------------------
+  ID:                  11301
+  Size:                1 proteins
+  Internal edges:      1
+  Density:             1.0000
+  Avg internal weight: 1.000000
+  Sample proteins (first 20):
+    - 9606.ENSP00000364076
+
+CLUSTER #14
+--------------------------------------------------------------------------------
+  ID:                  11742
+  Size:                1 proteins
+  Internal edges:      1
+  Density:             1.0000
+  Avg internal weight: 1.000000
+  Sample proteins (first 20):
+    - 9606.ENSP00000366970
+
+CLUSTER #15
+--------------------------------------------------------------------------------
+  ID:                  11776
+  Size:                1 proteins
+  Internal edges:      1
+  Density:             1.0000
+  Avg internal weight: 1.000000
+  Sample proteins (first 20):
+    - 9606.ENSP00000367154
+
+CLUSTER #16
+--------------------------------------------------------------------------------
+  ID:                  12436
+  Size:                1 proteins
+  Internal edges:      1
+  Density:             1.0000
+  Avg internal weight: 1.000000
+  Sample proteins (first 20):
+    - 9606.ENSP00000371594
+
+CLUSTER #17
+--------------------------------------------------------------------------------
+  ID:                  12440
+  Size:                1 proteins
+  Internal edges:      1
+  Density:             1.0000
+  Avg internal weight: 1.000000
+  Sample proteins (first 20):
+    - 9606.ENSP00000371614
+
+CLUSTER #18
+--------------------------------------------------------------------------------
+  ID:                  12509
+  Size:                1 proteins
+  Internal edges:      1
+  Density:             1.0000
+  Avg internal weight: 1.000000
+  Sample proteins (first 20):
+    - 9606.ENSP00000372218
+
+CLUSTER #19
+--------------------------------------------------------------------------------
+  ID:                  12511
+  Size:                1 proteins
+  Internal edges:      1
+  Density:             1.0000
+  Avg internal weight: 1.000000
+  Sample proteins (first 20):
+    - 9606.ENSP00000372272
+
+CLUSTER #20
+--------------------------------------------------------------------------------
+  ID:                  12690
+  Size:                1 proteins
+  Internal edges:      1
+  Density:             1.0000
+  Avg internal weight: 1.000000
+  Sample proteins (first 20):
+    - 9606.ENSP00000375109
+
+CLUSTER #21
+--------------------------------------------------------------------------------
+  ID:                  13561
+  Size:                1 proteins
+  Internal edges:      1
+  Density:             1.0000
+  Avg internal weight: 1.000000
+  Sample proteins (first 20):
+    - 9606.ENSP00000381693
+
+CLUSTER #22
+--------------------------------------------------------------------------------
+  ID:                  13588
+  Size:                1 proteins
+  Internal edges:      1
+  Density:             1.0000
+  Avg internal weight: 1.000000
+  Sample proteins (first 20):
+    - 9606.ENSP00000381970
+
+CLUSTER #23
+--------------------------------------------------------------------------------
+  ID:                  13639
+  Size:                1 proteins
+  Internal edges:      1
+  Density:             1.0000
+  Avg internal weight: 1.000000
+  Sample proteins (first 20):
+    - 9606.ENSP00000382518
+
+CLUSTER #24
+--------------------------------------------------------------------------------
+  ID:                  1439
+  Size:                1 proteins
+  Internal edges:      1
+  Density:             1.0000
+  Avg internal weight: 1.000000
+  Sample proteins (first 20):
+    - 9606.ENSP00000409378
+
+CLUSTER #25
+--------------------------------------------------------------------------------
+  ID:                  15517
+  Size:                1 proteins
+  Internal edges:      1
+  Density:             1.0000
+  Avg internal weight: 1.000000
+  Sample proteins (first 20):
+    - 9606.ENSP00000417235
+
+CLUSTER #26
+--------------------------------------------------------------------------------
+  ID:                  15942
+  Size:                1 proteins
+  Internal edges:      1
+  Density:             1.0000
+  Avg internal weight: 1.000000
+  Sample proteins (first 20):
+    - 9606.ENSP00000425166
+
+CLUSTER #27
+--------------------------------------------------------------------------------
+  ID:                  16348
+  Size:                1 proteins
+  Internal edges:      1
+  Density:             1.0000
+  Avg internal weight: 1.000000
+  Sample proteins (first 20):
+    - 9606.ENSP00000434717
+
+CLUSTER #28
+--------------------------------------------------------------------------------
+  ID:                  16460
+  Size:                1 proteins
+  Internal edges:      1
+  Density:             1.0000
+  Avg internal weight: 1.000000
+  Sample proteins (first 20):
+    - 9606.ENSP00000437629
+
+CLUSTER #29
+--------------------------------------------------------------------------------
+  ID:                  13667
+  Size:                1 proteins
+  Internal edges:      1
+  Density:             1.0000
+  Avg internal weight: 1.000000
+  Sample proteins (first 20):
+    - 9606.ENSP00000438949
+
+CLUSTER #30
+--------------------------------------------------------------------------------
+  ID:                  16630
+  Size:                1 proteins
+  Internal edges:      1
+  Density:             1.0000
+  Avg internal weight: 1.000000
+  Sample proteins (first 20):
+    - 9606.ENSP00000441980
+
+CLUSTER #31
+--------------------------------------------------------------------------------
+  ID:                  16827
+  Size:                1 proteins
+  Internal edges:      1
+  Density:             1.0000
+  Avg internal weight: 1.000000
+  Sample proteins (first 20):
+    - 9606.ENSP00000446916
+
+CLUSTER #32
+--------------------------------------------------------------------------------
+  ID:                  17081
+  Size:                1 proteins
+  Internal edges:      1
+  Density:             1.0000
+  Avg internal weight: 1.000000
+  Sample proteins (first 20):
+    - 9606.ENSP00000454562
+
+CLUSTER #33
+--------------------------------------------------------------------------------
+  ID:                  17136
+  Size:                1 proteins
+  Internal edges:      1
+  Density:             1.0000
+  Avg internal weight: 1.000000
+  Sample proteins (first 20):
+    - 9606.ENSP00000455854
+
+CLUSTER #34
+--------------------------------------------------------------------------------
+  ID:                  17749
+  Size:                1 proteins
+  Internal edges:      1
+  Density:             1.0000
+  Avg internal weight: 1.000000
+  Sample proteins (first 20):
+    - 9606.ENSP00000474850
+
+CLUSTER #35
+--------------------------------------------------------------------------------
+  ID:                  18656
+  Size:                1 proteins
+  Internal edges:      1
+  Density:             1.0000
+  Avg internal weight: 1.000000
+  Sample proteins (first 20):
+    - 9606.ENSP00000489225
+
+CLUSTER #36
+--------------------------------------------------------------------------------
+  ID:                  18663
+  Size:                1 proteins
+  Internal edges:      1
+  Density:             1.0000
+  Avg internal weight: 1.000000
+  Sample proteins (first 20):
+    - 9606.ENSP00000489320
+
+CLUSTER #37
+--------------------------------------------------------------------------------
+  ID:                  18641
+  Size:                1 proteins
+  Internal edges:      1
+  Density:             1.0000
+  Avg internal weight: 1.000000
+  Sample proteins (first 20):
+    - 9606.ENSP00000489648
+
+CLUSTER #38
+--------------------------------------------------------------------------------
+  ID:                  18707
+  Size:                1 proteins
+  Internal edges:      1
+  Density:             1.0000
+  Avg internal weight: 1.000000
+  Sample proteins (first 20):
+    - 9606.ENSP00000489890
+
+CLUSTER #39
+--------------------------------------------------------------------------------
+  ID:                  18741
+  Size:                1 proteins
+  Internal edges:      1
+  Density:             1.0000
+  Avg internal weight: 1.000000
+  Sample proteins (first 20):
+    - 9606.ENSP00000490274
+
+CLUSTER #40
+--------------------------------------------------------------------------------
+  ID:                  18924
+  Size:                1 proteins
+  Internal edges:      1
+  Density:             1.0000
+  Avg internal weight: 1.000000
+  Sample proteins (first 20):
+    - 9606.ENSP00000492963
+
