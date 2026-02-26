@@ -1,0 +1,26 @@
+MCL ALGORITHM ITERATION LOGS
+============================================================
+
+Generated: 2026-02-26T17:14:14.725114
+Parameters: R=1.5, TAU=1e-06, MAX_ITERS=60, TOL=1e-09
+Input matrix: n=19,579, nnz=13,715,098
+
+ITERATION DETAILS
+------------------------------------------------------------
+iter=01 nnz=1,334 err=1.000e+00 iter_time=44.689s
+iter=02 nnz=1,395 err=1.000e+00 iter_time=0.011s
+iter=03 nnz=1,116 err=4.750e-01 iter_time=0.009s
+iter=04 nnz=812 err=4.777e-01 iter_time=0.011s
+iter=05 nnz=687 err=3.526e-01 iter_time=0.011s
+iter=06 nnz=557 err=4.779e-01 iter_time=0.010s
+iter=07 nnz=346 err=1.715e-01 iter_time=0.010s
+iter=08 nnz=284 err=1.998e-01 iter_time=0.008s
+iter=09 nnz=205 err=3.307e-01 iter_time=0.011s
+iter=10 nnz=180 err=1.000e+00 iter_time=0.011s
+iter=11 nnz=167 err=8.866e-02 iter_time=0.009s
+iter=12 nnz=166 err=8.963e-02 iter_time=0.011s
+iter=13 nnz=165 err=7.386e-02 iter_time=0.009s
+iter=14 nnz=162 err=1.000e+00 iter_time=0.011s
+iter=15 nnz=162 err=1.104e-02 iter_time=0.011s
+iter=16 nnz=137 err=1.415e-03 iter_time=0.009s
+iter=17 nnz=137 err=1.110e-16 iter_time=0.011s

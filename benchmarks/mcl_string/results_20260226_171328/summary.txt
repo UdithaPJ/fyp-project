@@ -1,0 +1,46 @@
+MCL GPU ANALYSIS SUMMARY
+================================================================================
+
+Generated: 2026-02-26T17:14:14.726606
+Results directory: results_20260226_171328
+
+INPUT DATA
+--------------------------------------------------------------------------------
+  Nodes:                19,579
+  Edges:                13,715,098
+  Sparsity:             96.42%
+
+MCL PARAMETERS
+--------------------------------------------------------------------------------
+  Inflation (R):        1.5
+  Pruning threshold:    1e-06
+  Max iterations:       60
+  Convergence tol:      1e-09
+
+EXECUTION TIMING (seconds)
+--------------------------------------------------------------------------------
+  Data loading:                  0.4048
+  GPU transfer (upload):         0.3652
+  MCL initialization:            0.1676
+  MCL iterations (17):            44.8504
+  GPU transfer (download):       0.0002
+  TOTAL                             45.7883
+  Avg time per iteration:        2.6383
+
+CLUSTERING RESULTS
+--------------------------------------------------------------------------------
+  Total clusters:       40
+  Largest cluster:      1 proteins
+  Smallest cluster:     1 proteins
+  Average cluster size: 1.0
+  Median cluster size:  1.0
+
+OUTPUT FILES GENERATED
+--------------------------------------------------------------------------------
+  mcl_gpu_timing.txt        - Detailed timing breakdown
+  mcl_gpu_iterations.txt    - Per-iteration logs
+  cluster_stats.json        - Cluster statistics (JSON format)
+  top_proteins.txt          - Top 100 proteins by influence
+  protein_clusters.txt      - All protein assignments
+  cluster_details.txt       - Detailed cluster analysis
+  summary.txt               - This summary file

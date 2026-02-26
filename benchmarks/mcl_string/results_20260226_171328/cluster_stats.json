@@ -1,0 +1,405 @@
+{
+  "total_clusters": 40,
+  "cluster_details": [
+    {
+      "cluster_id": 2007,
+      "size": 1,
+      "internal_edges": 1,
+      "density": 1.0,
+      "avg_internal_weight": 1.0,
+      "proteins": [
+        "9606.ENSP00000258704"
+      ]
+    },
+    {
+      "cluster_id": 5787,
+      "size": 1,
+      "internal_edges": 1,
+      "density": 1.0,
+      "avg_internal_weight": 1.0,
+      "proteins": [
+        "9606.ENSP00000310801"
+      ]
+    },
+    {
+      "cluster_id": 7258,
+      "size": 1,
+      "internal_edges": 1,
+      "density": 1.0,
+      "avg_internal_weight": 1.0,
+      "proteins": [
+        "9606.ENSP00000330945"
+      ]
+    },
+    {
+      "cluster_id": 7244,
+      "size": 1,
+      "internal_edges": 1,
+      "density": 1.0,
+      "avg_internal_weight": 1.0,
+      "proteins": [
+        "9606.ENSP00000332790"
+      ]
+    },
+    {
+      "cluster_id": 7551,
+      "size": 1,
+      "internal_edges": 1,
+      "density": 1.0,
+      "avg_internal_weight": 1.0,
+      "proteins": [
+        "9606.ENSP00000334186"
+      ]
+    },
+    {
+      "cluster_id": 6505,
+      "size": 1,
+      "internal_edges": 1,
+      "density": 1.0,
+      "avg_internal_weight": 1.0,
+      "proteins": [
+        "9606.ENSP00000334329"
+      ]
+    },
+    {
+      "cluster_id": 7616,
+      "size": 1,
+      "internal_edges": 1,
+      "density": 1.0,
+      "avg_internal_weight": 1.0,
+      "proteins": [
+        "9606.ENSP00000334853"
+      ]
+    },
+    {
+      "cluster_id": 7677,
+      "size": 1,
+      "internal_edges": 1,
+      "density": 1.0,
+      "avg_internal_weight": 1.0,
+      "proteins": [
+        "9606.ENSP00000335358"
+      ]
+    },
+    {
+      "cluster_id": 7692,
+      "size": 1,
+      "internal_edges": 1,
+      "density": 1.0,
+      "avg_internal_weight": 1.0,
+      "proteins": [
+        "9606.ENSP00000335560"
+      ]
+    },
+    {
+      "cluster_id": 7693,
+      "size": 1,
+      "internal_edges": 1,
+      "density": 1.0,
+      "avg_internal_weight": 1.0,
+      "proteins": [
+        "9606.ENSP00000335565"
+      ]
+    },
+    {
+      "cluster_id": 7708,
+      "size": 1,
+      "internal_edges": 1,
+      "density": 1.0,
+      "avg_internal_weight": 1.0,
+      "proteins": [
+        "9606.ENSP00000335651"
+      ]
+    },
+    {
+      "cluster_id": 10208,
+      "size": 1,
+      "internal_edges": 1,
+      "density": 1.0,
+      "avg_internal_weight": 1.0,
+      "proteins": [
+        "9606.ENSP00000358535"
+      ]
+    },
+    {
+      "cluster_id": 11301,
+      "size": 1,
+      "internal_edges": 1,
+      "density": 1.0,
+      "avg_internal_weight": 1.0,
+      "proteins": [
+        "9606.ENSP00000364076"
+      ]
+    },
+    {
+      "cluster_id": 11742,
+      "size": 1,
+      "internal_edges": 1,
+      "density": 1.0,
+      "avg_internal_weight": 1.0,
+      "proteins": [
+        "9606.ENSP00000366970"
+      ]
+    },
+    {
+      "cluster_id": 11776,
+      "size": 1,
+      "internal_edges": 1,
+      "density": 1.0,
+      "avg_internal_weight": 1.0,
+      "proteins": [
+        "9606.ENSP00000367154"
+      ]
+    },
+    {
+      "cluster_id": 12436,
+      "size": 1,
+      "internal_edges": 1,
+      "density": 1.0,
+      "avg_internal_weight": 1.0,
+      "proteins": [
+        "9606.ENSP00000371594"
+      ]
+    },
+    {
+      "cluster_id": 12440,
+      "size": 1,
+      "internal_edges": 1,
+      "density": 1.0,
+      "avg_internal_weight": 1.0,
+      "proteins": [
+        "9606.ENSP00000371614"
+      ]
+    },
+    {
+      "cluster_id": 12509,
+      "size": 1,
+      "internal_edges": 1,
+      "density": 1.0,
+      "avg_internal_weight": 1.0,
+      "proteins": [
+        "9606.ENSP00000372218"
+      ]
+    },
+    {
+      "cluster_id": 12511,
+      "size": 1,
+      "internal_edges": 1,
+      "density": 1.0,
+      "avg_internal_weight": 1.0,
+      "proteins": [
+        "9606.ENSP00000372272"
+      ]
+    },
+    {
+      "cluster_id": 12690,
+      "size": 1,
+      "internal_edges": 1,
+      "density": 1.0,
+      "avg_internal_weight": 1.0,
+      "proteins": [
+        "9606.ENSP00000375109"
+      ]
+    },
+    {
+      "cluster_id": 13561,
+      "size": 1,
+      "internal_edges": 1,
+      "density": 1.0,
+      "avg_internal_weight": 1.0,
+      "proteins": [
+        "9606.ENSP00000381693"
+      ]
+    },
+    {
+      "cluster_id": 13588,
+      "size": 1,
+      "internal_edges": 1,
+      "density": 1.0,
+      "avg_internal_weight": 1.0,
+      "proteins": [
+        "9606.ENSP00000381970"
+      ]
+    },
+    {
+      "cluster_id": 13639,
+      "size": 1,
+      "internal_edges": 1,
+      "density": 1.0,
+      "avg_internal_weight": 1.0,
+      "proteins": [
+        "9606.ENSP00000382518"
+      ]
+    },
+    {
+      "cluster_id": 1439,
+      "size": 1,
+      "internal_edges": 1,
+      "density": 1.0,
+      "avg_internal_weight": 1.0,
+      "proteins": [
+        "9606.ENSP00000409378"
+      ]
+    },
+    {
+      "cluster_id": 15517,
+      "size": 1,
+      "internal_edges": 1,
+      "density": 1.0,
+      "avg_internal_weight": 1.0,
+      "proteins": [
+        "9606.ENSP00000417235"
+      ]
+    },
+    {
+      "cluster_id": 15942,
+      "size": 1,
+      "internal_edges": 1,
+      "density": 1.0,
+      "avg_internal_weight": 1.0,
+      "proteins": [
+        "9606.ENSP00000425166"
+      ]
+    },
+    {
+      "cluster_id": 16348,
+      "size": 1,
+      "internal_edges": 1,
+      "density": 1.0,
+      "avg_internal_weight": 1.0,
+      "proteins": [
+        "9606.ENSP00000434717"
+      ]
+    },
+    {
+      "cluster_id": 16460,
+      "size": 1,
+      "internal_edges": 1,
+      "density": 1.0,
+      "avg_internal_weight": 1.0,
+      "proteins": [
+        "9606.ENSP00000437629"
+      ]
+    },
+    {
+      "cluster_id": 13667,
+      "size": 1,
+      "internal_edges": 1,
+      "density": 1.0,
+      "avg_internal_weight": 1.0,
+      "proteins": [
+        "9606.ENSP00000438949"
+      ]
+    },
+    {
+      "cluster_id": 16630,
+      "size": 1,
+      "internal_edges": 1,
+      "density": 1.0,
+      "avg_internal_weight": 1.0,
+      "proteins": [
+        "9606.ENSP00000441980"
+      ]
+    },
+    {
+      "cluster_id": 16827,
+      "size": 1,
+      "internal_edges": 1,
+      "density": 1.0,
+      "avg_internal_weight": 1.0,
+      "proteins": [
+        "9606.ENSP00000446916"
+      ]
+    },
+    {
+      "cluster_id": 17081,
+      "size": 1,
+      "internal_edges": 1,
+      "density": 1.0,
+      "avg_internal_weight": 1.0,
+      "proteins": [
+        "9606.ENSP00000454562"
+      ]
+    },
+    {
+      "cluster_id": 17136,
+      "size": 1,
+      "internal_edges": 1,
+      "density": 1.0,
+      "avg_internal_weight": 1.0,
+      "proteins": [
+        "9606.ENSP00000455854"
+      ]
+    },
+    {
+      "cluster_id": 17749,
+      "size": 1,
+      "internal_edges": 1,
+      "density": 1.0,
+      "avg_internal_weight": 1.0,
+      "proteins": [
+        "9606.ENSP00000474850"
+      ]
+    },
+    {
+      "cluster_id": 18656,
+      "size": 1,
+      "internal_edges": 1,
+      "density": 1.0,
+      "avg_internal_weight": 1.0,
+      "proteins": [
+        "9606.ENSP00000489225"
+      ]
+    },
+    {
+      "cluster_id": 18663,
+      "size": 1,
+      "internal_edges": 1,
+      "density": 1.0,
+      "avg_internal_weight": 1.0,
+      "proteins": [
+        "9606.ENSP00000489320"
+      ]
+    },
+    {
+      "cluster_id": 18641,
+      "size": 1,
+      "internal_edges": 1,
+      "density": 1.0,
+      "avg_internal_weight": 1.0,
+      "proteins": [
+        "9606.ENSP00000489648"
+      ]
+    },
+    {
+      "cluster_id": 18707,
+      "size": 1,
+      "internal_edges": 1,
+      "density": 1.0,
+      "avg_internal_weight": 1.0,
+      "proteins": [
+        "9606.ENSP00000489890"
+      ]
+    },
+    {
+      "cluster_id": 18741,
+      "size": 1,
+      "internal_edges": 1,
+      "density": 1.0,
+      "avg_internal_weight": 1.0,
+      "proteins": [
+        "9606.ENSP00000490274"
+      ]
+    },
+    {
+      "cluster_id": 18924,
+      "size": 1,
+      "internal_edges": 1,
+      "density": 1.0,
+      "avg_internal_weight": 1.0,
+      "proteins": [
+        "9606.ENSP00000492963"
+      ]
+    }
+  ]
+}
