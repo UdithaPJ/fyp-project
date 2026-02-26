@@ -1,0 +1,7 @@
+Loaded CPU CSR: n=19,622 nnz=13,715,404 load_time=0.39s
+Params: R=2.0 TAU=1e-06 MAX_ITERS=60 TOL=1e-09
+Transferred to GPU | time=0.28s
+iter=01 nnz=0 err=1.000e+00 iter_time=0.16s
+iter=02 nnz=0 err=0.000e+00 iter_time=0.00s
+
+GPU DONE | final nnz=0 | total_time=0.16s

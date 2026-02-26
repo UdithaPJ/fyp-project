@@ -21,9 +21,9 @@ OUT_FILE = RESULTS_DIR / f"mcl_cpu_single_{timestamp}.txt"
 
 # ---- Longer runtime knobs ----
 R = 2.0
-TAU = 1e-8      # smaller = keep more entries = slower
-MAX_ITERS = 80  # more iters = slower
-TOL = 1e-12      # stricter convergence = slower
+TAU = 1e-06      # smaller = keep more entries = slower
+MAX_ITERS = 60  # more iters = slower
+TOL = 1e-09      # stricter convergence = slower
 EXPANSION = 2   # or 4
 # ------------------------------
 

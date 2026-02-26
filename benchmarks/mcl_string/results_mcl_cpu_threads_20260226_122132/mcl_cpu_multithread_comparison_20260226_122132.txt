@@ -1,0 +1,17 @@
+STRING MCL CPU MULTI-THREAD COMPARISON
+timestamp=20260226_122132
+threads_tested=[1, 2, 4, 8, 12]
+
+SUMMARY:
+threads | load_time_s | total_time_s | speedup_vs_2t | nnz_out
+------------------------------------------------------------------------
+      1 |       0.388 |       44.543 |        1.000 | 19,555
+      2 |       0.388 |       41.213 |        1.081 | 19,555
+      4 |       0.385 |       39.503 |        1.128 | 19,555
+      8 |       0.380 |       39.060 |        1.140 | 19,555
+     12 |       0.390 |       42.657 |        1.044 | 19,555
+
+NOTES:
+- Each run is executed in a fresh Python process so thread env vars actually apply.
+- Full per-run logs: mcl_cpu_threads_<t>.log
+- Raw stdout/stderr captured for each run for reproducibility/debugging.
