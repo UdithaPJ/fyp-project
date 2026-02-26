@@ -1,10 +1,45 @@
-Loaded CSR: n=2,861 nnz=8,403 load_time=0.00s
-Workload: NUM_SOURCES=2048 SOURCE_MODE=top_degree N_PROCS=4
-Selected sources: 2048
 
-CPU MULTI BFS SUMMARY
-Total BFS runs: 2048
-Total visited (sum over runs): 1,071,245
-Avg depth (per run): 1.91
-Max depth seen: 11
-Total BFS time: 2.92s
+================================================================================
+BFS MULTI-THREADED CPU BENCHMARK
+Started: 2026-02-26T20:46:41.794146
+================================================================================
+
+[1/3] Loading graph...
+✓ Graph loaded: 2,861 nodes, 8,403 edges (load_time=0.002s)
+
+[2/3] Selecting source nodes...
+✓ Selected 2048 source nodes (top_degree mode)
+
+[3/3] Running benchmarks...
+
+  Running with 1 process(es)...
+    ✓ Time: 1.9819s | Throughput: 1033.36 runs/sec
+
+  Running with 2 process(es)...
+    ✓ Time: 1.0101s | Throughput: 2027.54 runs/sec
+
+  Running with 4 process(es)...
+    ✓ Time: 0.5299s | Throughput: 3864.97 runs/sec
+
+  Running with 8 process(es)...
+    ✓ Time: 0.4058s | Throughput: 5046.45 runs/sec
+
+  Running with 12 process(es)...
+    ✓ Time: 0.3528s | Throughput: 5805.28 runs/sec
+
+====================================================================================================
+BFS MULTI-THREADED BENCHMARK RESULTS
+====================================================================================================
+Procs    Runs     Visited         Avg Depth    Max Depth    Time (s)     Throughput      Speedup    Efficiency  
+----------------------------------------------------------------------------------------------------
+1        2048     1,071,245       1.91         11           1.9819       1033.36         1.00      x 100.00%     
+2        2048     1,071,245       1.91         11           1.0101       2027.54         1.96      x 98.10%      
+4        2048     1,071,245       1.91         11           0.5299       3864.97         3.74      x 93.50%      
+8        2048     1,071,245       1.91         11           0.4058       5046.45         4.88      x 61.04%      
+12       2048     1,071,245       1.91         11           0.3528       5805.28         5.62      x 46.82%      
+====================================================================================================
+
+[4/4] Saving results...
+✓ JSON results saved to results/bfs_cpu_multi.json
+CSV results saved to results/bfs_cpu_multi.csv
+✓ Algorithm outputs saved to results/bfs_algorithm_outputs.txt
