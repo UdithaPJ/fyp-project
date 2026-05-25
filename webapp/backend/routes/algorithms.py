@@ -27,6 +27,7 @@ import sys
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Thread
+from time import monotonic
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from fastapi.responses import StreamingResponse
@@ -164,6 +165,15 @@ def stream_algorithm(job_id: str) -> StreamingResponse:
     def _event_stream():
         event_queue: Queue = Queue()
 
+        # Track last known progress so keepalive events don't reset the UI.
+        last_progress: dict = {
+            "type": "progress",
+            "stage": "running",
+            "percent": 0,
+            "message": "",
+        }
+        last_emit = monotonic()
+
         def _progress_cb(event: dict) -> None:
             event_queue.put(event)
 
@@ -193,14 +203,40 @@ def stream_algorithm(job_id: str) -> StreamingResponse:
 
         while True:
             try:
-                event = event_queue.get(timeout=120)
+                # Use a short timeout and emit keepalive progress if the
+                # algorithm produces no events for a while (common for GPU
+                # kernels). This prevents intermediate proxies/browsers from
+                # closing an idle connection.
+                event = event_queue.get(timeout=15)
             except Empty:
-                # Safety valve — client should reconnect after timeout.
-                yield json.dumps({"type": "error", "message": "stream timeout"}).encode() + b"\n"
-                break
+                now = monotonic()
+                if now - last_emit >= 15:
+                    # Keepalive event — treated as normal progress by the frontend.
+                    keepalive = dict(last_progress)
+                    if not keepalive.get("message"):
+                        keepalive["message"] = "still running"
+                    yield json.dumps(keepalive).encode() + b"\n"
+                    last_emit = now
+                # If the worker thread unexpectedly died without signaling _DONE,
+                # fail fast so the client isn't stuck forever.
+                if not worker_thread.is_alive() and event_queue.empty():
+                    yield json.dumps({"type": "error", "message": "stream terminated unexpectedly"}).encode() + b"\n"
+                    break
+                continue
             if event is _DONE:
                 break
+
+            if isinstance(event, dict) and event.get("type") == "progress":
+                # Update keepalive baseline.
+                last_progress = {
+                    "type": "progress",
+                    "stage": event.get("stage", last_progress.get("stage", "running")),
+                    "percent": event.get("percent", last_progress.get("percent", 0)),
+                    "message": event.get("message", last_progress.get("message", "")),
+                }
+
             yield json.dumps(event).encode() + b"\n"
+            last_emit = monotonic()
 
     return StreamingResponse(_event_stream(), media_type="application/x-ndjson")
 

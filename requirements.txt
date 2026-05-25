@@ -21,6 +21,8 @@ networkx
 #   pip install cupy-cuda12x   (CUDA 12.x)
 # cupy-cuda11x
 # pycuda
+# cupy-cuda12x
+# pycuda
 
 # -- Visualization ------------------------------------------------------------
 matplotlib
