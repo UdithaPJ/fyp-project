@@ -32,8 +32,13 @@ max_depth (int, default 5)   Maximum BFS depth.  Cascade beyond this depth is
 """
 
 # ── GPU / CUDA-optimised implementation ──────────────────────────────────
-# Source: biological_network_framework/algorithms/bfs.py
-# Requires: cupy-cuda11x (or matching CUDA version), pycuda
+# Source:    biological_network_framework/algorithms/bfs.py
+# Requires:  cupy-cuda11x (or matching CUDA version), pycuda
+# Used by:   webapp routes, GPU benchmarking (src.benchmarking.benchmark)
+# Modes:     _cpu_single, _cpu_multi, _gpu  (all three)
+# CPU-only counterparts (benchmarking only — never import in webapp):
+#   src.algorithms.cpu.single_threaded.bfs
+#   src.algorithms.cpu.multi_threaded.bfs
 # ──────────────────────────────────────────────────────────────────────────
 
 import warnings

@@ -54,8 +54,13 @@ van Dongen, S. (2000). A Cluster Algorithm for Graphs. CWI Technical Report.
 """
 
 # ── GPU / CUDA-optimised implementation ──────────────────────────────────
-# Source: biological_network_framework/algorithms/mcl.py
-# Requires: cupy-cuda11x (or matching CUDA version), pycuda
+# Source:    biological_network_framework/algorithms/mcl.py
+# Requires:  cupy-cuda11x (or matching CUDA version), pycuda
+# Used by:   webapp routes, GPU benchmarking (src.benchmarking.benchmark)
+# Modes:     _cpu_single, _cpu_multi, _gpu  (all three)
+# CPU-only counterparts (benchmarking only — never import in webapp):
+#   src.algorithms.cpu.single_threaded.mcl
+#   src.algorithms.cpu.multi_threaded.mcl
 # ──────────────────────────────────────────────────────────────────────────
 
 import sys

@@ -81,8 +81,13 @@ resolution   (float, default 1.0)   γ in the modularity formula.
 """
 
 # ── GPU / CUDA-optimised implementation ──────────────────────────────────
-# Source: biological_network_framework/algorithms/louvain.py
-# Requires: cupy-cuda11x (or matching CUDA version), pycuda
+# Source:    biological_network_framework/algorithms/louvain.py
+# Requires:  cupy-cuda11x (or matching CUDA version), pycuda
+# Used by:   webapp routes, GPU benchmarking (src.benchmarking.benchmark)
+# Modes:     _cpu_single, _cpu_multi, _gpu  (all three)
+# CPU-only counterparts (benchmarking only — never import in webapp):
+#   src.algorithms.cpu.single_threaded.louvain
+#   src.algorithms.cpu.multi_threaded.louvain
 # ──────────────────────────────────────────────────────────────────────────
 
 import warnings

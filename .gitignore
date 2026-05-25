@@ -68,7 +68,7 @@ experiments/logs/
 
 # Benchmark artifacts
 *.csv
-*.json
+experiments/outputs/reports/*.json
 *.pkl
 *.pickle
 results/
@@ -116,3 +116,9 @@ htmlcov/
 # Windows
 Thumbs.db
 ehthumbs.db
+
+# Exclude all files except package.json
+!package.json
+!package-lock.json
+!webapp/frontend/package.json
+!webapp/frontend/package-lock.json

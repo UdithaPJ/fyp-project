@@ -58,8 +58,13 @@ tolerance (float, default 1e-6)  L1-norm convergence threshold.
 """
 
 # ── GPU / CUDA-optimised implementation ──────────────────────────────────
-# Source: biological_network_framework/algorithms/pagerank.py
-# Requires: cupy-cuda11x (or matching CUDA version), pycuda
+# Source:    biological_network_framework/algorithms/pagerank.py
+# Requires:  cupy-cuda11x (or matching CUDA version), pycuda
+# Used by:   webapp routes, GPU benchmarking (src.benchmarking.benchmark)
+# Modes:     _cpu_single, _cpu_multi, _gpu  (all three)
+# CPU-only counterparts (benchmarking only — never import in webapp):
+#   src.algorithms.cpu.single_threaded.pagerank
+#   src.algorithms.cpu.multi_threaded.pagerank
 # ──────────────────────────────────────────────────────────────────────────
 
 import warnings

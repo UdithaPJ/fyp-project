@@ -47,8 +47,13 @@ seed_nodes    (list[int] or
 """
 
 # ── GPU / CUDA-optimised implementation ──────────────────────────────────
-# Source: biological_network_framework/algorithms/rwr.py
-# Requires: cupy-cuda11x (or matching CUDA version), pycuda
+# Source:    biological_network_framework/algorithms/rwr.py
+# Requires:  cupy-cuda11x (or matching CUDA version), pycuda
+# Used by:   webapp routes, GPU benchmarking (src.benchmarking.benchmark)
+# Modes:     _cpu_single, _cpu_multi, _gpu  (all three)
+# CPU-only counterparts (benchmarking only — never import in webapp):
+#   src.algorithms.cpu.single_threaded.rwr
+#   src.algorithms.cpu.multi_threaded.rwr
 # ──────────────────────────────────────────────────────────────────────────
 
 import warnings

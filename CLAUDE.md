@@ -11,21 +11,32 @@ Three main layers:
 - `webapp/`       — user-facing web application (FastAPI + React/Vite)
 - `experiments/`  — benchmarking and validation (not user-facing)
 
-## Critical rule: two separate algorithm locations
+## Critical rule: three separate algorithm locations
 
 ```
-src/algorithms/gpu/cuda_optimized/   ← used by webapp and GPU benchmarking
+src/algorithms/gpu/cuda_optimized/          ← used by webapp and GPU benchmarking
   Custom CUDA / PyCUDA implementations. All three modes
   (_cpu_single, _cpu_multi, _gpu). These are the primary
   contribution of the project.
 
-src/algorithms/cpu/                  ← used by CPU benchmarking only
-  CPU-only copies (cpu_single and cpu_multi only). No _gpu function.
+src/algorithms/cpu/single_threaded/         ← used by CPU benchmarking only
+  Single-threaded CPU implementations (cpu_single only). No _gpu function.
+  Never imported by webapp code.
+
+src/algorithms/cpu/multi_threaded/          ← used by CPU benchmarking only
+  Multi-process CPU implementations (cpu_multi only). No _gpu function.
   Never imported by webapp code.
 ```
 
+Convenience imports from `src/algorithms/cpu/` (re-exports both sub-packages):
+    from src.algorithms.cpu import pagerank_cpu_single, pagerank_cpu_multi
+    ...and so on for all six algorithms.
+
+Shared helpers used by both single_threaded and multi_threaded variants:
+    src/algorithms/common/helpers.py
+
 - **NEVER** import from `src/algorithms/cpu/` in webapp code.
-- **NEVER** add `_gpu` functions to `src/algorithms/cpu/` files.
+- **NEVER** add `_gpu` functions to any `src/algorithms/cpu/` file.
 
 ---
 
