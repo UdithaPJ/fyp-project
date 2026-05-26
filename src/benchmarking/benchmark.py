@@ -255,7 +255,7 @@ def _load_dataset(dataset_name: str) -> tuple[sp.csr_matrix, dict, dict]:
     if not os.path.isfile(npz_path):
         sys.exit(
             f"[ERROR] Preprocessed graph not found: {npz_path}\n"
-            f"        Run preprocessing/preprocess.py first."
+            f"        Generate it via the preprocessing pipeline (src/preprocessing/) first."
         )
 
     graph = sp.load_npz(npz_path).tocsr()
