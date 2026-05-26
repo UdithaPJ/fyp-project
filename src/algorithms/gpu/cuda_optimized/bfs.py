@@ -76,7 +76,6 @@ import scipy.sparse as sp
 # ---------------------------------------------------------------------------
 
 try:
-    import pycuda.autoinit  # noqa: F401  (initialises a default context)
     import pycuda.driver as cuda
     from pycuda.compiler import SourceModule
     _PYCUDA_AVAILABLE = True
@@ -141,6 +140,38 @@ __global__ void bfs_expand(
 """
 
 _KERNEL_CACHE: dict = {}
+_PYCUDA_PRIMARY_CONTEXT = None
+
+
+def _ensure_pycuda_context_current() -> bool:
+    """Ensure a PyCUDA CUDA context is current in the calling thread.
+
+    Returns True if this function pushed the context (caller should pop),
+    False if a context was already current or context setup failed.
+
+    Uses the device PRIMARY context so it can coexist with CuPy.
+    """
+    global _PYCUDA_PRIMARY_CONTEXT
+    if not _PYCUDA_AVAILABLE or cuda is None:
+        return False
+    try:
+        cuda.init()
+        if _PYCUDA_PRIMARY_CONTEXT is None:
+            if cuda.Device.count() <= 0:
+                return False
+            _PYCUDA_PRIMARY_CONTEXT = cuda.Device(0).retain_primary_context()
+
+        try:
+            current = cuda.Context.get_current()
+        except Exception:
+            current = None
+
+        if current is None:
+            _PYCUDA_PRIMARY_CONTEXT.push()
+            return True
+    except Exception:
+        return False
+    return False
 
 
 def _get_kernel():
@@ -214,105 +245,125 @@ def bfs_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
             "Install pycuda and ensure a working CUDA toolchain is on PATH."
         )
 
-    p         = _merge_params(params)
-    source    = int(p["source"])
-    max_depth = int(p["max_depth"])
-    N         = int(graph_csr.shape[0])
-
-    if not (0 <= source < N):
-        raise ValueError(f"BFS source {source} out of bounds for N={N}")
-
-    # CSR arrays expected by the kernel — both int32 on the device.
-    row_offsets_host = np.asarray(graph_csr.indptr, dtype=np.int32)
-    col_indices_host = np.asarray(graph_csr.indices, dtype=np.int32)
-
-    kernel = _get_kernel()
-
-    # ---- Device allocation ----
-    d_row_offsets = cuda.mem_alloc(row_offsets_host.nbytes)
-    d_col_indices = cuda.mem_alloc(col_indices_host.nbytes)
-    d_distances   = cuda.mem_alloc(N * np.int32().nbytes)
-    d_frontier_a  = cuda.mem_alloc(N * np.int32().nbytes)
-    d_frontier_b  = cuda.mem_alloc(N * np.int32().nbytes)
-    d_next_size   = cuda.mem_alloc(np.int32().nbytes)
+    pushed = _ensure_pycuda_context_current()
+    if cuda is None:
+        raise RuntimeError("PyCUDA driver not available")
 
     try:
-        # ---- H2D copies (graph + initial state) ----
-        cuda.memcpy_htod(d_row_offsets, row_offsets_host)
-        cuda.memcpy_htod(d_col_indices, col_indices_host)
+        p         = _merge_params(params)
+        source    = int(p["source"])
+        max_depth = int(p["max_depth"])
+        N         = int(graph_csr.shape[0])
 
-        distances_host = np.full(N, -1, dtype=np.int32)
-        distances_host[source] = 0
-        cuda.memcpy_htod(d_distances, distances_host)
+        if not (0 <= source < N):
+            raise ValueError(f"BFS source {source} out of bounds for N={N}")
 
-        # Seed frontier A with the single source vertex.
-        source_arr = np.array([source], dtype=np.int32)
-        cuda.memcpy_htod(d_frontier_a, source_arr)
-        frontier_size = 1
+        # CSR arrays expected by the kernel — both int32 on the device.
+        row_offsets_host = np.asarray(graph_csr.indptr, dtype=np.int32)
+        col_indices_host = np.asarray(graph_csr.indices, dtype=np.int32)
 
-        visited_order: list[int] = [source]
-        cascade: dict[int, list[int]] = {0: [source]}
+        kernel = _get_kernel()
 
-        d_cur, d_nxt = d_frontier_a, d_frontier_b
-        zero_i32 = np.int32(0)
+        d_row_offsets = None
+        d_col_indices = None
+        d_distances = None
+        d_frontier_a = None
+        d_frontier_b = None
+        d_next_size = None
 
-        for depth in range(1, max_depth + 1):
-            if frontier_size == 0:
-                break
+        try:
+            # ---- Device allocation ----
+            d_row_offsets = cuda.mem_alloc(row_offsets_host.nbytes)
+            d_col_indices = cuda.mem_alloc(col_indices_host.nbytes)
+            d_distances   = cuda.mem_alloc(N * np.int32().nbytes)
+            d_frontier_a  = cuda.mem_alloc(N * np.int32().nbytes)
+            d_frontier_b  = cuda.mem_alloc(N * np.int32().nbytes)
+            d_next_size   = cuda.mem_alloc(np.int32().nbytes)
 
-            # Reset next-frontier counter.
-            cuda.memcpy_htod(d_next_size, zero_i32)
+            # ---- H2D copies (graph + initial state) ----
+            cuda.memcpy_htod(d_row_offsets, row_offsets_host)
+            cuda.memcpy_htod(d_col_indices, col_indices_host)
 
-            grid_x = (frontier_size + _BLOCK_SIZE - 1) // _BLOCK_SIZE
-            kernel(
-                d_row_offsets,
-                d_col_indices,
-                d_cur,
-                np.int32(frontier_size),
-                d_nxt,
-                d_next_size,
-                d_distances,
-                np.int32(depth),
-                block=(_BLOCK_SIZE, 1, 1),
-                grid=(grid_x, 1, 1),
-            )
+            distances_host = np.full(N, -1, dtype=np.int32)
+            distances_host[source] = 0
+            cuda.memcpy_htod(d_distances, distances_host)
 
-            # Read back the size of the next frontier.
-            next_size_host = np.zeros(1, dtype=np.int32)
-            cuda.memcpy_dtoh(next_size_host, d_next_size)
-            next_size = int(next_size_host[0])
+            # Seed frontier A with the single source vertex.
+            source_arr = np.array([source], dtype=np.int32)
+            cuda.memcpy_htod(d_frontier_a, source_arr)
+            frontier_size = 1
 
-            if next_size == 0:
-                break
+            visited_order: list[int] = [source]
+            cascade: dict[int, list[int]] = {0: [source]}
 
-            # Copy the new frontier indices back for host-side bookkeeping.
-            new_nodes_host = np.empty(next_size, dtype=np.int32)
-            cuda.memcpy_dtoh(new_nodes_host, d_nxt)
-            new_nodes_list = new_nodes_host.tolist()
+            d_cur, d_nxt = d_frontier_a, d_frontier_b
+            zero_i32 = np.int32(0)
 
-            visited_order.extend(new_nodes_list)
-            cascade[depth] = sorted(new_nodes_list)
+            for depth in range(1, max_depth + 1):
+                if frontier_size == 0:
+                    break
 
-            # Ping-pong the worklists for the next level.
-            d_cur, d_nxt = d_nxt, d_cur
-            frontier_size = next_size
+                # Reset next-frontier counter.
+                cuda.memcpy_htod(d_next_size, zero_i32)
 
-        # ---- Final D2H of the distance array ----
-        cuda.memcpy_dtoh(distances_host, d_distances)
+                grid_x = (frontier_size + _BLOCK_SIZE - 1) // _BLOCK_SIZE
+                kernel(
+                    d_row_offsets,
+                    d_col_indices,
+                    d_cur,
+                    np.int32(frontier_size),
+                    d_nxt,
+                    d_next_size,
+                    d_distances,
+                    np.int32(depth),
+                    block=(_BLOCK_SIZE, 1, 1),
+                    grid=(grid_x, 1, 1),
+                )
 
+                # Read back the size of the next frontier.
+                next_size_host = np.zeros(1, dtype=np.int32)
+                cuda.memcpy_dtoh(next_size_host, d_next_size)
+                next_size = int(next_size_host[0])
+
+                if next_size == 0:
+                    break
+
+                # Copy the new frontier indices back for host-side bookkeeping.
+                new_nodes_host = np.empty(next_size, dtype=np.int32)
+                cuda.memcpy_dtoh(new_nodes_host, d_nxt)
+                new_nodes_list = new_nodes_host.tolist()
+
+                visited_order.extend(new_nodes_list)
+                cascade[depth] = sorted(new_nodes_list)
+
+                # Ping-pong the worklists for the next level.
+                d_cur, d_nxt = d_nxt, d_cur
+                frontier_size = next_size
+
+            # ---- Final D2H of the distance array ----
+            cuda.memcpy_dtoh(distances_host, d_distances)
+
+            return _pack_result(distances_host, visited_order, cascade)
+
+        finally:
+            # Explicit frees — PyCUDA's deallocation can race with context teardown
+            # if we leave these to GC, especially across repeated benchmark runs.
+            for buf in (
+                d_row_offsets, d_col_indices, d_distances,
+                d_frontier_a, d_frontier_b, d_next_size,
+            ):
+                if buf is None:
+                    continue
+                try:
+                    buf.free()
+                except Exception:
+                    pass
     finally:
-        # Explicit frees — PyCUDA's deallocation can race with context teardown
-        # if we leave these to GC, especially across repeated benchmark runs.
-        for buf in (
-            d_row_offsets, d_col_indices, d_distances,
-            d_frontier_a, d_frontier_b, d_next_size,
-        ):
+        if pushed and _PYCUDA_PRIMARY_CONTEXT is not None:
             try:
-                buf.free()
+                _PYCUDA_PRIMARY_CONTEXT.pop()
             except Exception:
                 pass
-
-    return _pack_result(distances_host, visited_order, cascade)
 
 
 # ---------------------------------------------------------------------------

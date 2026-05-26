@@ -34,6 +34,7 @@ result dict for the caller (web service, CLI, notebook) to persist.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import time
 from typing import Any, Optional
 
@@ -52,6 +53,7 @@ _GPU_TIMER_BACKEND: Optional[str] = None
 _CUDA_AVAILABLE = False
 _cp = None
 _pycuda = None
+_PYCUDA_PRIMARY_CONTEXT = None
 
 try:
     import cupy as _cp_mod
@@ -69,12 +71,74 @@ if not _CUDA_AVAILABLE:
         import pycuda.driver as _pc_mod
         _pc_mod.init()
         if _pc_mod.Device.count() > 0:
-            import pycuda.autoinit  # noqa: F401
             _pycuda = _pc_mod
             _GPU_TIMER_BACKEND = "pycuda"
             _CUDA_AVAILABLE = True
     except Exception:
         pass
+
+
+def _needs_pycuda_context(algorithm_name: str, mode: str) -> bool:
+    """Return True if this run should ensure a PyCUDA context is current."""
+    if mode != "gpu":
+        return False
+    # BFS is implemented with raw PyCUDA kernels.
+    if algorithm_name == "bfs":
+        return True
+    # If the timer backend is PyCUDA, we also need a current context.
+    return _GPU_TIMER_BACKEND == "pycuda"
+
+
+@contextmanager
+def _cuda_context_guard(algorithm_name: str, mode: str):
+    """Ensure the executing thread has a current CUDA context when needed."""
+    pushed = False
+
+    # Ensure a PyCUDA context is current for PyCUDA-based algorithms/timers.
+    if _needs_pycuda_context(algorithm_name, mode):
+        global _PYCUDA_PRIMARY_CONTEXT
+        try:
+            import pycuda.driver as cuda
+
+            cuda.init()
+            if _PYCUDA_PRIMARY_CONTEXT is None:
+                if cuda.Device.count() <= 0:
+                    raise RuntimeError("no CUDA devices detected")
+                # Use the PRIMARY context so it can coexist with CuPy.
+                _PYCUDA_PRIMARY_CONTEXT = cuda.Device(0).retain_primary_context()
+
+            try:
+                current = cuda.Context.get_current()
+            except Exception:
+                current = None
+
+            if current is None:
+                _PYCUDA_PRIMARY_CONTEXT.push()
+                pushed = True
+        except Exception:
+            # No PyCUDA context available in this thread. Let downstream code
+            # raise a clear error or fall back.
+            pushed = False
+
+    # Ensure CuPy's primary context is current in this thread (no-op if already).
+    # Do this AFTER any PyCUDA primary-context push so CuPy events/streams
+    # are guaranteed to bind to the same primary context.
+    if mode == "gpu" and _cp is not None:
+        try:
+            _cp.cuda.Device(0).use()
+        except Exception:
+            # If CuPy is present but no device/context is usable, defer to
+            # the algorithm's internal fallback logic.
+            pass
+
+    try:
+        yield
+    finally:
+        if pushed and _PYCUDA_PRIMARY_CONTEXT is not None:
+            try:
+                _PYCUDA_PRIMARY_CONTEXT.pop()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -261,8 +325,9 @@ def run_algorithm(
     reporter.update(ProgressReporter.STAGE_RUNNING, 30,
                     f"Running {algorithm_name}.{mode}()")
     try:
-        with BenchmarkTimer(mode) as timer:
-            result = mode_fn(graph_csr, final_params)
+        with _cuda_context_guard(algorithm_name, mode):
+            with BenchmarkTimer(mode) as timer:
+                result = mode_fn(graph_csr, final_params)
     except Exception as exc:
         reporter.error(f"{algorithm_name}.{mode} raised "
                        f"{type(exc).__name__}: {exc}")
