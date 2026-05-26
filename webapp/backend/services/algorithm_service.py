@@ -124,13 +124,15 @@ def run_algorithm_job(
     algorithm_name : str
         One of the six registered algorithm names.
     mode : str
-        ``"cpu_single"``, ``"cpu_multi"``, or ``"gpu"``.
+        Always ``"gpu"`` — CPU modes are for benchmarking only.
     params : dict
         Algorithm parameters supplied by the user.
     progress_callback : callable, optional
         Receives progress event dicts ``{type, stage, percent, message}``
         produced by the ``ProgressReporter``.  Used by the SSE stream route.
     """
+    # The webapp exclusively uses GPU mode; CPU variants are benchmarking-only.
+    mode = "gpu"
     _mark_running(job_id)
 
     try:

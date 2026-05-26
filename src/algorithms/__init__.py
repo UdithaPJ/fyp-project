@@ -1,38 +1,160 @@
-﻿"""
-Algorithm implementations.
+"""
+src/algorithms/__init__.py
+==========================
 
-Each algorithm is a class subclassing :class:`AlgorithmBase` and exposing
-``cpu_single``, ``cpu_multi``, and ``gpu`` static methods that return a
-standardised result dict.
+Builds the algorithm registry by dynamically wrapping each module in
+``src/algorithms/gpu/cuda_optimized/`` with a thin adapter class that
+satisfies the :class:`~src.algorithms.base.AlgorithmBase` interface
+expected by ``src/runner/algorithm_runner.py``.
 
-The algorithm classes are exposed both individually and via the
-``ALGORITHM_REGISTRY`` mapping that the runner uses for dynamic dispatch.
+Why adapters instead of direct imports
+---------------------------------------
+The runner resolves algorithms via ``ALGORITHM_REGISTRY[name]`` and expects
+each entry to provide:
+
+  * ``NAME``             — string identifier
+  * ``PARAM_SCHEMA``     — dict of default parameter values
+  * ``gpu(csr, params)`` — staticmethod returning the standard result dict
+  * ``validate_params``  — classmethod (inherited from AlgorithmBase)
+  * ``describe``         — classmethod (inherited from AlgorithmBase)
+
+The cuda_optimized modules expose ``_DEFAULT_PARAMS`` and ``_gpu()`` — the
+adapter translates between the two conventions.
+
+Result wrapping
+---------------
+``_gpu()`` in each cuda_optimized module returns::
+
+    {"output": {<algorithm-specific keys>}, "extra_params": {...}}
+
+The adapter's ``gpu()`` staticmethod unpacks this and wraps it into the
+standard result dict::
+
+    {
+      "algorithm":      str,
+      "mode":           "gpu",
+      "execution_time": 0.0,    # overwritten by runner's BenchmarkTimer
+      "num_nodes":      int,
+      "num_edges":      int,
+      "result":         dict,   # the "output" value from _gpu()
+    }
+
+CPU modes are NOT exposed here — they are benchmarking-only tools that live
+in ``src/algorithms/cpu/`` and are never used by the webapp.
 """
 
-from .base    import AlgorithmBase
-from .bfs     import BFS
-from .hits    import HITS
-from .louvain import Louvain
-from .mcl     import MCL
-from .pagerank import PageRank
-from .rwr     import RWR
+from __future__ import annotations
+
+import importlib
+
+import scipy.sparse as sp
+
+from .base import AlgorithmBase
+
+# ---------------------------------------------------------------------------
+# Per-algorithm metadata
+# ---------------------------------------------------------------------------
+
+# (registry_name, cuda_optimized module path, one-line description)
+_ALGO_META: list[tuple[str, str, str]] = [
+    (
+        "pagerank",
+        "src.algorithms.gpu.cuda_optimized.pagerank",
+        "Rank regulators by global influence in the GRN (PageRank).",
+    ),
+    (
+        "bfs",
+        "src.algorithms.gpu.cuda_optimized.bfs",
+        "Trace a regulatory cascade outward from a source TF (BFS).",
+    ),
+    (
+        "louvain",
+        "src.algorithms.gpu.cuda_optimized.louvain",
+        "Detect communities of co-regulated genes (Louvain).",
+    ),
+    (
+        "rwr",
+        "src.algorithms.gpu.cuda_optimized.rwr",
+        "Proximity walk from seed TFs (Random Walk with Restart).",
+    ),
+    (
+        "hits",
+        "src.algorithms.gpu.cuda_optimized.hits",
+        "Identify hub TFs and authority target genes (HITS).",
+    ),
+    (
+        "mcl",
+        "src.algorithms.gpu.cuda_optimized.mcl",
+        "Markov-clustering for tightly co-regulated modules (MCL).",
+    ),
+]
+
+
+# ---------------------------------------------------------------------------
+# Adapter factory
+# ---------------------------------------------------------------------------
+
+def _make_adapter(name: str, module_path: str, description: str) -> type[AlgorithmBase]:
+    """
+    Create an AlgorithmBase subclass that delegates ``gpu()`` to the
+    corresponding cuda_optimized module's ``_gpu()`` function.
+
+    The module is imported eagerly so import errors surface at startup
+    rather than silently at runtime.
+    """
+    mod = importlib.import_module(module_path)
+    defaults: dict = dict(getattr(mod, "_DEFAULT_PARAMS", {}))
+
+    def _gpu_staticmethod(graph_csr: sp.csr_matrix, params: dict) -> dict:
+        raw = mod._gpu(graph_csr, params)
+        # Unpack {"output": ..., "extra_params": ...} wrapper produced by _gpu()
+        result_data = raw["output"] if isinstance(raw, dict) and "output" in raw else raw
+        return {
+            "algorithm":      name,
+            "mode":           "gpu",
+            "execution_time": 0.0,   # overwritten by BenchmarkTimer in the runner
+            "num_nodes":      int(graph_csr.shape[0]),
+            "num_edges":      int(graph_csr.nnz),
+            "result":         result_data,
+        }
+
+    cls: type[AlgorithmBase] = type(
+        name.upper(),
+        (AlgorithmBase,),
+        {
+            "__doc__":      description,
+            "NAME":         name,
+            "PARAM_SCHEMA": defaults,
+            "gpu":          staticmethod(_gpu_staticmethod),
+        },
+    )
+    return cls
+
+
+# ---------------------------------------------------------------------------
+# Build registry
+# ---------------------------------------------------------------------------
 
 ALGORITHM_REGISTRY: dict[str, type[AlgorithmBase]] = {
-    PageRank.NAME: PageRank,
-    BFS.NAME:      BFS,
-    Louvain.NAME:  Louvain,
-    RWR.NAME:      RWR,
-    HITS.NAME:     HITS,
-    MCL.NAME:      MCL,
+    name: _make_adapter(name, path, desc)
+    for name, path, desc in _ALGO_META
 }
+
+# Named exports for any code that does ``from src.algorithms import PageRank``
+PageRank = ALGORITHM_REGISTRY["pagerank"]
+BFS      = ALGORITHM_REGISTRY["bfs"]
+Louvain  = ALGORITHM_REGISTRY["louvain"]
+RWR      = ALGORITHM_REGISTRY["rwr"]
+HITS     = ALGORITHM_REGISTRY["hits"]
+MCL      = ALGORITHM_REGISTRY["mcl"]
 
 __all__ = [
     "AlgorithmBase",
+    "ALGORITHM_REGISTRY",
     "PageRank",
     "BFS",
     "Louvain",
     "RWR",
     "HITS",
     "MCL",
-    "ALGORITHM_REGISTRY",
 ]

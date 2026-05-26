@@ -833,3 +833,79 @@ select {
     grid-template-columns: 1fr;
   }
 }
+
+/* ── GPU status indicators ─────────────────────────────────────────────── */
+
+.gpu-status-checking {
+  margin: 0 auto 1rem;
+  max-width: 720px;
+  padding: 10px 16px;
+  border-radius: 8px;
+  background: #f0f6ff;
+  border: 1px solid #c0d6f0;
+  color: #2c4f72;
+  font-size: 0.9rem;
+}
+
+.gpu-status-ok {
+  margin: 0 auto 1rem;
+  max-width: 720px;
+  padding: 10px 16px;
+  border-radius: 8px;
+  background: #edfaf3;
+  border: 1px solid #7dd3a8;
+  color: #1a5c3a;
+  font-size: 0.9rem;
+}
+
+.gpu-status-error {
+  margin: 0 auto 1.5rem;
+  max-width: 720px;
+  padding: 20px 24px;
+  border-radius: 10px;
+  background: #fff3f3;
+  border: 2px solid #e07070;
+  color: #7a1f1f;
+}
+
+.gpu-status-error strong {
+  display: block;
+  font-size: 1.05rem;
+  margin-bottom: 8px;
+  color: #b02020;
+}
+
+.gpu-status-error p {
+  margin: 6px 0;
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
+.gpu-status-detail {
+  font-family: "Consolas", "Monaco", monospace;
+  font-size: 0.8rem !important;
+  color: #8a3030 !important;
+  background: #fde8e8;
+  padding: 6px 10px;
+  border-radius: 6px;
+  word-break: break-word;
+}
+
+/* Dim the main panel when GPU is unavailable */
+.panel--disabled {
+  opacity: 0.35;
+  pointer-events: none;
+  user-select: none;
+}
+
+/* Readonly execution mode field in AlgorithmSelector */
+.param-field--readonly .param-field-value-fixed {
+  display: inline-block;
+  padding: 6px 12px;
+  border-radius: 6px;
+  background: #e8f0f8;
+  border: 1px solid #c4d6e8;
+  color: #244154;
+  font-weight: 600;
+  font-size: 0.9rem;
+}

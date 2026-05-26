@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional  # Literal kept for mode field
 
 from pydantic import BaseModel, Field
 
@@ -43,12 +43,9 @@ class RunAlgorithmRequest(BaseModel):
             "Algorithm name.  One of: pagerank, hits, rwr, louvain, mcl, bfs."
         ),
     )
-    mode: Literal["cpu_single", "cpu_multi", "gpu"] = Field(
+    mode: Literal["gpu"] = Field(
         default="gpu",
-        description=(
-            "Execution mode.  'gpu' falls back to 'cpu_single' automatically "
-            "if no CUDA device is available."
-        ),
+        description="Execution mode.  Always 'gpu' — CPU modes are reserved for benchmarking only.",
     )
     params: Optional[Dict[str, Any]] = Field(
         default_factory=dict,

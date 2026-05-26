@@ -136,6 +136,11 @@ export async function getGraphStats(uploadId) {
   return parseResponse(response);
 }
 
+export async function getGpuStatus() {
+  const response = await fetch(`${API_BASE_URL}/system/gpu-status`);
+  return parseResponse(response);
+}
+
 export async function getAlgorithmCatalog() {
   const response = await fetch(`${API_BASE_URL}/algorithms/catalog`);
   return parseResponse(response);

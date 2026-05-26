@@ -73,7 +73,6 @@ function AlgorithmSelector({ uploadId, onBack, onNext }) {
   const [isLoading, setLoading] = useState(false);
   const [error, setError]       = useState("");
   const [selected, setSelected] = useState(null);
-  const [mode, setMode]         = useState("gpu");
   const [params, setParams]     = useState({});
 
   // Load catalog once on mount
@@ -136,7 +135,7 @@ function AlgorithmSelector({ uploadId, onBack, onNext }) {
     if (!selectedAlgo) return;
     onNext?.({
       algorithm: selectedAlgo.name,
-      mode,
+      mode: "gpu",
       params: { ...params },
     });
   }
@@ -224,20 +223,13 @@ function AlgorithmSelector({ uploadId, onBack, onNext }) {
                 },
               )}
 
-              <label className="param-field">
+              <div className="param-field param-field--readonly">
                 <span className="param-field-label">Execution mode</span>
-                <select
-                  onChange={(event) => setMode(event.target.value)}
-                  value={mode}
-                >
-                  <option value="gpu">gpu (recommended)</option>
-                  <option value="cpu_single">cpu_single</option>
-                  <option value="cpu_multi">cpu_multi</option>
-                </select>
+                <span className="param-field-value-fixed">GPU (CUDA)</span>
                 <small className="param-field-hint">
-                  GPU mode falls back to cpu_single if no CUDA device is present.
+                  Analyses always run on the detected NVIDIA GPU.
                 </small>
-              </label>
+              </div>
             </>
           )}
         </div>

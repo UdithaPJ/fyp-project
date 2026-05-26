@@ -7,7 +7,7 @@ import ResultsView from "./components/ResultsView";
 import RunAnalysis from "./components/RunAnalysis";
 import Upload from "./components/Upload";
 import Validation from "./components/Validation";
-import { detectColumns, preprocessDatasetWithProgress } from "./services/api";
+import { detectColumns, getGpuStatus, preprocessDatasetWithProgress } from "./services/api";
 
 const STEP_TITLES = [
   "Upload Dataset",
@@ -23,6 +23,22 @@ const STEP_TITLES = [
 function App() {
   const [step, setStep] = useState(0);
   const [error, setError] = useState("");
+  const [gpuStatus, setGpuStatus] = useState(null);   // null = checking
+
+  // Check GPU availability once on mount — before the user does anything.
+  useEffect(() => {
+    getGpuStatus()
+      .then(setGpuStatus)
+      .catch(() =>
+        setGpuStatus({
+          available: false,
+          device_name: null,
+          cuda_version: null,
+          driver: "none",
+          error: "Could not reach the backend to check GPU status.",
+        }),
+      );
+  }, []);
   const [uploadResult, setUploadResult] = useState(null);
   const [detectionResult, setDetectionResult] = useState(null);
   const [mapping, setMapping] = useState({
@@ -198,8 +214,37 @@ function App() {
 
       {error ? <div className="error-banner">{error}</div> : null}
 
-      <main className="panel">
-        {step === 0 ? (
+      {/* GPU availability gate — shown on the upload step while checking,
+          and as a persistent blocking error if no CUDA GPU is detected.    */}
+      {gpuStatus === null ? (
+        <div className="gpu-status-checking">
+          Checking for CUDA-capable GPU…
+        </div>
+      ) : !gpuStatus.available ? (
+        <div className="gpu-status-error">
+          <strong>No NVIDIA CUDA GPU detected</strong>
+          <p>
+            This framework requires a CUDA-capable NVIDIA GPU.
+            All analyses run exclusively on the GPU.
+          </p>
+          {gpuStatus.error ? (
+            <p className="gpu-status-detail">{gpuStatus.error}</p>
+          ) : null}
+          <p>
+            Please run this application on a machine with a supported NVIDIA
+            GPU and the appropriate CUDA drivers installed, then refresh the
+            page.
+          </p>
+        </div>
+      ) : step === 0 ? (
+        <div className="gpu-status-ok">
+          GPU detected: <strong>{gpuStatus.device_name}</strong>
+          {gpuStatus.cuda_version ? ` — CUDA ${gpuStatus.cuda_version}` : ""}
+        </div>
+      ) : null}
+
+      <main className={`panel${gpuStatus && !gpuStatus.available ? " panel--disabled" : ""}`}>
+        {step === 0 && gpuStatus && !gpuStatus.available ? null : step === 0 ? (
           <Upload
             uploadResult={uploadResult}
             isDetecting={isDetecting}

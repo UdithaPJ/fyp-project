@@ -20,11 +20,13 @@ try:
     from .routes.graph import router as graph_router
     from .routes.algorithms import router as algorithms_router
     from .routes.results import router as results_router
+    from .routes.system import router as system_router
 except ImportError:  # pragma: no cover - fallback for running from backend directory
     from routes.preprocessing import router as preprocessing_router
     from routes.graph import router as graph_router
     from routes.algorithms import router as algorithms_router
     from routes.results import router as results_router
+    from routes.system import router as system_router
 
 
 app = FastAPI(
@@ -51,6 +53,7 @@ app.include_router(preprocessing_router)
 app.include_router(graph_router)
 app.include_router(algorithms_router)
 app.include_router(results_router)
+app.include_router(system_router)
 
 
 @app.get("/")
