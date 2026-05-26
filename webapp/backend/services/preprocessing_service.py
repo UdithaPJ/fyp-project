@@ -17,6 +17,7 @@ PROJECT_ROOT = WEBAPP_DIR.parent          # fyp-project (top of repo)
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.graph.converter import graphdata_to_csr
 from src.preprocessing.modules import FileLoader, SchemaDetector
 from src.preprocessing.pipeline import PreprocessingPipeline
 
@@ -96,7 +97,13 @@ class PreprocessingService:
         mapping: Dict[str, str | None],
         duplicate_method: str,
     ) -> PreprocessResponse:
-        """Run cleaning, duplicate handling, validation, and graph building."""
+        """Run cleaning, duplicate handling, validation, and graph building.
+
+        After the pipeline completes, the resulting ``GraphData``, the
+        derived scipy CSR matrix, and the node-label → index map are all
+        attached to the dataset record so subsequent algorithm runs can
+        retrieve them directly without re-running the pipeline.
+        """
 
         record = self._get_dataset(upload_id)
         self._warn_if_large(record.dataframe, context=record.filename)
@@ -105,6 +112,7 @@ class PreprocessingService:
             user_override=mapping,
             duplicate_strategy=duplicate_method,
         )
+        self._store_graph_artefacts(upload_id, graph_data)
         api_graph = self._to_api_graph(graph_data)
         return PreprocessResponse(
             nodes=len(graph_data.nodes),
@@ -120,7 +128,11 @@ class PreprocessingService:
         duplicate_method: str,
         progress_callback: Optional[Callable[[str, float], None]] = None,
     ) -> PreprocessResponse:
-        """Run preprocessing while reporting progress through a callback."""
+        """Run preprocessing while reporting progress through a callback.
+
+        Stores the same graph artefacts as :meth:`preprocess` so the
+        algorithm layer can fetch them without re-running the pipeline.
+        """
 
         record = self._get_dataset(upload_id)
         self._warn_if_large(record.dataframe, context=record.filename)
@@ -130,12 +142,31 @@ class PreprocessingService:
             duplicate_strategy=duplicate_method,
             progress_callback=progress_callback,
         )
+        self._store_graph_artefacts(upload_id, graph_data)
         api_graph = self._to_api_graph(graph_data)
         return PreprocessResponse(
             nodes=len(graph_data.nodes),
             edges=len(graph_data.edges),
             validation=self._make_json_safe(validation),
             graph=api_graph,
+        )
+
+    def _store_graph_artefacts(self, upload_id: str, graph_data) -> None:
+        """Attach ``graph_data``, ``graph_csr``, and ``node_index_map`` to
+        the dataset record.
+
+        The CSR matrix is computed here (once) instead of inside the
+        algorithm service so that every algorithm run can reuse it.
+        """
+
+        graph_csr, node_index_map = graphdata_to_csr(graph_data)
+        dataset_store.update(
+            upload_id,
+            {
+                "graph_data":     graph_data,
+                "graph_csr":      graph_csr,
+                "node_index_map": node_index_map,
+            },
         )
 
     def _get_dataset(self, upload_id: str) -> DatasetRecord:

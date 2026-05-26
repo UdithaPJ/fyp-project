@@ -39,7 +39,6 @@ if str(PROJECT_ROOT) not in sys.path:
 
 # Core src/ imports — all guarded so the module can be imported even if
 # optional GPU dependencies (cupy, pycuda) are absent at import time.
-from src.graph.converter import graphdata_to_csr
 from src.runner.algorithm_runner import list_algorithms, run_algorithm
 from src.runner.progress import ProgressReporter
 from src.visualization.charts import make_cluster_size_chart_data, make_score_chart_data
@@ -66,11 +65,6 @@ except ImportError:  # pragma: no cover - fallback for running from backend dire
         STATUS_RUNNING,
         result_store,
     )
-
-# GraphBuilder is used to convert the stored DataFrame into a GraphData
-# object before the CSR conversion step.
-from src.preprocessing.modules import GraphBuilder
-from src.preprocessing.pipeline import PreprocessingPipeline
 
 
 def get_algorithm_catalog() -> list[Dict[str, Any]]:
@@ -105,12 +99,13 @@ def run_algorithm_job(
     Pipeline
     --------
     1. Mark job as ``running``.
-    2. Retrieve the stored DataFrame from ``dataset_store``.
-    3. Re-run the preprocessing pipeline to produce a ``GraphData`` object.
-    4. Convert ``GraphData`` → CSR matrix + ``node_index_map``.
-    5. Run the algorithm via ``src.runner.algorithm_runner.run_algorithm``.
-    6. Build visualization payloads (chart, table, graph-viz).
-    7. Mark job as ``completed`` with all payloads attached.
+    2. Retrieve the dataset record from ``dataset_store``.
+    3. Read the pre-computed ``graph_csr`` and ``node_index_map`` directly
+       from the record — the preprocessing pipeline already ran once
+       during the /preprocess step and is NEVER re-run here.
+    4. Run the algorithm via ``src.runner.algorithm_runner.run_algorithm``.
+    5. Build visualization payloads (chart, table, graph-viz).
+    6. Mark job as ``completed`` with all payloads attached.
 
     Any exception at any step marks the job as ``failed`` and stores the
     error message — it does NOT re-raise (the caller is a daemon thread).
@@ -136,26 +131,28 @@ def run_algorithm_job(
     _mark_running(job_id)
 
     try:
-        # ---- Step 2: retrieve dataset ----
-        record = dataset_store.get(upload_id)
+        # ---- Step 2: retrieve dataset record ----
+        try:
+            record = dataset_store.get(upload_id)
+        except KeyError as exc:
+            raise ValueError(f"No dataset found for upload_id: {upload_id}") from exc
 
-        # ---- Step 3: build GraphData from the stored DataFrame ----
-        # The preprocessing pipeline has already cleaned / validated the data
-        # and stored the DataFrame.  We re-run the lightweight GraphBuilder
-        # stage only (no re-cleaning) to get a fresh GraphData object.
-        pipeline = PreprocessingPipeline()
-        graph_data, _validation = pipeline.run_dataframe(
-            raw_dataframe=record.dataframe,
-            # No user override needed here — the column mapping was already
-            # applied during the original upload / preprocess step.
-            user_override=None,
-            duplicate_strategy="mean",
-        )
+        # ---- Step 3: read pre-computed graph artefacts ----
+        # The /preprocess (or /preprocess/stream) endpoint ran the pipeline
+        # ONCE and attached the CSR matrix + node index map to the record.
+        # We never re-run the pipeline here — that would duplicate work and
+        # silently re-detect a column mapping that may not match the one
+        # the user actually confirmed.
+        graph_csr      = getattr(record, "graph_csr", None)
+        node_index_map = getattr(record, "node_index_map", None)
+        if graph_csr is None or node_index_map is None:
+            raise ValueError(
+                "Graph has not been preprocessed yet. "
+                "Complete the preprocessing step before running algorithms. "
+                f"upload_id={upload_id}"
+            )
 
-        # ---- Step 4: CSR conversion ----
-        graph_csr, node_index_map = graphdata_to_csr(graph_data)
-
-        # ---- Step 5: run algorithm ----
+        # ---- Step 4: run algorithm ----
         reporter = ProgressReporter(callback=progress_callback)
         result = run_algorithm(
             algorithm_name=algorithm_name,
@@ -166,12 +163,12 @@ def run_algorithm_job(
             progress_reporter=reporter,
         )
 
-        # ---- Step 6: visualization payloads ----
+        # ---- Step 5: visualization payloads ----
         chart_data  = _build_chart(result, node_index_map)
         table_data  = _build_table(result, node_index_map)
         graph_viz   = make_highlight_data(result, graph_csr, node_index_map)
 
-        # ---- Step 7: mark completed ----
+        # ---- Step 6: mark completed ----
         result_store.update_job(
             job_id,
             status=STATUS_COMPLETED,

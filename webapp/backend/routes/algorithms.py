@@ -43,11 +43,13 @@ try:
     from ..models.requests import RunAlgorithmRequest
     from ..models.responses import JobStatusResponse
     from ..services.algorithm_service import get_algorithm_catalog, run_algorithm_job
+    from ..services.dataset_store import dataset_store
     from ..services.result_store import result_store
 except ImportError:  # pragma: no cover - fallback for running from backend directory
     from models.requests import RunAlgorithmRequest
     from models.responses import JobStatusResponse
     from services.algorithm_service import get_algorithm_catalog, run_algorithm_job
+    from services.dataset_store import dataset_store
     from services.result_store import result_store
 
 
@@ -94,7 +96,26 @@ def run_algorithm(
 
     HTTP 202 (Accepted) signals that the request was received but the
     computation has not yet completed.
+
+    Guard: the dataset referenced by ``upload_id`` must already have been
+    preprocessed (i.e. ``graph_csr`` is attached to its record).  We
+    short-circuit with HTTP 400 here so the user gets an immediate, clear
+    error instead of a cryptic background-job failure.
     """
+    # ---- Guard: dataset must exist and must already be preprocessed ----
+    try:
+        record = dataset_store.get(payload.upload_id)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No uploaded dataset found for upload_id '{payload.upload_id}'.",
+        ) from exc
+    if getattr(record, "graph_csr", None) is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Dataset not preprocessed. Complete preprocessing first.",
+        )
+
     job_id = result_store.create_job(
         algorithm=payload.algorithm,
         mode=payload.mode,

@@ -266,6 +266,28 @@ Default view per algorithm:
 
 ---
 
+## Data flow: preprocessing → algorithm
+
+1. User uploads file → POST /upload
+   dataset_store stores: raw DataFrame
+
+2. User maps columns + runs preprocessing → POST /preprocess/stream
+   preprocessing_service.py runs pipeline ONCE
+   dataset_store stores: graph_data, graph_csr, node_index_map
+   Frontend shows Graph Summary (Step 3)
+
+3. User selects algorithm → POST /algorithms/run
+   algorithm_service.py retrieves graph_csr + node_index_map
+   directly from dataset_store
+   Pipeline is NOT re-run
+   If graph_csr is None: return HTTP 400 (not preprocessed yet)
+
+The pipeline runs EXACTLY ONCE per upload session.
+graph_csr and node_index_map are computed once and reused
+for every algorithm run in that session.
+
+---
+
 ## Additional rules for the new structure
 
 ### Import paths (always use these — never old paths)
@@ -314,6 +336,12 @@ from src.explanation.explainer   import explain_result
 - `src/preprocessing/`          (pipeline, modules, graph_data)
 - `webapp/backend/routes/preprocessing.py`
 - `webapp/backend/services/dataset_store.py`
+  Stores per upload_id: raw DataFrame, GraphData,
+  graph_csr (CSR matrix), node_index_map.
+  Graph results are populated by preprocessing_service.py
+  after /preprocess completes.
+  Retrieved directly by algorithm_service.py —
+  pipeline is NEVER re-run after Step 3.
 - `webapp/backend/services/preprocessing_service.py`
 - `webapp/backend/models/`
 - `webapp/frontend/src/components/Upload.jsx`

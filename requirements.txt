@@ -20,8 +20,8 @@ networkx
 #   pip install cupy-cuda11x   (CUDA 11.x)
 #   pip install cupy-cuda12x   (CUDA 12.x)
 # cupy-cuda11x
-# pycuda
-# cupy-cuda12x
+pycuda
+cupy-cuda13x
 # pycuda
 
 # -- Visualization ------------------------------------------------------------
