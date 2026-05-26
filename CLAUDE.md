@@ -190,6 +190,43 @@ mcl:      {"expansion": 2, "inflation": 2.0, "prune_threshold": 0.001,
 
 ---
 
+## BFS GPU implementation (optimised)
+
+Five-improvement version addressing load imbalance, atomic contention,
+memory inefficiency, kernel overhead, and static traversal strategy.
+
+Kernels (all compiled together in one `SourceModule`):
+  - `bfs_frontier_tiered` — push kernel with three-tier scheduling
+      < 32 neighbours   → 1 thread per node
+      32–255 neighbours → 1 warp per node (stride-32 loop)
+      ≥ 256 neighbours  → 1 block per node (stride-256 loop)
+  - `bfs_pull` — pull kernel for large frontiers, bitmap-based
+  - `worklist_to_bitmap`, `bitmap_to_worklist` — direction-switch helpers
+  - `bfs_persistent` (optional, cooperative-groups) — level loop inside
+      kernel; requires sm ≥ 7.0.  Currently gated behind
+      `USE_PERSISTENT_KERNEL = False` until cooperative launches are
+      verified on the deployment box.
+
+Key implementation details:
+  - Visited array: `uint32` bitmap (32× memory reduction)
+  - Atomic pressure: block-local shared-memory buffer + warp-level
+    deduplication via `__match_any_sync` (one global `atomicAdd` per
+    block per level instead of one per discovered neighbour)
+  - Push/pull threshold: `frontier_size > n / (4 · avg_degree)`
+  - Compilation target: `-arch=sm_75` (RTX 20-series Turing)
+  - Kernel cache: compiled once, reused across calls
+  - Network-type handling: PPI symmetrises the adjacency before running
+    (transpose == original, so only one CSR is allocated); GRN / mirna
+    keep edge direction and allocate the CSR-transpose separately.
+  - Fallback chain: optimised GPU → `cpu_single` (logs warning).
+
+Result includes `traversal_modes` list showing the push/pull decision
+per level (useful for benchmarking analysis).
+
+Do NOT revert to CuPy SpMV or single-tier kernel.
+
+---
+
 ## Progress event format (NDJSON)
 
 ```json
