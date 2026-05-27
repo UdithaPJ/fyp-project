@@ -227,6 +227,382 @@ Do NOT revert to CuPy SpMV or single-tier kernel.
 
 ---
 
+## HITS GPU implementation
+
+Custom PyCUDA kernels — no CuPy dependency.
+
+Kernels (compiled once, cached in `_kernel_cache["hits"]`):
+  - `spmv_degree_aware`        — SpMV with three-tier scheduling
+      < 32 edges  → 1 thread (serial)
+      32–255      → 1 warp (`__shfl_down_sync` reduction)
+      ≥ 256       → 1 block (shared-memory tree reduction)
+  - `compute_partial_norm_sq`  — partial L2-norm², one sum per block
+  - `normalize_vector`         — in-place division by L2 norm
+  - `compute_convergence_delta`— Σ((Δh)² + (Δa)²) partial per block
+
+Two-phase norm computation:
+  - Phase 1 (GPU): `compute_partial_norm_sq` → `d_partial` (small array)
+  - Phase 2 (CPU): `np.sqrt(np.sum(d_partial.get()))`
+  - Rationale: avoids a second GPU kernel for a tiny array;
+    CPU reduction of `norm_blocks` (~⌈n/256⌉) values is negligible.
+
+Both `A` and `Aᵀ` stored in CSR on GPU throughout iteration.
+Pointer swap (`d_h, d_h_new = d_h_new, d_h`) avoids data copies.
+CUDA streams: `stream_compute` for kernels, `stream_transfer` for
+  async H2D transfers during setup.
+Context handling: the device PRIMARY context is `retain_primary_context()`
+  and pushed unconditionally so PyCUDA's driver-API works correctly even
+  when CuPy is also active in the same process (avoids
+  `cuModuleLoadDataEx: invalid device context`).
+Network-type behaviour:
+  - grn / mirna: directed `A`, returns `top_hubs` + `top_authorities` +
+    `hub_authority_overlap`
+  - ppi:         symmetrised `A + Aᵀ` (binarised), returns `top_nodes` only
+Does NOT silently fall back to CPU — raises `RuntimeError` /
+  `cuda.LogicError` / `MemoryError` so `algorithm_runner.py` can handle
+  the failure explicitly.
+Target: `-arch=sm_75` (RTX 20-series Turing), `BLOCK_SIZE = 256`.
+
+---
+
+## Louvain GPU implementation
+
+Custom PyCUDA kernels — no CuPy dependency.
+
+Preprocessing (CPU, before any GPU work):
+  - `_symmetrize(graph_csr, network_type)` — network-type-aware
+    undirected conversion.
+      grn / mirna : `A + Aᵀ` (mutual edges weight 2)
+      ppi         : graph used as-is (already undirected)
+  - `_remove_self_loops` — `setdiag(0)` + `eliminate_zeros()`; self-loops
+    are regenerated correctly at higher levels as collapsed
+    intra-community weight.
+  - `_handle_isolated_nodes` — zero-degree nodes are detected and left
+    in singleton communities (the kernel returns `proposed = current`
+    for `degree == 0`); the CSR is NOT mutated.
+  - `_normalize_weights` — divides by max weight.  Modularity Q is
+    invariant under uniform scaling; protects against float32 overflow.
+
+Kernels (compiled once, cached in `_kernel_cache["louvain"]`):
+  - `compute_proposed_moves` — Phase 1 core.  Three-tier degree-aware
+    scheduling (1 thread / 1 warp / 1 block based on `degree[u]`);
+    two-pass design within each block:
+      Pass 1 accumulates `k_self` (sum of edge weights to the current
+        community) via warp shuffles or shared-mem reduction.
+      Pass 2 evaluates per-edge gain for moving u to each neighbour
+        community; block-wide reduction finds the winning (gain, comm).
+    Writes proposals only; community array is never modified here.
+  - `apply_moves` — Phase 1 batch update.  One thread per node, atomic
+    update to `community[]` and `comm_degree_sum[]`; increments
+    `improvement_flag` so the host can loop Phase 1 to convergence.
+    Conflicts (A↔B swap cycles) apply both moves — documented as
+    parallel non-determinism, valid partition.
+  - `count_community_edges` — Phase 2 step 1.  One thread per edge;
+    emits `(comm[src], comm[dst], w)` triples.  Uses precomputed
+    `edge_src[e] = np.repeat(arange(n), diff(indptr))`.
+  - `compute_modularity_partial` — final Q per level.  One thread per
+    edge, partial sums of `w − γ·k_i·k_j·inv_2m` for same-community
+    edges, block-reduced; host sums the partials and scales by `inv_2m`.
+
+Phase 2 sort + reduce strategy:
+  - GPU `count_community_edges` → D2H copy of `(csrc, cdst, cwt)`
+  - CPU `np.lexsort((cdst, csrc))` — correctness-first
+  - CPU segment-head detect + `np.add.reduceat` to sum duplicate edges
+  - CPU `scipy.sparse.csr_matrix((wt, (src, dst)), shape=(K, K))`
+  - Self-loops KEPT (intra-community weight contributes to higher
+    levels' modularity)
+  - TODO: GPU radix sort (CUB DeviceRadixSort) once thrust / pycuda-cub
+    bindings justify the dependency cost.
+
+CUDA streams:
+  - `stream_compute`  — kernel execution (Phase 1 loop, modularity,
+    count_community_edges)
+  - `stream_transfer` — async H2D for per-level CSR uploads
+
+Context handling: same pattern as HITS — `retain_primary_context()`
+  and unconditional push.  Coexists with CuPy in the same process.
+
+Hierarchy bookkeeping:
+  - `global_community[i]` tracks the level-current community of original
+    node i.  After each Phase 1, communities are renumbered to `0..K-1`
+    via `np.unique`, then `global_community = renum[global_community]`.
+  - `hierarchy` field is one list per level, each containing the
+    community ID of every original node at that level.
+
+Non-determinism: parallel move application can produce a different
+  partition than serial Louvain.  Documented in
+  `result["result"]["note"]`.  Modularity remains non-decreasing in
+  practice.  `max_phase1_passes` caps oscillation.
+
+Chunked fallback: `apply_config` may set `use_chunking=True` for low
+  VRAM tiers.  Currently treated as advisory (regular path runs); a
+  proper chunked Phase 1 is a future optimisation.
+
+Does NOT silently fall back to CPU — raises `RuntimeError` /
+  `cuda.LogicError` / `MemoryError`.
+Target: `-arch=sm_75` (RTX 20-series Turing), `BLOCK_SIZE = 256`.
+
+---
+
+## MCL GPU implementation
+
+Custom PyCUDA kernels — no CuPy dependency.
+
+Preprocessing (CPU, before any GPU work):
+  - `_symmetrize_mcl(graph_csr, network_type)` — network-type aware
+    undirected conversion + self-loops on every node (ensures
+    irreducibility of the Markov chain).
+      grn / mirna : `binarise(A + Aᵀ)` then add identity
+      ppi         : graph used as-is then add identity
+  - `_to_column_stochastic` — divides each column by its sum; zero-sum
+    columns get a 1.0 placed on their diagonal (absorbing state).
+  - `_to_ellpack_r` — present but UNUSED; biological networks have high
+    row-length variance (hubs vs. leaves) and padding waste outweighs
+    coalesced-access benefit.  CSR + CSC are the canonical pair.
+
+Kernels (compiled once, cached in `_kernel_cache["mcl"]`):
+  - `spgemm_row_chunk` — inner-product SpGEMM (CSR × CSC → COO).
+      One block per output row; threads iterate over output columns;
+      sparse dot via two-pointer merge of sorted index lists.
+      atomicAdd counter on COO output with capacity guard.
+      Chunked by row to bound VRAM growth from fill-in.
+  - `threshold_prune` — mark entries < threshold (CPU compaction follows).
+  - `topk_column_prune` — exact top-k per column with index tie-break;
+      one block per column, O(col_len²) per column (fine because
+      threshold prune ran first).
+  - `inflate_values` — element-wise `powf(x, r)` in FP32.
+  - `column_sum_segmented` — warp-per-column Σ via `__shfl_down_sync`.
+  - `normalize_columns` — warp-per-column in-place divide; epsilon guard.
+  - `convergence_frobenius` — partial ‖M_new − M_old‖_F² with FP64
+      accumulation (FP32 inputs, FP64 partial sums); host sums + sqrt.
+
+SpGEMM chunking strategy:
+  - Free VRAM probed via `cuda.mem_get_info()`; 70 % budget for the COO
+    output (12 bytes per entry: int + int + float).
+  - `chunk_rows = max(1, vram_budget / (density × COO_BYTES))`.
+  - Each chunk's COO capacity probed after kernel completion; overflow
+    raises `MemoryError` with guidance to tighten pruning.
+  - COO triples accumulated CPU-side across chunks → `coo_matrix.tocsr()`.
+
+Pruning order: threshold first (kills bulk of fill-in cheaply), then
+  top-k (operates on survivors in CSC view).  CPU compactions between
+  steps via cumulative-sum row_ptr / col_ptr rebuild.
+
+Inflation + normalisation: in-place on CSC.data — pattern unchanged,
+  only values updated.
+
+Convergence check:
+  - Sparsity pattern must match (host array-equals indptr + indices)
+  - On match: GPU FP64 Frobenius reduction → CPU `sqrt(sum(partials))`
+  - On mismatch (early iterations): returns `inf`, iteration continues
+
+Precision policy: FP32 for matrix data and arithmetic, FP64 for the
+  convergence reduction only (detects small Δ near convergence without
+  cancellation error).
+
+CUDA streams:
+  - `stream_compute`  — kernel execution
+  - `stream_transfer` — async H2D for per-iteration uploads
+                        (CSC view + matrix arrays)
+
+Context handling: same pattern as HITS / Louvain —
+  `retain_primary_context()` and unconditional push.
+
+Cluster extraction (CPU, post-convergence): attractor method.  Nodes
+  with `M[i, i] > 0` are attractors; every node j is assigned to
+  `argmax_i M[i, j]`.  Fallback to weakly-connected components if no
+  diagonal entry is positive.  Cluster IDs renumbered to compact
+  `0..K-1`.
+
+Does NOT silently fall back to CPU — raises `RuntimeError` /
+  `cuda.LogicError` / `MemoryError`.
+Target: `-arch=sm_75` (RTX 20-series Turing), `BLOCK_SIZE = 256`.
+
+---
+
+## PageRank GPU implementation
+
+Custom PyCUDA kernels — no CuPy dependency.  Hybrid CSR + ELLPACK
+storage for degree-aware access; scatter-form power iteration over the
+original CSR (no transpose / Mᵀ build).
+
+Kernels (compiled once, cached in `_kernel_cache["pagerank"]`):
+  - `initialize_pr` — writes the teleport baseline `(1 − d) / N` into
+    `PR_new`.  Must precede scatter because scatter atomicAdds INTO
+    `PR_new` and assumes it starts at the teleport value.
+  - `scatter_contributions_csr` — low/medium-degree source nodes via
+    the original CSR arrays.  Three-tier degree-aware dispatch:
+      LOW  (deg < 32)         : thread 0 only, serial scatter
+      MED  (32 ≤ deg < 256)   : first warp, stride-32 scatter
+      HIGH (deg ≥ 256)        : full block + 256-bucket SMEM hash
+    HIGH-tier SMEM hash: open-addressing with linear probing, probe-cap
+    = SMEM_BUCKETS, atomicCAS for slot claim + atomicAdd for value.
+    Saturated chains fall back to direct global atomicAdd (correctness
+    guaranteed).  After `__syncthreads()` each thread flushes its
+    assigned bucket (SMEM_BUCKETS == BLOCK_SIZE).  Order-of-magnitude
+    fewer global atomics per hub block.
+  - `scatter_contributions_ellpack` — hub source nodes via padded
+    ELLPACK arrays (one block per hub, threads stride through
+    `max_row_len`; padding entries are `-1` and skipped).  Win vs. CSR:
+    no `row_ptr` indirection, predictable stride.
+  - `sum_dangling_pr` — block-partial Σ `PR_old[i]` over dangling nodes
+    (host sums the per-block partials).
+  - `distribute_dangling_mass` — adds `d · dangling_sum / |eligible|`
+    via atomicAdd to every eligible node.  Structure-agnostic: the CPU
+    side picks the eligible set per network type.
+  - `compute_l1_convergence` — `Σ |PR_new[i] − PR_old[i]|` per block
+    via warp shuffle reductions (intra-warp) + final 8-lane warp
+    reduction in shared memory (FP32 throughout).
+
+Hybrid storage split at HUB_THRESHOLD = 32:
+  - 0 < out_degree < 32  → CSR scatter kernel (filtered `node_ids`)
+  - out_degree ≥ 32      → ELLPACK scatter kernel
+  - out_degree == 0      → dangling, handled by dangling kernels
+
+Network-type-aware dangling redistribution:
+  - GRN   : `eligible = where(out_degree > 0)` — regulators only.
+            Preserves TF↔target asymmetry.
+  - PPI   : `eligible = arange(n)` — uniform across all nodes.
+  - miRNA : `eligible = where(out_degree > 0)` — miRNA nodes only
+            (out_degree == 0 ⇒ gene target in a directed bipartite
+            graph).  If a `node_index_map` with type labels were
+            provided, it would override the out-degree proxy.
+  Degenerate fallback (`eligible.size == 0`): logs warning, falls back
+  to uniform.
+
+Out-degree storage: FP32 weighted sum (`graph_csr.sum(axis=1)`) so
+  weighted networks (PPI confidence scores, weighted GRN) are handled
+  correctly; for binary graphs this collapses to the integer degree.
+
+Result keys by network type (matches CLAUDE.md spec):
+  - GRN   : `scores`, `top_regulators` (top-15, out>0),
+            `top_targets` (top-15, out==0)
+  - PPI   : `scores`, `top_nodes` (top-20 combined)
+  - miRNA : `scores`, `top_mirnas` (top-15, out>0),
+            `top_target_genes` (top-15, out==0)
+
+Iteration structure:
+  init → sum_dangling (D2H reduction) → scatter_csr → scatter_ellpack
+  → distribute_dangling_mass → compute_l1_convergence (D2H reduction)
+  → pointer swap of `PR_old` / `PR_new` (no data copy).  Implicit
+  serialization within `stream_compute` orders the kernels correctly
+  (scatter sees the post-init `PR_new`; convergence sees the final
+  `PR_new` of the iteration).
+
+CUDA streams:
+  - `stream_compute`  — all six kernels
+  - `stream_transfer` — async H2D during setup (CSR / ELLPACK /
+    out_degree / dangling flags / eligible array / initial `PR_old`)
+
+Context handling: same pattern as HITS / Louvain / MCL —
+  `retain_primary_context()` and unconditional push.
+
+VRAM check: `_estimate_pagerank_vram` is compared against
+  `cuda.mem_get_info()`; raises `MemoryError` if the working set
+  exceeds free VRAM.  Chunked fallback (`use_chunking=True` from
+  `apply_config`) is currently a logged TODO — the regular path runs
+  and `MemoryError` surfaces if allocation fails.
+
+Does NOT silently fall back to CPU — raises `RuntimeError` /
+  `cuda.LogicError` / `MemoryError`.
+Target: `-arch=sm_75` (RTX 20-series Turing), `BLOCK_SIZE = 256`,
+  `SMEM_BUCKETS = 256`, `HUB_THRESHOLD = 32`.
+
+---
+
+## RWR GPU implementation
+
+Custom PyCUDA kernels — no CuPy dependency.  Fused SpMV + restart in a
+single kernel; batched variant for multi-seed-set workloads.
+
+Kernels (compiled once, cached in `_kernel_cache["rwr"]`):
+  - `rwr_spmv_restart` — fused single-seed-set update
+    `p_new[i] = (1 − r) · Σ_j W[i,j] · p[j] + r · p0[i]`.
+    Three-tier degree-aware scheduling:
+      LOW  (deg < 32)         : thread 0 only, serial scan
+      MED  (32 ≤ deg < 256)   : first warp, stride-32 +
+                                `__shfl_down_sync` reduction
+      HIGH (deg ≥ 256)        : full block, stride-256 + shared-mem
+                                tree reduction
+    Restart term `r · p0[i]` added by **thread 0 only**, after the
+    reduction, in the same write that stores `p_new[i]` — adding it
+    from every thread would multiply the contribution.
+    Uses `__ldg(&p[col])` on p-neighbour reads to route through the
+    read-only texture cache (separate from L1 data; p is read many
+    times per iteration but never written by this kernel).
+  - `l1_convergence_rwr` — `Σ |p_new[i] − p[i]|` per block via warp
+    shuffles + final 8-lane warp reduction in shared memory (same
+    pattern as `pagerank.compute_l1_convergence`).
+  - `rwr_spmv_restart_batched` — multi-seed batched kernel.
+    `gridDim = (n, B, 1)`; one block per `(node_i, seed_b)` pair;
+    `p` / `p0` / `p_new` stored as `[n × B]` row-major flat arrays
+    (entry `(node, seed) = node * B + seed`).
+    Used only when `1 < B <= MAX_BATCH = 4`; larger batches fall back
+    to the serial-per-seed-set loop to avoid `O(n · B)` VRAM.
+
+Transition matrix W construction (CPU, network-type aware):
+  - GRN   : directed CSR as-is; `W = (D⁻¹ · A).T`.  Dangling columns
+            (`out_degree == 0`) get a self-loop `W[j,j] = 1` so the
+            absorbing state preserves probability mass during diffusion.
+  - PPI   : `A_sym = A + Aᵀ`, binarised, then the same column-normalise
+            + dangling-column self-loop fix.
+  - miRNA : directed bipartite CSR; same treatment as GRN.  Gene-target
+            nodes (out_degree == 0 in the bipartite digraph) get
+            self-loops.
+  Normalisation runs CPU-side (scipy sparse is well-optimised); the
+  resulting FP32 CSR is transferred to GPU.
+
+p₀ construction:
+  - Non-empty seeds : `p0[seed] = 1 / |seeds|`, zero elsewhere.
+  - Empty seeds     : `p0[i] = 1 / n` (uniform — global PageRank-like).
+  Network type does not change the maths, only the semantics of the
+  seed set (GRN seeds = TF indices; PPI seeds = disease proteins;
+  miRNA seeds = miRNA node indices).
+
+Multi-seed-set handling:
+  - `seed_nodes = [1, 2, 3]`        → single seed set (`B = 1`)
+  - `seed_nodes = [[1,2], [3,4]]`   → multiple seed sets (batched)
+  - `B ≤ MAX_BATCH` (= 4)           → batched kernel
+  - `B > MAX_BATCH`                  → serial-per-seed-set loop
+  Per-node scores are averaged across all seed sets to form the
+  primary score vector; `batch_results` field carries per-seed-set
+  scores / iterations / converged when `B > 1`.
+
+Optional node reordering (`reorder_nodes=False` by default):
+  CPU permutes W rows/cols by ascending degree → similar-degree nodes
+  adjacent in CSR → reduced warp divergence inside the three-tier
+  dispatch.  Seed indices are remapped via the inverse permutation
+  before GPU work; final scores remapped back via `scores_orig[perm] =
+  scores_reord`.  Documented as a perf TODO; default path runs
+  unreordered for correctness simplicity.
+
+Result keys (per CLAUDE.md spec):
+  `scores`, `top_nodes` (top-20), `top_seeds` (top-10 among the union
+  of all seed indices, or `top_nodes[:10]` if no seeds), `iterations`,
+  `converged`, `note`, and `batch_results` when `B > 1`.
+
+CUDA streams:
+  - `stream_compute`  — kernel execution (`spmv_restart`, `l1_conv`)
+  - `stream_transfer` — async H2D of W CSR arrays and p₀ vectors
+                        during setup
+  Pointer swap of `p` / `p_new` each iteration (no data copy).
+
+Context handling: same pattern as HITS / Louvain / MCL / PageRank —
+  `retain_primary_context()` and unconditional push.
+
+VRAM check: `_estimate_rwr_vram` compared against `cuda.mem_get_info()`;
+  raises `MemoryError` if the working set exceeds free VRAM.
+  `use_chunking=True` and `use_zero_copy=True` (from `apply_config`)
+  are currently logged TODOs — the regular path runs and `MemoryError`
+  surfaces if allocation fails.
+
+Does NOT silently fall back to CPU — raises `RuntimeError` /
+  `cuda.LogicError` / `MemoryError`.
+Target: `-arch=sm_75` (RTX 20-series Turing), `BLOCK_SIZE = 256`,
+  `MAX_BATCH = 4`.
+
+---
+
 ## Progress event format (NDJSON)
 
 ```json

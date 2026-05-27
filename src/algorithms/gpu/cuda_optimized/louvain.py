@@ -1,113 +1,144 @@
 """
-algorithms/louvain.py — Louvain Community Detection for GRN Module Discovery
-=============================================================================
+algorithms/louvain.py — Louvain Community Detection (GPU / PyCUDA)
+==================================================================
 
-Biological Context — Co-regulated Gene Modules
-------------------------------------------------
-Louvain community detection on a GRN identifies groups of genes that share
-common transcription factor regulators or participate in the same regulatory
-pathway.  Within a detected community, genes are more densely connected to
-each other (via shared TF inputs or TF–target–TF feedback arcs) than to the
-rest of the network.  These communities often correspond to:
+Biological context
+------------------
+Louvain on a biological network identifies modules of nodes that are more
+densely connected to each other than to the rest of the graph:
 
-  * Functionally coherent gene modules (e.g. cell-cycle genes all regulated
-    by E2F factors)
-  * Co-expressed gene clusters that respond to the same upstream signal
-  * Biological pathway membership (MAPK cascade, NF-κB regulon, etc.)
+  GRN   — co-regulated gene modules (shared TF inputs, feedback arcs).
+  PPI   — protein complexes / functional modules.
+  miRNA — miRNA–gene regulons (a miRNA and its co-targeted genes).
 
-The ``top_communities`` output (largest K communities with member node lists)
-can be submitted directly to GO-term enrichment tools (e.g. Enrichr, g:Profiler)
-to assess whether each detected module is biologically coherent.
+The ``top_communities`` output is the natural input to GO-term enrichment
+tools (Enrichr, g:Profiler) — each module can be tested for functional
+coherence.
 
-Why the GRN must be symmetrized
----------------------------------
-Louvain optimises modularity Q, which is defined for *undirected* graphs:
+Why the graph must be undirected for Louvain
+--------------------------------------------
+Modularity Q is only defined for undirected graphs:
 
-    Q = (1/2m) Σ_{i,j} (A_{ij} − k_i·k_j/2m) · δ(c_i, c_j)
+    Q = (1 / 2m) · Σ_{i,j} ( A_{ij} − γ · k_i · k_j / 2m ) · δ(c_i, c_j)
 
-Applying Q to an asymmetric matrix produces mathematically undefined results
-because the null-model k_i·k_j/2m assumes undirected degree.
+The null model k_i·k_j / 2m assumes undirected degree.  For GRN / miRNA
+networks this module applies A ← A + Aᵀ internally (mutual edges keep
+their summed weight = 2 × original, encoding tighter coupling).  PPI
+networks are already undirected and are used as-is.
 
-The symmetrisation used here is:
-
-    A_sym = A + A^T
-
-Biological meaning of each edge weight after symmetrisation:
-
-  * One-way TF→gene edge:    weight = original weight (one regulatory event)
-  * Mutual TF↔gene feedback: weight = 2 × original weight (stronger co-regulation)
-
-This weighting is intentional: mutual regulation reflects tighter functional
-coupling and should group nodes into the same community more strongly.
-
-This symmetrisation step is performed *inside* each Louvain function, NOT
-during preprocessing, because all other algorithms (HITS, RWR, BFS, PageRank)
-require the original directed graph.
+The symmetrisation step happens *inside* this module rather than during
+preprocessing because every other algorithm (HITS, RWR, BFS, PageRank,
+MCL) needs the original directed graph.
 
 Parallel non-determinism
---------------------------
-The ``cpu_multi`` and ``gpu`` modes batch all community moves in Phase 1 and
-apply them simultaneously.  This eliminates the sequential dependency of
-``cpu_single`` Phase 1 and enables parallelism, but means that two nodes
-that would beneficially swap communities may BOTH propose the swap
-simultaneously, and the outcome depends on which write lands last.
+------------------------
+Phase 1 is bulk-synchronous on the GPU: every node evaluates its best
+move against a *snapshot* of the community state, then all moves are
+applied in a single batch.  Two nodes that beneficially swap into each
+other's communities will BOTH apply simultaneously — the resulting
+partition may differ between runs.  This is a documented property of
+parallel Louvain (Traag et al. 2019, "From Louvain to Leiden").
+Modularity remains non-decreasing in practice; the partition is still
+valid.
 
-This is a known and expected property of parallel Louvain (documented in
-Traag et al. 2019, "From Louvain to Leiden").  A runtime warning is printed
-whenever these modes are used.  Results remain valid (modularity is
-monotonically non-decreasing in practice) but may differ between runs.
-
-Algorithm Outline
+Algorithm outline
 -----------------
-Phase 1 — Move nodes to improve modularity:
-    For each node i, compute ΔQ for moving i to each neighbour community.
-    ΔQ = (k_{i,C}/m) − γ·k_i·Σ_tot_C/(2m²)
-    Move i to the community with the highest positive ΔQ.
-    Repeat until no node moves.
+Phase 1 — node-level moves (GPU):
+    For each node u, compute ΔQ for moving u to each neighbouring
+    community.  Propose the best move.  Apply all proposals as a batch.
+    Repeat until no node moves, or ``max_phase1_passes`` reached.
 
-Phase 2 — Collapse communities into super-nodes:
-    Each community becomes a single super-node.
-    Edge weights between super-nodes = sum of weights of inter-community edges.
-    Self-loops on super-nodes = sum of intra-community edge weights.
-    Recursively run Phase 1 + Phase 2 until no improvement.
+Phase 2 — graph coarsening (mixed GPU + CPU):
+    Each community becomes a super-node; inter-community edges are
+    summed.  Self-loops on super-nodes carry intra-community weight.
+    Recurse Phase 1 on the coarsened graph.
 
-Parameter Guide
+Parameter guide
 ---------------
-min_delta_q  (float, default 1e-4)  Minimum ΔQ to accept a node move.
-max_levels   (int,   default 10)    Maximum Phase 1 + Phase 2 recursion depth.
+min_delta_q  (float, default 1e-4)  Minimum ΔQ to accept a move.
+max_levels   (int,   default 10)    Maximum Phase 1+2 recursion depth.
 resolution   (float, default 1.0)   γ in the modularity formula.
-                                     > 1.0 → more, smaller communities.
-                                     < 1.0 → fewer, larger communities.
+                                    > 1.0 → more, smaller communities.
+                                    < 1.0 → fewer, larger communities.
+network_type (str,   default "grn") One of "grn", "ppi", "mirna".
+block_size   (int,   default 256)   CUDA block dimension.
 """
 
-# ── GPU / CUDA-optimised implementation ──────────────────────────────────
+# ── GPU / CUDA-optimised implementation (PyCUDA custom kernels) ──────────
 # Source:    biological_network_framework/algorithms/louvain.py
-# Requires:  cupy-cuda11x (or matching CUDA version), pycuda
+# Requires:  pycuda (with a working NVCC toolchain)
 # Used by:   webapp routes, GPU benchmarking (src.benchmarking.benchmark)
-# Modes:     _cpu_single, _cpu_multi, _gpu  (all three)
+# Modes:     _gpu only — this module is GPU-exclusive.
 # CPU-only counterparts (benchmarking only — never import in webapp):
 #   src.algorithms.cpu.single_threaded.louvain
 #   src.algorithms.cpu.multi_threaded.louvain
+#
+# Four PyCUDA kernels (one SourceModule, compiled once, cached):
+#   compute_proposed_moves     — Phase 1: three-tier degree-aware ΔQ scan
+#                                + block-wide best-move reduction.
+#                                Writes proposals only; never touches the
+#                                community array directly.
+#   apply_moves                — Phase 1: batch-apply all proposals.
+#                                Updates community + comm_degree_sum via
+#                                atomicAdd.
+#   count_community_edges      — Phase 2: edge-parallel mapping
+#                                (u, v, w) → (comm[u], comm[v], w).
+#   compute_modularity_partial — Final Q: per-block partial sums of
+#                                A_{ij} − γ·k_i·k_j/(2m) over same-
+#                                community edges.
+#
+# Sort + reduce + scan for Phase 2 coarsening run CPU-side
+# (np.lexsort + np.add.reduceat) — correctness-first, no thrust/CUB
+# dependency.  GPU radix sort is a future optimisation (see TODO).
+#
+# Compilation: -arch=sm_75 (RTX 20-series, Turing — explicit target).
+# Does NOT silently fall back to CPU; raises RuntimeError / MemoryError /
+# cuda.LogicError so the runner can surface the failure.
 # ──────────────────────────────────────────────────────────────────────────
 
-import warnings
-from concurrent.futures import ProcessPoolExecutor
+from __future__ import annotations
+
+import logging
+import math
+from typing import Any
 
 import numpy as np
 import scipy.sparse as sp
 
 # ---------------------------------------------------------------------------
-# Optional CuPy
+# Optional PyCUDA
 # ---------------------------------------------------------------------------
 
 try:
-    import cupy as cp
-    import cupyx.scipy.sparse as cpsp
-    _CUPY_AVAILABLE = True
-except Exception:
-    cp = None
-    cpsp = None
-    _CUPY_AVAILABLE = False
+    import pycuda.driver as cuda
+    import pycuda.gpuarray as gpuarray
+    from pycuda.compiler import SourceModule
+    PYCUDA_AVAILABLE = True
+except Exception:                                       # noqa: BLE001
+    cuda = None                                         # type: ignore[assignment]
+    gpuarray = None                                     # type: ignore[assignment]
+    SourceModule = None                                 # type: ignore[assignment]
+    PYCUDA_AVAILABLE = False
+    logging.warning("PyCUDA not available — louvain_gpu() will raise.")
+
+# Optional: GPU config (block_size + chunking suggestions per tier).
+try:
+    from src.optimization.gpu_config import apply_config, get_gpu_config
+    _GPU_CONFIG_AVAILABLE = True
+except Exception:                                       # noqa: BLE001
+    _GPU_CONFIG_AVAILABLE = False
+
+    def apply_config(_name, _csr, params=None):         # type: ignore[no-redef]
+        return params or {}
+
+    def get_gpu_config():                               # type: ignore[no-redef]
+        return {"free_vram_mb": 0}
+
+try:
+    from src.benchmarking.benchmark import _ensure_cuda_context
+except Exception:                                       # noqa: BLE001
+    def _ensure_cuda_context() -> bool:                 # type: ignore[no-redef]
+        return True
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -117,662 +148,915 @@ _DEFAULT_PARAMS: dict = {
     "min_delta_q":        1e-4,
     "max_levels":         10,
     "resolution":         1.0,
-    # Maximum Phase 1 passes per Louvain level.
-    # Sequential cpu_single converges naturally; parallel modes (cpu_multi,
-    # gpu) use bulk-synchronous moves that can oscillate indefinitely without
-    # this cap.  100 passes is well above the typical convergence point for
-    # GRN-sized graphs while guaranteeing termination.
+    # Maximum Phase 1 passes per Louvain level.  Bulk-synchronous parallel
+    # Phase 1 can oscillate (two adjacent nodes swapping communities in
+    # alternating passes), so the cap is the primary termination guarantee.
     "max_phase1_passes":  100,
+    "network_type":       "grn",
+    "block_size":         256,
 }
+
+BLOCK_SIZE: int    = 256
+WARP_SIZE: int     = 32
+VRAM_SAFETY: float = 0.80    # warn if working set > 80 % of free VRAM
+_TOP_K: int        = 5
 
 
 # ---------------------------------------------------------------------------
-# Shared helpers
+# CUDA kernel source (all four kernels, single SourceModule)
+# ---------------------------------------------------------------------------
+
+KERNEL_SOURCE = r"""
+extern "C" {
+
+#define BLOCK_SIZE 256
+#define WARP_SIZE  32
+
+// =========================================================================
+// KERNEL 1: compute_proposed_moves
+//
+// Phase 1 core.  One block per source node u; threads inside the block
+// cooperatively scan u's edges with three-tier degree-aware scheduling:
+//
+//   LOW   (degree < 32)         : thread 0 only, serial scan
+//   MED   (32 <= degree < 256)  : first warp, stride-32 + warp shuffles
+//   HIGH  (degree >= 256)       : whole block, stride-256 + shared-mem
+//
+// Two passes per block:
+//
+//   Pass 1 — accumulate k_self = sum w_uv over edges where comm[v] == comm[u].
+//            Reduce across active threads; broadcast via shared memory.
+//   Pass 2 — each active thread evaluates per-edge gain for moving u to
+//            comm[v], tracks its local (best_gain, best_comm).  Block-wide
+//            reduction finds the block's winning pair.  Thread 0 writes
+//            proposed_comm[u] (or c_old if best gain <= min_delta_q).
+//
+// Per-edge gain (the standard parallel-Louvain approximation):
+//
+//   join_gain(e=(u,v,w)) = w/m  -  gamma * k_u * Sigma_tot[c_v] / (2 m^2)
+//   leave_gain(u)        = k_self/m  -  gamma * (Sigma_tot[c_u] - k_u) * k_u / (2 m^2)
+//   delta_Q(e)           = join_gain(e) - leave_gain(u)
+//
+// The kernel writes to proposed_comm only — community[] is never modified
+// here.  apply_moves performs the batch update separately.
+// =========================================================================
+__global__ void compute_proposed_moves(
+    const int*   __restrict__ row_ptr,
+    const int*   __restrict__ col_idx,
+    const float* __restrict__ edge_wt,
+    const int*   __restrict__ community,
+    const float* __restrict__ comm_degree_sum,
+    const float* __restrict__ node_degree,
+    int*         __restrict__ proposed_comm,
+    const float                min_delta_q,
+    const float                inv_2m,        // = 1 / (2m)
+    const float                resolution,
+    const int                  n)
+{
+    __shared__ float smem_f[BLOCK_SIZE];
+    __shared__ int   smem_i[BLOCK_SIZE];
+    __shared__ float s_leave;
+    __shared__ float s_k_self;
+    __shared__ int   s_proposed;
+
+    const int u = blockIdx.x;
+    if (u >= n) return;
+
+    const int row_start = row_ptr[u];
+    const int row_end   = row_ptr[u + 1];
+    const int degree    = row_end - row_start;
+    const int c_old     = community[u];
+    const float k_u     = node_degree[u];
+
+    if (degree == 0) {
+        if (threadIdx.x == 0) proposed_comm[u] = c_old;
+        return;
+    }
+
+    // ---- Tier decision (uniform across the block; degree is shared) ----
+    int t_start  = -1;
+    int t_stride = 1;
+    if (degree < WARP_SIZE) {
+        if (threadIdx.x == 0) { t_start = 0;            t_stride = 1; }
+    } else if (degree < BLOCK_SIZE) {
+        if (threadIdx.x < WARP_SIZE) {
+            t_start = threadIdx.x;                       t_stride = WARP_SIZE;
+        }
+    } else {
+        t_start = threadIdx.x;                           t_stride = BLOCK_SIZE;
+    }
+
+    // =================================================================
+    // PASS 1 — accumulate k_self = sum w_uv where comm[v] == c_old.
+    // =================================================================
+    float local_k_self = 0.0f;
+    if (t_start >= 0) {
+        for (int off = t_start; off < degree; off += t_stride) {
+            const int v = col_idx[row_start + off];
+            if (community[v] == c_old) {
+                local_k_self += edge_wt[row_start + off];
+            }
+        }
+    }
+
+    // Reduce local_k_self across active threads, write to s_k_self.
+    if (degree < WARP_SIZE) {
+        if (threadIdx.x == 0) s_k_self = local_k_self;
+    } else if (degree < BLOCK_SIZE) {
+        if (threadIdx.x < WARP_SIZE) {
+            for (int off = WARP_SIZE >> 1; off > 0; off >>= 1) {
+                local_k_self += __shfl_down_sync(0xffffffffu, local_k_self, off);
+            }
+            if (threadIdx.x == 0) s_k_self = local_k_self;
+        }
+    } else {
+        smem_f[threadIdx.x] = local_k_self;
+        __syncthreads();
+        for (int s = BLOCK_SIZE >> 1; s > 0; s >>= 1) {
+            if (threadIdx.x < s) smem_f[threadIdx.x] += smem_f[threadIdx.x + s];
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) s_k_self = smem_f[0];
+    }
+    __syncthreads();
+
+    // Compute leave_gain on thread 0; broadcast via shared memory.
+    if (threadIdx.x == 0) {
+        const float sigma_old = comm_degree_sum[c_old];
+        // 1/m = 2 * inv_2m;  1/(2 m^2) = 2 * inv_2m * inv_2m
+        s_leave = 2.0f * inv_2m * s_k_self
+                  - 2.0f * resolution * (sigma_old - k_u) * k_u
+                    * inv_2m * inv_2m;
+    }
+    __syncthreads();
+
+    // =================================================================
+    // PASS 2 — per-edge gain; track best (gain, comm) per active thread.
+    // =================================================================
+    float best_gain = 0.0f;       // require strict improvement
+    int   best_comm = c_old;
+
+    if (t_start >= 0) {
+        const float leave = s_leave;
+        for (int off = t_start; off < degree; off += t_stride) {
+            const int v   = col_idx[row_start + off];
+            const int c_v = community[v];
+            if (c_v == c_old) continue;          // moving to current = no-op
+            const float w         = edge_wt[row_start + off];
+            const float sigma_new = comm_degree_sum[c_v];
+            const float join      = 2.0f * inv_2m * w
+                                    - 2.0f * resolution * k_u * sigma_new
+                                      * inv_2m * inv_2m;
+            const float gain      = join - leave;
+            if (gain > best_gain) {
+                best_gain = gain;
+                best_comm = c_v;
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Reduce (best_gain, best_comm) pair across active threads.
+    // -------------------------------------------------------------------
+    if (degree < WARP_SIZE) {
+        if (threadIdx.x == 0) {
+            s_proposed = (best_gain > min_delta_q) ? best_comm : c_old;
+        }
+    } else if (degree < BLOCK_SIZE) {
+        if (threadIdx.x < WARP_SIZE) {
+            float my_gain = best_gain;
+            int   my_comm = best_comm;
+            for (int off = WARP_SIZE >> 1; off > 0; off >>= 1) {
+                const float ogain = __shfl_down_sync(0xffffffffu, my_gain, off);
+                const int   ocomm = __shfl_down_sync(0xffffffffu, my_comm, off);
+                if (ogain > my_gain) {
+                    my_gain = ogain;
+                    my_comm = ocomm;
+                }
+            }
+            if (threadIdx.x == 0) {
+                s_proposed = (my_gain > min_delta_q) ? my_comm : c_old;
+            }
+        }
+    } else {
+        smem_f[threadIdx.x] = best_gain;
+        smem_i[threadIdx.x] = best_comm;
+        __syncthreads();
+        for (int s = BLOCK_SIZE >> 1; s > 0; s >>= 1) {
+            if (threadIdx.x < s) {
+                if (smem_f[threadIdx.x + s] > smem_f[threadIdx.x]) {
+                    smem_f[threadIdx.x] = smem_f[threadIdx.x + s];
+                    smem_i[threadIdx.x] = smem_i[threadIdx.x + s];
+                }
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            s_proposed = (smem_f[0] > min_delta_q) ? smem_i[0] : c_old;
+        }
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) proposed_comm[u] = s_proposed;
+}
+
+
+// =========================================================================
+// KERNEL 2: apply_moves
+//
+// One thread per node.  Atomically applies proposed_comm[u] to community[u]
+// and rebalances comm_degree_sum.  Increments improvement_flag whenever a
+// real move happens; the host loops Phase 1 until this counter stays zero.
+//
+// Conflict resolution: if A proposes comm[B] and B proposes comm[A], both
+// moves apply (A swaps to comm_B, B swaps to comm_A; the comm_degree_sum
+// updates remain balanced).  This is the documented parallel Louvain
+// non-determinism.
+// =========================================================================
+__global__ void apply_moves(
+    int*       __restrict__ community,
+    const int* __restrict__ proposed_comm,
+    int*       __restrict__ improvement_flag,
+    const float* __restrict__ node_degree,
+    float*     __restrict__ comm_degree_sum,
+    const int                n)
+{
+    const int u = blockIdx.x * blockDim.x + threadIdx.x;
+    if (u >= n) return;
+
+    const int old_c = community[u];
+    const int new_c = proposed_comm[u];
+    if (new_c == old_c) return;
+
+    community[u] = new_c;
+    atomicAdd(improvement_flag, 1);
+
+    const float k_u = node_degree[u];
+    atomicAdd(&comm_degree_sum[old_c], -k_u);
+    atomicAdd(&comm_degree_sum[new_c],  k_u);
+}
+
+
+// =========================================================================
+// KERNEL 3: count_community_edges
+//
+// Phase 2 step 1.  One thread per edge: emit a (comm_src, comm_dst, weight)
+// triple.  edge_src[e] is the source-node mapping, precomputed CPU-side as
+// np.repeat(arange(n), diff(indptr)).
+// =========================================================================
+__global__ void count_community_edges(
+    const int*   __restrict__ edge_src,
+    const int*   __restrict__ col_idx,
+    const float* __restrict__ edge_wt,
+    const int*   __restrict__ community,
+    int*         __restrict__ out_csrc,
+    int*         __restrict__ out_cdst,
+    float*       __restrict__ out_cwt,
+    const int                  nnz)
+{
+    const int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= nnz) return;
+    const int u = edge_src[e];
+    const int v = col_idx[e];
+    out_csrc[e] = community[u];
+    out_cdst[e] = community[v];
+    out_cwt[e]  = edge_wt[e];
+}
+
+
+// =========================================================================
+// KERNEL 4: compute_modularity_partial
+//
+// One thread per edge.  Accumulates ( w − gamma · k_i · k_j · inv_2m ) for
+// each edge whose endpoints share a community.  Block-reduces in shared
+// memory; host sums the per-block partials and multiplies by inv_2m for
+// the final Q.
+// =========================================================================
+__global__ void compute_modularity_partial(
+    const int*   __restrict__ edge_src,
+    const int*   __restrict__ col_idx,
+    const float* __restrict__ edge_wt,
+    const int*   __restrict__ community,
+    const float* __restrict__ node_degree,
+    float*       __restrict__ partial_Q,
+    const float                inv_2m,
+    const float                resolution,
+    const int                  nnz)
+{
+    __shared__ float smem[BLOCK_SIZE];
+    const int e = blockIdx.x * blockDim.x + threadIdx.x;
+
+    float val = 0.0f;
+    if (e < nnz) {
+        const int u = edge_src[e];
+        const int v = col_idx[e];
+        if (community[u] == community[v]) {
+            const float w  = edge_wt[e];
+            const float ki = node_degree[u];
+            const float kj = node_degree[v];
+            val = w - resolution * ki * kj * inv_2m;
+        }
+    }
+    smem[threadIdx.x] = val;
+    __syncthreads();
+    for (int s = BLOCK_SIZE >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) partial_Q[blockIdx.x] = smem[0];
+}
+
+}  // extern "C"
+"""
+
+
+# ---------------------------------------------------------------------------
+# Module-level kernel cache
+# ---------------------------------------------------------------------------
+
+_kernel_cache: dict[str, dict[str, Any]] = {}
+
+
+def _get_kernels() -> dict[str, Any]:
+    """Compile (or fetch from cache) the four Louvain device kernels."""
+    if "louvain" not in _kernel_cache:
+        if not PYCUDA_AVAILABLE:
+            raise RuntimeError(
+                "PyCUDA is required to compile Louvain kernels — "
+                "install pycuda and ensure NVCC is on PATH."
+            )
+        mod = SourceModule(
+            KERNEL_SOURCE,
+            options=["-arch=sm_75"],        # RTX 20-series Turing
+            no_extern_c=True,
+        )
+        _kernel_cache["louvain"] = {
+            "proposed_moves": mod.get_function("compute_proposed_moves"),
+            "apply_moves":    mod.get_function("apply_moves"),
+            "count_edges":    mod.get_function("count_community_edges"),
+            "modularity":     mod.get_function("compute_modularity_partial"),
+        }
+    return _kernel_cache["louvain"]
+
+
+# ---------------------------------------------------------------------------
+# Parameter merging
 # ---------------------------------------------------------------------------
 
 def _merge_params(user_params: dict | None) -> dict:
     return {**_DEFAULT_PARAMS, **(user_params or {})}
 
 
-def _symmetrize(graph_csr: sp.csr_matrix) -> sp.csr_matrix:
-    """
-    Symmetrize the directed GRN adjacency: A_sym = A + A^T.
-
-    Mutual TF↔gene edges get weight 2× (tighter co-regulation);
-    one-way edges keep their original weight.
-    """
-    A_sym = (graph_csr + graph_csr.T).tocsr()
-    A_sym.sum_duplicates()
-    return A_sym.astype(np.float64)
-
-
-def _compute_modularity(
-    adj_sym: sp.csr_matrix,
-    labels: np.ndarray,
-    m: float,
-    resolution: float,
-) -> float:
-    """Compute modularity Q for a labelled partition in O(nnz)."""
-    degrees = np.asarray(adj_sym.sum(axis=1)).flatten()
-    coo = adj_sym.tocoo()
-    same = labels[coo.row] == labels[coo.col]
-    expected = degrees[coo.row] * degrees[coo.col] / (2.0 * m)
-    Q = float(np.sum((coo.data - resolution * expected) * same) / (2.0 * m))
-    return Q
-
-
-def _phase2_collapse(
-    adj_csr: sp.csr_matrix,
-    communities: np.ndarray,
-) -> tuple[sp.csr_matrix, np.ndarray]:
-    """
-    Collapse a community assignment into a new weighted super-node graph.
-
-    Returns
-    -------
-    new_adj   : (K × K) CSR — weighted super-node adjacency (with self-loops)
-    new_labels: (n,) array  — old node index → new super-node index
-    """
-    _, new_labels = np.unique(communities, return_inverse=True)
-    K = int(new_labels.max()) + 1
-    coo = adj_csr.tocoo()
-    row_new = new_labels[coo.row]
-    col_new = new_labels[coo.col]
-    new_adj = sp.coo_matrix(
-        (coo.data.astype(np.float64), (row_new, col_new)),
-        shape=(K, K),
-    ).tocsr()
-    new_adj.sum_duplicates()
-    return new_adj, new_labels.astype(np.int32)
-
-
-def _build_result(
-    A_sym: sp.csr_matrix,
-    final_labels: np.ndarray,
-    hierarchy: list[list[int]],
-    m: float,
-    resolution: float,
-) -> dict:
-    K = int(final_labels.max()) + 1
-    Q = _compute_modularity(A_sym, final_labels, m, resolution)
-    sizes = np.bincount(final_labels, minlength=K)
-    top5 = np.argsort(sizes)[::-1][:5]
-    top_communities = [
-        {
-            "community_id": int(c),
-            "size":         int(sizes[c]),
-            "member_nodes": np.where(final_labels == c)[0].tolist(),
-        }
-        for c in top5 if sizes[c] > 0
-    ]
-    return {
-        "community_assignments": final_labels.tolist(),
-        "num_communities":       K,
-        "modularity":            Q,
-        "hierarchy":             hierarchy,
-        "top_communities":       top_communities,
-    }
-
-
 # ---------------------------------------------------------------------------
-# Phase 1 — sequential (cpu_single)
+# CPU preprocessing helpers
 # ---------------------------------------------------------------------------
 
-def _phase1_single(
-    adj_csr: sp.csr_matrix,
-    communities: np.ndarray,
-    degrees: np.ndarray,
-    m: float,
-    resolution: float,
-    min_delta_q: float,
-) -> tuple[np.ndarray, bool]:
-    """
-    One complete sequential pass of Louvain Phase 1.
-
-    For each node, computes ΔQ for moving to each neighbour community and
-    performs the best greedy move if ΔQ > min_delta_q.
-
-    ΔQ (move i from c_old to c_new) =
-        (k_{i,c_new} − k_{i,c_old}) / m
-        − resolution · k_i · (Σ_tot_c_new − Σ_tot_c_old) / (2m²)
-
-    where Σ_tot_c is the sum of degrees of nodes in c (after removing i).
-
-    Returns (communities, improved).
-    """
-    N = len(communities)
-    n_slots = int(communities.max()) + 1
-    comm_degsums = np.zeros(n_slots, dtype=np.float64)
-    np.add.at(comm_degsums, communities, degrees)
-
-    improved = False
-
-    for i in range(N):
-        ki    = degrees[i]
-        c_old = int(communities[i])
-
-        # Temporarily remove node i from its current community
-        comm_degsums[c_old] -= ki
-
-        s = int(adj_csr.indptr[i])
-        e = int(adj_csr.indptr[i + 1])
-        if s == e:                              # isolated node
-            comm_degsums[c_old] += ki
-            continue
-
-        nb_indices = adj_csr.indices[s:e]
-        nb_weights = adj_csr.data[s:e].astype(np.float64)
-        nb_comms   = communities[nb_indices].astype(np.int32)
-
-        # Aggregate: k_{i,c} = sum of weights from i to community c
-        unique_comms, inverse = np.unique(nb_comms, return_inverse=True)
-        k_i_c = np.zeros(len(unique_comms), dtype=np.float64)
-        np.add.at(k_i_c, inverse, nb_weights)
-
-        k_i_c_old = k_i_c[unique_comms == c_old].sum()   # 0 if c_old not neighbour
-
-        best_dq   = 0.0    # must beat this threshold
-        best_comm = c_old
-
-        for idx, c_new in enumerate(unique_comms):
-            if c_new == c_old:
-                continue
-            dq = ((k_i_c[idx] - k_i_c_old) / m
-                  - resolution * ki * (comm_degsums[c_new] - comm_degsums[c_old]) / (2.0 * m * m))
-            if dq > best_dq:
-                best_dq   = dq
-                best_comm = int(c_new)
-
-        communities[i] = best_comm
-        comm_degsums[best_comm] += ki
-        if best_comm != c_old:
-            improved = True
-
-    return communities, improved
-
-
-# ---------------------------------------------------------------------------
-# Phase 1 — batch parallel worker (cpu_multi)
-# ---------------------------------------------------------------------------
-
-def _louvain_batch_worker(args: tuple) -> list[tuple[int, int]]:
-    """
-    ProcessPoolExecutor worker: compute the best move for a batch of nodes.
-
-    Uses a *snapshot* of ``comm_degsums`` taken before the batch starts.
-    All proposals are returned as (node_index, best_community) pairs.
-    The caller applies all moves together (bulk-synchronous update).
-    """
-    (adj_data, adj_indices, adj_indptr,
-     communities, degrees, comm_degsums,
-     m, resolution, min_delta_q, node_batch) = args
-
-    proposals: list[tuple[int, int]] = []
-    n_comms = len(comm_degsums)
-
-    for i in node_batch:
-        ki    = float(degrees[i])
-        c_old = int(communities[i])
-
-        # Snapshot: Σ_tot after hypothetically removing i
-        sigma_old = float(comm_degsums[c_old]) - ki
-
-        s = int(adj_indptr[i])
-        e = int(adj_indptr[i + 1])
-        if s == e:
-            proposals.append((i, c_old))
-            continue
-
-        nb_comms   = communities[adj_indices[s:e]]
-        nb_weights = adj_data[s:e].astype(np.float64)
-
-        unique_comms, inverse = np.unique(nb_comms, return_inverse=True)
-        k_i_c = np.zeros(len(unique_comms), dtype=np.float64)
-        np.add.at(k_i_c, inverse, nb_weights)
-
-        k_i_c_old = k_i_c[unique_comms == c_old].sum()
-
-        best_dq   = min_delta_q
-        best_comm = c_old
-
-        for idx, c_new in enumerate(unique_comms):
-            if c_new == c_old or c_new >= n_comms:
-                continue
-            sigma_new = float(comm_degsums[c_new])
-            dq = ((k_i_c[idx] - k_i_c_old) / m
-                  - resolution * ki * (sigma_new - sigma_old) / (2.0 * m * m))
-            if dq > best_dq:
-                best_dq   = dq
-                best_comm = int(c_new)
-
-        proposals.append((i, best_comm))
-
-    return proposals
-
-
-# ---------------------------------------------------------------------------
-# Phase 1 — vectorized GPU (gpu)
-# ---------------------------------------------------------------------------
-
-def _phase1_gpu(
-    adj_csr_gpu,           # CuPy CSR sparse
-    communities_gpu,       # (N,) CuPy int32
-    degrees_gpu,           # (N,) CuPy float64
-    m: float,
-    resolution: float,
-    min_delta_q: float,
-) -> tuple:                # (new_communities_gpu, improved: bool)
-    """
-    One vectorized batch-parallel Phase 1 pass on the GPU.
-
-    For every edge (i, j, w) simultaneously:
-        join_gain[e] = w/m − γ·Σ_tot[comm[j]]·k_i / (2m²)
-    For every node i:
-        leave_gain[i] = k_{i,c_i}/m − γ·(Σ_tot[c_i] − k_i)·k_i / (2m²)
-        delta_q[e]    = join_gain[e] − leave_gain[edge_rows[e]]
-
-    For each node the edge achieving the maximum delta_q (subject to
-    delta_q > min_delta_q) is selected using cp.maximum.at (GPU atomics).
-    All moves are applied simultaneously (bulk-synchronous Louvain).
-    """
-    N = int(adj_csr_gpu.shape[0])
-
-    # Community degree sums
-    n_comms = int(communities_gpu.max()) + 1
-    comm_degsums = cp.zeros(n_comms, dtype=cp.float64)
-    cp.add.at(comm_degsums, communities_gpu, degrees_gpu)
-
-    # Edge arrays from COO view
-    coo = adj_csr_gpu.tocoo()
-    e_rows = coo.row.astype(cp.int64)
-    e_cols = coo.col.astype(cp.int64)
-    e_wts  = coo.data.astype(cp.float64)
-    nnz    = int(coo.nnz)
-
-    target_comms = communities_gpu[e_cols]   # community of each edge's target
-
-    # Join gain per edge
-    join_gain = (e_wts / m
-                 - resolution * comm_degsums[target_comms] * degrees_gpu[e_rows]
-                 / (2.0 * m * m))
-
-    # Leave gain per node: k_{i,c_i} via scatter-add over same-community edges
-    same_comm = (target_comms == communities_gpu[e_rows]).astype(cp.float64)
-    k_self = cp.zeros(N, dtype=cp.float64)
-    cp.add.at(k_self, e_rows, e_wts * same_comm)
-
-    leave_gain = (k_self / m
-                  - resolution * (comm_degsums[communities_gpu] - degrees_gpu)
-                  * degrees_gpu / (2.0 * m * m))
-
-    # ΔQ per edge
-    delta_q = join_gain - leave_gain[e_rows]   # (nnz,)
-
-    # Per-node maximum ΔQ via GPU atomic scatter-max
-    # Baseline = min_delta_q so only improving moves are flagged
-    best_dq = cp.full(N, min_delta_q, dtype=cp.float64)
-    cp.maximum.at(best_dq, e_rows, delta_q)
-
-    # Mark edges that achieve the best ΔQ for their source node AND improve Q
-    is_best = (
-        (cp.abs(delta_q - best_dq[e_rows]) < 1e-12)
-        & (delta_q > min_delta_q)
-    )
-
-    # Apply batch moves: scatter target communities of best edges back to sources
-    # For nodes with ties (multiple edges sharing best_dq), last write wins —
-    # this is the expected non-determinism of parallel Louvain.
-    new_communities = communities_gpu.copy()
-    if bool(is_best.any()):
-        best_src   = e_rows[is_best]
-        best_tgt_c = communities_gpu[e_cols[is_best]]
-        new_communities[best_src] = best_tgt_c
-
-    improved = bool(cp.any(new_communities != communities_gpu))
-    return new_communities, improved
-
-
-# ---------------------------------------------------------------------------
-# Louvain main loop (shared across modes)
-# ---------------------------------------------------------------------------
-
-def _run_louvain(
-    A_sym: sp.csr_matrix,
-    m: float,
-    resolution: float,
-    min_delta_q: float,
-    max_levels: int,
-    phase1_fn,            # callable: (adj, comms, degs, m, res, mdq) → (comms, improved)
-    max_phase1_passes: int = 100,
-) -> tuple[np.ndarray, list[list[int]]]:
-    """
-    Execute the two-phase Louvain loop using a pluggable Phase 1 function.
-
-    ``max_phase1_passes`` caps the inner while-loop for each Louvain level.
-    Sequential (cpu_single) Phase 1 converges monotonically and typically
-    exits long before the cap.  Parallel (cpu_multi / gpu) Phase 1 uses
-    bulk-synchronous moves that can oscillate — two adjacent nodes swapping
-    communities in alternating passes — so the cap is the primary termination
-    condition for those modes.
-
-    Returns (final_labels, hierarchy).
-    """
-    N = A_sym.shape[0]
-    node_to_super = np.arange(N, dtype=np.int32)
-    current_adj   = A_sym
-    current_m     = m
-    hierarchy: list[list[int]] = []
-
-    for _level in range(max_levels):
-        n_cur = current_adj.shape[0]
-        degrees = np.asarray(current_adj.sum(axis=1)).flatten().astype(np.float64)
-        communities = np.arange(n_cur, dtype=np.int32)
-
-        # ---- Phase 1 ----
-        # The pass counter prevents infinite oscillation in bulk-synchronous
-        # parallel modes (cpu_multi, gpu).  Sequential cpu_single will exit
-        # naturally via changed=False well before max_phase1_passes.
-        changed   = True
-        pass_num  = 0
-        while changed and pass_num < max_phase1_passes:
-            communities, changed = phase1_fn(
-                current_adj, communities, degrees, current_m, resolution, min_delta_q
-            )
-            pass_num += 1
-
-        # Record community assignments for original nodes at this level
-        level_comms = communities[node_to_super]
-        _, level_renumbered = np.unique(level_comms, return_inverse=True)
-        hierarchy.append(level_renumbered.tolist())
-
-        # ---- Phase 2: collapse ----
-        new_adj, new_labels = _phase2_collapse(current_adj, communities)
-        K = new_adj.shape[0]
-
-        if K >= n_cur:          # no merging — converged
-            break
-
-        # Update node → super-node mapping
-        node_to_super = new_labels[communities[node_to_super]]
-        current_adj   = new_adj
-        current_m     = float(new_adj.sum()) / 2.0
-
-    # Final assignments: each original node maps to its super-node at the last level
-    final_labels = node_to_super
-    _, final_labels = np.unique(final_labels, return_inverse=True)
-    return final_labels.astype(np.int32), hierarchy
-
-
-# ---------------------------------------------------------------------------
-# Public implementations
-# ---------------------------------------------------------------------------
-
-def louvain_cpu_single(graph_csr: sp.csr_matrix, params: dict) -> dict:
-    """
-    Louvain — single-threaded CPU with sequential Phase 1.
-
-    The directed GRN is symmetrized internally (A_sym = A + A^T) before
-    running Louvain.  Phase 1 is a deterministic sequential node scan.
-    Phase 2 collapses communities into weighted super-nodes via scipy sparse.
-
-    Parameters
-    ----------
-    graph_csr : scipy.sparse.csr_matrix — directed GRN adjacency (CSR).
-    params    : dict — see module docstring.
-
-    Returns
-    -------
-    dict with keys: community_assignments, num_communities, modularity,
-                    hierarchy, top_communities
-    """
-    p = _merge_params(params)
-    A_sym = _symmetrize(graph_csr)
-    m     = float(A_sym.sum()) / 2.0
-
-    final_labels, hierarchy = _run_louvain(
-        A_sym, m,
-        resolution        = float(p["resolution"]),
-        min_delta_q       = float(p["min_delta_q"]),
-        max_levels        = int(p["max_levels"]),
-        phase1_fn         = _phase1_single,
-        max_phase1_passes = int(p["max_phase1_passes"]),
-    )
-    return _build_result(A_sym, final_labels, hierarchy, m, float(p["resolution"]))
-
-
-def louvain_cpu_multi(
+def _symmetrize(
     graph_csr: sp.csr_matrix,
-    params: dict,
-    n_workers: int = 4,
-) -> dict:
-    """
-    Louvain — multi-process CPU with bulk-synchronous batch Phase 1.
+    network_type: str,
+) -> tuple[sp.csr_matrix, str]:
+    """Convert the graph to an undirected weighted CSR for Louvain.
 
-    Phase 1 is parallelised by distributing nodes across workers.  Each
-    worker computes the best community move for its node batch using a
-    *snapshot* of the community degree sums taken at the start of each
-    batch round.  All proposed moves are then applied simultaneously.
+    Louvain requires an undirected graph — modularity Q is undefined for
+    directed edges (the null model k_i·k_j / 2m assumes undirected degree).
 
-    .. warning::
-        Parallel Louvain non-determinism — this mode may produce different
-        community assignments and modularity values than ``cpu_single``
-        because simultaneous moves can conflict (e.g. two nodes propose to
-        swap communities).  This is a documented property of bulk-synchronous
-        Louvain and does not indicate an error.
-
-    Phase 2 (community collapse) runs on the main process (sequential) as
-    it involves graph restructuring that is not trivially parallelisable.
-
-    Parameters
-    ----------
-    graph_csr : scipy.sparse.csr_matrix
-    params    : dict
-    n_workers : int
+    Behaviour by network type
+    -------------------------
+    GRN    : A_sym = A + Aᵀ.  Mutual TF↔gene edges get weight 2 (stronger
+             co-regulation).  One-way TF→gene edges keep their original
+             weight.
+    PPI    : graph used as-is (already undirected; symmetrising would
+             double every edge weight).
+    miRNA  : A_sym = A + Aᵀ (bipartite → mutual reads as weight 2).
 
     Returns
     -------
-    Same structure as louvain_cpu_single.
+    (csr_float32, note_string)
     """
-    warnings.warn(
-        "louvain_cpu_multi uses bulk-synchronous parallel Phase 1.  "
-        "Community assignments may differ from cpu_single due to batched "
-        "move application — this is expected behaviour, not a bug.",
-        UserWarning,
-        stacklevel=2,
-    )
+    nt = str(network_type).lower()
+    if nt == "ppi":
+        A = graph_csr.astype(np.float32).tocsr()
+        A.sum_duplicates()
+        return A, "PPI: graph used as-is (already undirected)"
+    # grn / mirna / anything else → symmetrise
+    A = (graph_csr + graph_csr.T).astype(np.float32).tocsr()
+    A.sum_duplicates()
+    return A, f"{nt.upper()}: A + Aᵀ applied (mutual edges weight 2)"
 
-    p                 = _merge_params(params)
-    resolution        = float(p["resolution"])
-    min_delta_q       = float(p["min_delta_q"])
-    max_levels        = int(p["max_levels"])
-    max_phase1_passes = int(p["max_phase1_passes"])
 
-    A_sym = _symmetrize(graph_csr)
-    m     = float(A_sym.sum()) / 2.0
+def _remove_self_loops(csr: sp.csr_matrix) -> sp.csr_matrix:
+    """Zero the diagonal and drop the now-explicit zeros.
 
-    # Create ONE worker pool for the entire Louvain run.
-    # Previously the pool was spawned and torn down inside _phase1_batch on
-    # every single Phase 1 pass.  On Windows (spawn start method) each pool
-    # creation costs ~0.3–1 s of process start-up per worker, so hundreds of
-    # passes × 4 workers meant minutes of pure overhead before any work.
-    # Hoisting the pool here amortises that cost across all passes and levels.
-    with ProcessPoolExecutor(max_workers=n_workers) as ex:
+    Self-loops on the *original* graph are not biologically meaningful for
+    Louvain at level 0.  They will be regenerated correctly at higher
+    levels as collapsed intra-community weight by :func:`_build_coarsened_graph`.
+    """
+    csr = csr.copy()
+    csr.setdiag(0)
+    csr.eliminate_zeros()
+    return csr
 
-        def _phase1_batch(
-            adj_csr: sp.csr_matrix,
-            communities: np.ndarray,
-            degrees: np.ndarray,
-            m_inner: float,
-            res: float,
-            mdq: float,
-        ) -> tuple[np.ndarray, bool]:
-            """Bulk-synchronous batch Phase 1 — reuses the outer pool."""
-            N_inner   = adj_csr.shape[0]
-            n_slots   = int(communities.max()) + 1
-            comm_degs = np.zeros(n_slots, dtype=np.float64)
-            np.add.at(comm_degs, communities, degrees)
 
-            chunk_size = max(1, (N_inner + n_workers - 1) // n_workers)
-            batches = [
-                list(range(i, min(i + chunk_size, N_inner)))
-                for i in range(0, N_inner, chunk_size)
-            ]
-            args_list = [
-                (adj_csr.data, adj_csr.indices, adj_csr.indptr,
-                 communities, degrees, comm_degs,
-                 m_inner, res, mdq, batch)
-                for batch in batches
-            ]
+def _handle_isolated_nodes(
+    csr: sp.csr_matrix,
+) -> tuple[sp.csr_matrix, np.ndarray]:
+    """Identify zero-degree nodes.
 
-            all_proposals = list(ex.map(_louvain_batch_worker, args_list))
+    The CSR is returned unchanged; isolated nodes naturally remain in
+    singleton communities (``compute_proposed_moves`` returns
+    ``proposed = current`` when ``degree == 0``).  The list is returned
+    purely for downstream reporting / re-integration logic.
+    """
+    degrees = np.asarray(csr.sum(axis=1), dtype=np.float64).flatten()
+    isolated = np.where(degrees == 0)[0].astype(np.int32)
+    return csr, isolated
 
-            # Apply all proposed moves simultaneously (bulk-synchronous update)
-            improved = False
-            for batch_props in all_proposals:
-                for node_i, new_comm in batch_props:
-                    if communities[node_i] != new_comm:
-                        communities[node_i] = new_comm
-                        improved = True
 
-            return communities, improved
+def _normalize_weights(csr: sp.csr_matrix) -> sp.csr_matrix:
+    """Rescale edge weights so max(w) <= 1.
 
-        final_labels, hierarchy = _run_louvain(
-            A_sym, m,
-            resolution        = resolution,
-            min_delta_q       = min_delta_q,
-            max_levels        = max_levels,
-            phase1_fn         = _phase1_batch,
-            max_phase1_passes = max_phase1_passes,
+    Modularity Q is invariant under uniform weight scaling, so this is
+    safe and protects against float32 overflow in dot-product sums for
+    dense or high-weight graphs (e.g. miRNA expression-correlation
+    networks).
+    """
+    if csr.nnz == 0:
+        return csr
+    max_w = float(csr.data.max())
+    if max_w <= 0.0 or math.isclose(max_w, 1.0):
+        return csr
+    csr = csr.copy()
+    csr.data = (csr.data / max_w).astype(np.float32)
+    return csr
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 GPU helper — run one Louvain level + modularity
+# ---------------------------------------------------------------------------
+
+def _louvain_level(
+    csr: sp.csr_matrix,
+    kernels: dict[str, Any],
+    min_delta_q: float,
+    resolution: float,
+    max_phase1_passes: int,
+    block_size: int,
+    stream_compute,
+    stream_transfer,
+) -> tuple[np.ndarray, float]:
+    """Run Phase 1 on the GPU until convergence (or pass cap) and compute Q.
+
+    Returns
+    -------
+    (community_assignment, modularity_Q)
+
+    The community assignment is NOT renumbered to 0..K-1 here — that is
+    done in :func:`louvain_gpu` before passing to :func:`_build_coarsened_graph`.
+    """
+    n   = int(csr.shape[0])
+    nnz = int(csr.nnz)
+    if n == 0:
+        return np.zeros(0, dtype=np.int32), 0.0
+
+    # ---- Host arrays --------------------------------------------------
+    row_ptr_h  = np.ascontiguousarray(csr.indptr,  dtype=np.int32)
+    col_idx_h  = np.ascontiguousarray(csr.indices, dtype=np.int32)
+    edge_wt_h  = np.ascontiguousarray(csr.data,    dtype=np.float32)
+    degree_h   = np.asarray(csr.sum(axis=1), dtype=np.float32).flatten()
+    edge_src_h = np.repeat(
+        np.arange(n, dtype=np.int32), np.diff(row_ptr_h)
+    ).astype(np.int32)
+
+    total_weight = float(degree_h.sum())   # = 2m for symmetric CSR
+    if total_weight <= 0.0:
+        return np.arange(n, dtype=np.int32), 0.0
+    inv_2m = 1.0 / total_weight            # = 1 / (2m)
+
+    community_h    = np.arange(n, dtype=np.int32)
+    comm_degsum_h  = degree_h.copy()       # each node alone → degsum = degree
+
+    # ---- Device allocation -------------------------------------------
+    d_buffers: list = []
+
+    def _to_gpu(arr: np.ndarray):
+        ga = gpuarray.to_gpu_async(arr, stream=stream_transfer)
+        d_buffers.append(ga)
+        return ga
+
+    def _empty(shape, dtype):
+        ga = gpuarray.empty(shape, dtype=dtype)
+        d_buffers.append(ga)
+        return ga
+
+    d_row_ptr    = _to_gpu(row_ptr_h)
+    d_col_idx    = _to_gpu(col_idx_h)
+    d_edge_wt    = _to_gpu(edge_wt_h)
+    d_edge_src   = _to_gpu(edge_src_h)
+    d_degree     = _to_gpu(degree_h)
+    d_community  = _to_gpu(community_h)
+    d_comm_degs  = _to_gpu(comm_degsum_h)
+    d_proposed   = _empty((n,), np.int32)
+    d_improve    = _empty((1,), np.int32)
+
+    mod_blocks   = max(1, (nnz + BLOCK_SIZE - 1) // BLOCK_SIZE)
+    d_partial_Q  = _empty((mod_blocks,), np.float32)
+
+    stream_transfer.synchronize()
+
+    try:
+        k_prop  = kernels["proposed_moves"]
+        k_apply = kernels["apply_moves"]
+        k_mod   = kernels["modularity"]
+
+        bs_apply = int(block_size)
+        if bs_apply <= 0 or bs_apply > 1024:
+            bs_apply = BLOCK_SIZE
+        grid_apply = ((n + bs_apply - 1) // bs_apply, 1, 1)
+        grid_n     = (n, 1, 1)            # one block per node for Phase 1
+        block_256  = (BLOCK_SIZE, 1, 1)
+
+        # ---- Phase 1 iterative loop -----------------------------------
+        for _pass in range(max_phase1_passes):
+            cuda.memset_d32(d_improve.gpudata, 0, 1)
+
+            # Compute proposals (block per node, three-tier dispatch)
+            k_prop(
+                d_row_ptr, d_col_idx, d_edge_wt,
+                d_community, d_comm_degs, d_degree,
+                d_proposed,
+                np.float32(min_delta_q),
+                np.float32(inv_2m),
+                np.float32(resolution),
+                np.int32(n),
+                block=block_256, grid=grid_n, stream=stream_compute,
+            )
+
+            # Apply proposals in batch (one thread per node)
+            k_apply(
+                d_community, d_proposed, d_improve,
+                d_degree, d_comm_degs, np.int32(n),
+                block=(bs_apply, 1, 1), grid=grid_apply,
+                stream=stream_compute,
+            )
+
+            stream_compute.synchronize()
+            if int(d_improve.get()[0]) == 0:
+                break
+
+        # ---- Modularity (one thread per edge) -------------------------
+        mod_grid = (mod_blocks, 1, 1)
+        k_mod(
+            d_edge_src, d_col_idx, d_edge_wt,
+            d_community, d_degree, d_partial_Q,
+            np.float32(inv_2m), np.float32(resolution),
+            np.int32(nnz),
+            block=block_256, grid=mod_grid, stream=stream_compute,
         )
+        stream_compute.synchronize()
 
-    return _build_result(A_sym, final_labels, hierarchy, m, resolution)
+        modularity = float(inv_2m * float(np.sum(d_partial_Q.get())))
+        community_out = d_community.get().astype(np.int32)
+        return community_out, modularity
 
+    finally:
+        for arr in d_buffers:
+            try:
+                arr.gpudata.free()
+            except Exception:                           # noqa: BLE001
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — build the coarsened graph for the next level
+# ---------------------------------------------------------------------------
+
+def _build_coarsened_graph(
+    csr: sp.csr_matrix,
+    community: np.ndarray,        # already renumbered to 0..K-1
+    K: int,
+    kernels: dict[str, Any],
+    stream_compute,
+    block_size: int,
+) -> sp.csr_matrix:
+    """Collapse the graph into a (K × K) weighted super-node CSR.
+
+    Implementation (mixed GPU + CPU)
+    --------------------------------
+      1. GPU: count_community_edges  → (csrc, cdst, cwt) triples
+      2. D2H copy
+      3. CPU: np.lexsort by (csrc, cdst)         (TODO: GPU radix sort)
+      4. CPU: segment-head detect + np.add.reduceat to sum weights
+      5. CPU: assemble scipy.sparse.csr_matrix on (K × K) shape
+
+    Self-loops are KEPT — they encode intra-community edge weight, which
+    contributes to the modularity null model at higher levels.
+    """
+    n   = int(csr.shape[0])
+    nnz = int(csr.nnz)
+    if nnz == 0:
+        return sp.csr_matrix((K, K), dtype=np.float32)
+
+    row_ptr_h  = np.ascontiguousarray(csr.indptr,  dtype=np.int32)
+    col_idx_h  = np.ascontiguousarray(csr.indices, dtype=np.int32)
+    edge_wt_h  = np.ascontiguousarray(csr.data,    dtype=np.float32)
+    edge_src_h = np.repeat(
+        np.arange(n, dtype=np.int32), np.diff(row_ptr_h)
+    ).astype(np.int32)
+
+    d_local: list = []
+
+    def _to_gpu(arr: np.ndarray):
+        ga = gpuarray.to_gpu(arr)
+        d_local.append(ga)
+        return ga
+
+    def _empty(shape, dtype):
+        ga = gpuarray.empty(shape, dtype=dtype)
+        d_local.append(ga)
+        return ga
+
+    try:
+        d_edge_src  = _to_gpu(edge_src_h)
+        d_col_idx   = _to_gpu(col_idx_h)
+        d_edge_wt   = _to_gpu(edge_wt_h)
+        d_community = _to_gpu(community.astype(np.int32))
+        d_csrc      = _empty((nnz,), np.int32)
+        d_cdst      = _empty((nnz,), np.int32)
+        d_cwt       = _empty((nnz,), np.float32)
+
+        bs = int(block_size)
+        if bs <= 0 or bs > 1024:
+            bs = BLOCK_SIZE
+        grid = ((nnz + bs - 1) // bs, 1, 1)
+
+        k_count = kernels["count_edges"]
+        k_count(
+            d_edge_src, d_col_idx, d_edge_wt, d_community,
+            d_csrc, d_cdst, d_cwt, np.int32(nnz),
+            block=(bs, 1, 1), grid=grid, stream=stream_compute,
+        )
+        stream_compute.synchronize()
+
+        csrc_h = d_csrc.get()
+        cdst_h = d_cdst.get()
+        cwt_h  = d_cwt.get()
+    finally:
+        for arr in d_local:
+            try:
+                arr.gpudata.free()
+            except Exception:                           # noqa: BLE001
+                pass
+
+    # ---- CPU sort + reduce-by-key + assemble new CSR --------------------
+    # TODO(optimisation): replace lexsort with a GPU radix sort (CUB
+    # DeviceRadixSort via cupy / pycuda-cub bindings) once the dependency
+    # cost is justified.  Current correctness-first path: numpy lexsort.
+    order  = np.lexsort((cdst_h, csrc_h))
+    csrc_h = csrc_h[order]
+    cdst_h = cdst_h[order]
+    cwt_h  = cwt_h[order]
+
+    # Segment heads: positions where (csrc, cdst) changes vs. previous.
+    if nnz == 1:
+        seg_starts = np.array([0], dtype=np.int64)
+    else:
+        change = (csrc_h[1:] != csrc_h[:-1]) | (cdst_h[1:] != cdst_h[:-1])
+        seg_starts = np.concatenate(([0], np.flatnonzero(change) + 1)).astype(np.int64)
+
+    new_csrc = csrc_h[seg_starts]
+    new_cdst = cdst_h[seg_starts]
+    new_cwt  = np.add.reduceat(cwt_h, seg_starts).astype(np.float32)
+
+    new_csr = sp.csr_matrix(
+        (new_cwt, (new_csrc, new_cdst)),
+        shape=(K, K),
+        dtype=np.float32,
+    )
+    # sum_duplicates is a no-op here (reduce_by-segment already did it) but
+    # it canonicalises the CSR layout for downstream calls.
+    new_csr.sum_duplicates()
+    return new_csr
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
 
 def louvain_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
-    """
-    Louvain — GPU-accelerated bulk-synchronous Phase 1 via CuPy.
+    """Louvain — GPU-accelerated via custom PyCUDA kernels.
 
-    The symmetrized adjacency is uploaded to GPU once per Louvain level.
-    Phase 1 uses fully vectorized CuPy operations (see ``_phase1_gpu``):
-    join/leave gains are computed for all edges in parallel; per-node
-    best moves are found via GPU atomic scatter-max (``cp.maximum.at``);
-    all moves are applied simultaneously as a batch index-scatter.
+    No CuPy dependency.  All four kernels (compiled once, cached) are
+    launched from a single PyCUDA driver-API context retained via
+    :py:meth:`Device.retain_primary_context` so the implementation
+    coexists cleanly with any CuPy code running in the same process.
 
-    Phase 2 (community collapse) runs on CPU since it involves graph
-    restructuring (scatter-add on a new COO matrix), which scipy handles
-    efficiently for the reduced super-node graph.
+    Pipeline
+    --------
+    CPU preprocessing (NOT timed):
+      _symmetrize          — network-type-aware undirected conversion
+      _remove_self_loops   — drop diagonal
+      _handle_isolated_nodes
+      _normalize_weights   — divide by max (Q invariant under scaling)
 
-    .. warning::
-        Same non-determinism caveat as ``cpu_multi`` — bulk-synchronous
-        move application may produce different partitions across runs.
-
-    Falls back to ``louvain_cpu_single`` with a warning if CuPy is
-    unavailable.
-
-    Parameters
-    ----------
-    graph_csr : scipy.sparse.csr_matrix
-    params    : dict
+    GPU loop (timed):
+      For each level (up to max_levels):
+        _louvain_level         — Phase 1 + modularity
+        _build_coarsened_graph — Phase 2 (mixed GPU + CPU)
+        break when no merging occurs
 
     Returns
     -------
-    Same structure as louvain_cpu_single.
+    dict — see CLAUDE.md "Louvain" result spec (outer envelope +
+    ``result`` sub-dict with community_assignments, num_communities,
+    modularity, top_communities, hierarchy, note).
+
+    Raises
+    ------
+    RuntimeError
+        If PyCUDA is unavailable or no CUDA device can be initialised.
+    MemoryError
+        If GPU allocation fails.
     """
+    if not PYCUDA_AVAILABLE:
+        raise RuntimeError(
+            "PyCUDA is required for louvain_gpu(). "
+            "Install it or use louvain_cpu_single() from "
+            "src/algorithms/cpu/single_threaded/louvain.py"
+        )
+
+    # Push the device PRIMARY context unconditionally — same rationale as
+    # hits.py: `_ensure_cuda_context()` activates the CuPy runtime-API
+    # context, which PyCUDA's `cuModuleLoadDataEx` does not recognise as
+    # current on the driver-API stack.  retain_primary_context() is
+    # ref-counted and shared with CuPy under the hood.
+    pushed_ctx = None
     try:
-        from src.benchmarking.benchmark import _ensure_cuda_context
-        if not _ensure_cuda_context():
-            raise RuntimeError("no CUDA context")
-    except Exception:
-        pass
+        cuda.init()
+        if cuda.Device.count() <= 0:
+            raise RuntimeError("No CUDA device available")
+        pushed_ctx = cuda.Device(0).retain_primary_context()
+        pushed_ctx.push()
+    except cuda.LogicError as e:
+        raise RuntimeError(f"CUDA initialisation failed: {e}") from e
 
-    if not _CUPY_AVAILABLE:
-        warnings.warn(
-            "CuPy unavailable — falling back to louvain_cpu_single.",
-            RuntimeWarning,
-            stacklevel=2,
+    try:
+        # ---- Parameter merging ----------------------------------------
+        p = _merge_params(params)
+        if _GPU_CONFIG_AVAILABLE:
+            p = apply_config("louvain", graph_csr, p) or p
+            for k, v in _DEFAULT_PARAMS.items():
+                p.setdefault(k, v)
+
+        min_delta_q       = float(p["min_delta_q"])
+        max_levels        = int(p["max_levels"])
+        resolution        = float(p["resolution"])
+        max_phase1_passes = int(p["max_phase1_passes"])
+        network_type      = str(p.get("network_type", "grn"))
+        block_size        = int(p.get("block_size", BLOCK_SIZE))
+        if block_size <= 0 or block_size > 1024:
+            block_size = BLOCK_SIZE
+
+        n_original = int(graph_csr.shape[0])
+        if n_original == 0:
+            raise ValueError("Empty graph")
+
+        # ---- CPU preprocessing ----------------------------------------
+        A_sym, sym_note = _symmetrize(graph_csr, network_type)
+        A_sym           = _remove_self_loops(A_sym)
+        A_sym, _isolated = _handle_isolated_nodes(A_sym)
+        A_sym           = _normalize_weights(A_sym)
+
+        # Ensure float32 throughout the GPU pipeline.
+        if A_sym.dtype != np.float32:
+            A_sym = A_sym.astype(np.float32)
+
+        kernels = _get_kernels()
+
+        # ---- Streams + timing ------------------------------------------
+        stream_compute  = cuda.Stream()
+        stream_transfer = cuda.Stream()
+        start_event     = cuda.Event()
+        end_event       = cuda.Event()
+        start_event.record(stream_compute)
+
+        # ---- Hierarchy loop -------------------------------------------
+        current          = A_sym
+        global_community = np.arange(n_original, dtype=np.int32)
+        hierarchy: list[list[int]] = []
+        final_modularity = 0.0
+
+        for _level in range(max_levels):
+            n_cur = int(current.shape[0])
+
+            # Phase 1 + modularity for this level
+            level_community, level_modularity = _louvain_level(
+                current, kernels,
+                min_delta_q=min_delta_q,
+                resolution=resolution,
+                max_phase1_passes=max_phase1_passes,
+                block_size=block_size,
+                stream_compute=stream_compute,
+                stream_transfer=stream_transfer,
+            )
+            final_modularity = level_modularity
+
+            # Renumber communities to 0..K-1 (compact label space)
+            _, renum = np.unique(level_community, return_inverse=True)
+            level_renum = renum.astype(np.int32)
+            K = int(level_renum.max()) + 1 if level_renum.size else 0
+
+            # Update global mapping: each original node now points to its
+            # super-node at this level.
+            global_community = level_renum[global_community]
+            hierarchy.append(global_community.astype(np.int32).tolist())
+
+            # Convergence: no merging occurred at this level.
+            if K >= n_cur:
+                break
+
+            # Phase 2: build coarsened CSR for the next level.
+            current = _build_coarsened_graph(
+                current, level_renum, K, kernels,
+                stream_compute=stream_compute,
+                block_size=block_size,
+            )
+
+            # Defensive: if coarsening produced nothing useful, stop.
+            if current.shape[0] == 0 or current.shape[0] == n_cur:
+                break
+
+        end_event.record(stream_compute)
+        end_event.synchronize()
+        elapsed = start_event.time_till(end_event) / 1000.0   # ms → s
+
+        # ---- Result construction (NOT timed) --------------------------
+        # Compact label space for the final assignment.
+        _, final_labels = np.unique(global_community, return_inverse=True)
+        final_labels    = final_labels.astype(np.int32)
+        K_final         = int(final_labels.max()) + 1 if final_labels.size else 0
+
+        sizes      = np.bincount(final_labels, minlength=K_final)
+        top_idx    = np.argsort(sizes)[::-1][:_TOP_K]
+        top_communities = [
+            {
+                "community_id": int(c),
+                "size":         int(sizes[c]),
+                "member_nodes": np.where(final_labels == c)[0].tolist(),
+            }
+            for c in top_idx if sizes[c] > 0
+        ]
+
+        note = (
+            f"Graph symmetrised for Louvain ({sym_note}). "
+            "Parallel Phase 1 updates may produce a different partition "
+            "than serial Louvain — expected behaviour, not an error."
         )
-        return louvain_cpu_single(graph_csr, params)
 
-    warnings.warn(
-        "louvain_gpu uses bulk-synchronous parallel Phase 1.  "
-        "Community assignments may differ from cpu_single — this is expected.",
-        UserWarning,
-        stacklevel=2,
-    )
+        return {
+            "algorithm":      "louvain",
+            "mode":           "gpu",
+            "network_type":   network_type,
+            "execution_time": elapsed,
+            "num_nodes":      n_original,
+            "num_edges":      int(graph_csr.nnz),
+            "result": {
+                "community_assignments": final_labels.tolist(),
+                "num_communities":       int(K_final),
+                "modularity":            float(final_modularity),
+                "top_communities":       top_communities,
+                "hierarchy":             hierarchy,
+                "note":                  note,
+            },
+        }
 
-    p                 = _merge_params(params)
-    resolution        = float(p["resolution"])
-    min_delta_q       = float(p["min_delta_q"])
-    max_levels        = int(p["max_levels"])
-    max_phase1_passes = int(p["max_phase1_passes"])
-
-    A_sym = _symmetrize(graph_csr)
-    m     = float(A_sym.sum()) / 2.0
-
-    def _phase1_gpu_wrapper(
-        adj_csr: sp.csr_matrix,
-        communities: np.ndarray,
-        degrees: np.ndarray,
-        m_inner: float,
-        res: float,
-        mdq: float,
-    ) -> tuple[np.ndarray, bool]:
-        """Upload current level to GPU, run vectorized Phase 1, download."""
-        coo = adj_csr.tocoo()
-        adj_gpu = cpsp.csr_matrix(
-            (
-                cp.asarray(coo.data,  dtype=cp.float64),
-                (cp.asarray(coo.row), cp.asarray(coo.col)),
-            ),
-            shape=coo.shape,
+    except cuda.LogicError as e:
+        logging.error("CUDA error in louvain_gpu: %s", e)
+        raise
+    except MemoryError:
+        logging.warning(
+            "VRAM exhausted in louvain_gpu. "
+            "Try a smaller graph or a higher-VRAM device."
         )
-        comms_gpu   = cp.asarray(communities, dtype=cp.int32)
-        degrees_gpu = cp.asarray(degrees,     dtype=cp.float64)
-
-        new_comms_gpu, improved = _phase1_gpu(
-            adj_gpu, comms_gpu, degrees_gpu, m_inner, res, mdq
-        )
-
-        new_comms_cpu = cp.asnumpy(new_comms_gpu).astype(np.int32)
-
-        del adj_gpu, comms_gpu, degrees_gpu, new_comms_gpu
-        cp.get_default_memory_pool().free_all_blocks()
-
-        return new_comms_cpu, improved
-
-    final_labels, hierarchy = _run_louvain(
-        A_sym, m,
-        resolution        = resolution,
-        min_delta_q       = min_delta_q,
-        max_levels        = max_levels,
-        phase1_fn         = _phase1_gpu_wrapper,
-        max_phase1_passes = max_phase1_passes,
-    )
-    return _build_result(A_sym, final_labels, hierarchy, m, resolution)
+        raise
+    finally:
+        if pushed_ctx is not None:
+            try:
+                pushed_ctx.pop()
+            except Exception:                           # noqa: BLE001
+                pass
 
 
 # ---------------------------------------------------------------------------
 # Runner interface
 # ---------------------------------------------------------------------------
 
-def _cpu_single(graph_csr: sp.csr_matrix, params: dict | None = None, **_) -> dict:
-    p = _merge_params(params)
-    return {"output": louvain_cpu_single(graph_csr, p), "extra_params": p}
-
-
-def _cpu_multi(
-    graph_csr: sp.csr_matrix,
-    params: dict | None = None,
-    n_workers: int = 4,
-    **_,
-) -> dict:
-    p = _merge_params(params)
-    return {
-        "output":      louvain_cpu_multi(graph_csr, p, n_workers=n_workers),
-        "extra_params": {**p, "n_workers": n_workers},
-    }
-
-
 def _gpu(graph_csr: sp.csr_matrix, params: dict | None = None, **_) -> dict:
+    """Runner entry point — preserves the legacy ``{output, extra_params}``
+    shape required by ``src.benchmarking.benchmark`` and
+    ``src.runner.algorithm_runner``.
+    """
     p = _merge_params(params)
-    return {"output": louvain_gpu(graph_csr, p), "extra_params": p}
+    full = louvain_gpu(graph_csr, p)
+    # `full` already has the outer envelope; the benchmark runner only
+    # consumes "output" and "extra_params" — keep both layers available.
+    return {"output": full, "extra_params": p}
