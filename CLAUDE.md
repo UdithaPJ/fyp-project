@@ -227,41 +227,74 @@ Do NOT revert to CuPy SpMV or single-tier kernel.
 
 ---
 
-## HITS GPU implementation
+## HITS GPU implementation (optimised)
 
 Custom PyCUDA kernels — no CuPy dependency.
 
-Kernels (compiled once, cached in `_kernel_cache["hits"]`):
-  - `spmv_degree_aware`        — SpMV with three-tier scheduling
-      < 32 edges  → 1 thread (serial)
-      32–255      → 1 warp (`__shfl_down_sync` reduction)
-      ≥ 256       → 1 block (shared-memory tree reduction)
-  - `compute_partial_norm_sq`  — partial L2-norm², one sum per block
-  - `normalize_vector`         — in-place division by L2 norm
-  - `compute_convergence_delta`— Σ((Δh)² + (Δa)²) partial per block
+Key optimisations over the initial implementation:
+  1. Fused SpMV + norm: `spmv_with_norm_sq` computes y = M·x AND writes
+     per-node y[i]² to `partial_norm` in one kernel pass — eliminates a
+     separate `compute_partial_norm_sq` launch.
+  2. GPU-side norm reduction: `partial_reduce_to_scalar` reduces the
+     `partial_norm` array to a single scalar and writes sqrt(sum) to a
+     GPU pointer — `normalize_inplace` reads that pointer in the next
+     launch with no CPU round-trip between SpMV and normalisation.
+  3. Single CPU sync per iteration: only `d_partial_conv.get()` for the
+     convergence delta check ever transfers to the CPU (vs. ~4–5 syncs
+     before).
+  4. Edge-parallel low-degree kernel: `spmv_edge_parallel_low_degree`
+     packs `NODES_PER_BLOCK = 8` nodes per CTA (one warp each), giving
+     ~8× better SM occupancy for degree < `WARP_SIZE` nodes, which are
+     the majority in biological networks.
+  5. Node reordering: nodes sorted by descending out-degree before CSR
+     upload (`reorder_nodes=True` by default); similar-degree rows are
+     adjacent, improving `x[col_idx[j]]` cache locality.  Original-index
+     order restored before building the result dict.
 
-Two-phase norm computation:
-  - Phase 1 (GPU): `compute_partial_norm_sq` → `d_partial` (small array)
-  - Phase 2 (CPU): `np.sqrt(np.sum(d_partial.get()))`
-  - Rationale: avoids a second GPU kernel for a tiny array;
-    CPU reduction of `norm_blocks` (~⌈n/256⌉) values is negligible.
+Kernels per iteration: 10 total (vs. ~14 before).
+CPU-GPU syncs per iteration: 1 (vs. ~4–5 before).
+
+Per-iteration sequence:
+  Authority (a_new = Aᵀ h):
+    1. `spmv_edge_parallel_low_degree`  — packed-warp SpMV + norm (deg < 32)
+    2. `spmv_with_norm_sq`              — fused SpMV + norm (deg ≥ 32)
+    3. `partial_reduce_to_scalar`       — GPU sqrt(Σ partial_norm) → scalar
+    4. `normalize_inplace`              — divide a_new by GPU scalar
+  Hub (h_new = A a_new):
+    5–8. same four kernels for A
+  Convergence:
+    9. `compute_convergence_partial`    — FP64 partial Σ((Δh)² + (Δa)²)
+   10. `stream_compute.synchronize()`  — the single sync
+       `delta = sqrt(sum(d_partial_conv.get()))`
+
+Kernel registry (`_kernel_cache["hits"]`):
+  - `spmv_low_deg`   : `spmv_edge_parallel_low_degree`
+  - `spmv_high`      : `spmv_with_norm_sq`
+  - `reduce_scalar`  : `partial_reduce_to_scalar`
+  - `norm_div`       : `normalize_inplace`
+  - `conv_partial`   : `compute_convergence_partial`
+  - Deprecated (compiled, not called): `spmv_degree_aware`,
+    `compute_partial_norm_sq`, `normalize_vector`,
+    `compute_convergence_delta`
+
+Precision: FP32 for SpMV arithmetic and L2 norms (`partial_norm` is
+  float32).  FP64 for convergence delta only — avoids false early
+  termination near `tolerance = 1e-6` without cancellation error.
 
 Both `A` and `Aᵀ` stored in CSR on GPU throughout iteration.
-Pointer swap (`d_h, d_h_new = d_h_new, d_h`) avoids data copies.
+Pointer swap (`cur_h, nxt_h = nxt_h, cur_h`) avoids data copies.
 CUDA streams: `stream_compute` for kernels, `stream_transfer` for
   async H2D transfers during setup.
-Context handling: the device PRIMARY context is `retain_primary_context()`
-  and pushed unconditionally so PyCUDA's driver-API works correctly even
-  when CuPy is also active in the same process (avoids
-  `cuModuleLoadDataEx: invalid device context`).
+Context handling: `retain_primary_context().push()` unconditionally;
+  coexists with CuPy (avoids `cuModuleLoadDataEx: invalid device context`).
 Network-type behaviour:
-  - grn / mirna: directed `A`, returns `top_hubs` + `top_authorities` +
+  - grn / mirna: directed `A`; returns `top_hubs` + `top_authorities` +
     `hub_authority_overlap`
-  - ppi:         symmetrised `A + Aᵀ` (binarised), returns `top_nodes` only
+  - ppi: symmetrised `A + Aᵀ` (binarised); returns `top_nodes` only
 Does NOT silently fall back to CPU — raises `RuntimeError` /
-  `cuda.LogicError` / `MemoryError` so `algorithm_runner.py` can handle
-  the failure explicitly.
-Target: `-arch=sm_75` (RTX 20-series Turing), `BLOCK_SIZE = 256`.
+  `cuda.LogicError` / `MemoryError`.
+Target: `-arch=sm_75` (RTX 20-series Turing), `BLOCK_SIZE = 256`,
+  `NODES_PER_BLOCK = 8`.
 
 ---
 
