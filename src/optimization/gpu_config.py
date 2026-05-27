@@ -1219,6 +1219,23 @@ def apply_config(
         )
     strategy = _STRATEGY_CACHE[strategy_key]
 
+    # 4b. Memory-aware execution plan (MemoryManager).  Lazy-imported to
+    # avoid a circular dependency at module load.  The plan keys are
+    # additive: existing strategy keys are preserved, new keys
+    # (execution_mode, chunk_size, use_unified_memory, ...) are merged
+    # into the returned dict alongside the metadata block.
+    try:
+        from src.optimization.memory_manager import MemoryManager       # noqa: PLC0415
+        memory_plan = MemoryManager.select_execution_mode(
+            algorithm_name, graph_csr, params,
+        )
+    except Exception as exc:                                            # noqa: BLE001
+        logging.warning(
+            "MemoryManager.select_execution_mode failed (%s) — "
+            "memory plan keys will be omitted.", exc,
+        )
+        memory_plan = {}
+
     # 5. Runtime feedback
     runtime_rec = RuntimeProfiler.get_recommendation(
         algorithm_name, fingerprint,
@@ -1231,6 +1248,12 @@ def apply_config(
     merged: dict = {}
     merged.update(hw_recommended)
     merged.update(strategy)
+    # Memory plan keys go in BEFORE user params so user always wins
+    # (unless override=True).  Strategy may already set ``use_chunking``
+    # but the memory plan refines it with a concrete ``chunk_size`` and
+    # the explicit ``execution_mode`` flag.
+    for k, v in memory_plan.items():
+        merged[k] = v
     for k, v in runtime_rec.items():
         if not k.startswith("_"):
             merged[k] = v
@@ -1251,6 +1274,7 @@ def apply_config(
     merged["_graph_profile"]     = graph_profile
     merged["_memory_estimate"]   = memory_est
     merged["_strategy_selected"] = strategy
+    merged["_memory_plan"]       = memory_plan
     merged["_hardware_config"]   = {
         k: v for k, v in cfg.items() if k != "recommended"
     }
