@@ -377,9 +377,64 @@ Target: `-arch=sm_75` (RTX 20-series Turing), `BLOCK_SIZE = 256`.
 
 ---
 
-## MCL GPU implementation
+## MCL GPU implementation (optimised)
 
-Custom PyCUDA kernels — no CuPy dependency.
+Custom PyCUDA kernels — no CuPy dependency for compute.
+
+Key optimisations over the initial implementation:
+  1. **Hash-based SpGEMM** (`spgemm_hash_row`):
+     Gustavson-style row-wise sparse accumulator using a SMEM hash
+     table (power-of-2 size, linear probing).  Processes only NONZERO
+     entries of A's row, scatters their contributions through B's rows
+     into the hash table keyed by output column index.  Eliminates the
+     zero × zero work of the inner-product approach and matches the
+     power-law degree distribution of biological networks.  Falls back
+     to `spgemm_row_chunk` for rows whose estimated output would not
+     fit in SMEM hash capacity (heavy-row tier).
+  2. **GPU-native pruning compaction**:
+     `prefix_sum_block` → `prefix_sum_add_offsets` → `compact_csr_values`
+     → `rebuild_row_ptr` replace the previous numpy `np.where` /
+     `np.cumsum` round-trip.  Only one int (`new_nnz`) plus a small
+     per-block-sums array (ceil(nnz / BLOCK_SIZE) ints) crosses the
+     PCIe bus per compaction; the big arrays stay on the device.
+  3. **Bitonic-style top-k** for wide columns (`topk_bitonic_column`):
+     One block per column, launched with 2 × BLOCK_SIZE = 512 threads.
+     A shared-memory buffer of size 2 × BLOCK_SIZE holds the running
+     top BLOCK_SIZE in its upper half; each chunk of the column is
+     loaded into the lower half and a full Batcher bitonic sort
+     ascending re-establishes the order in O((log 2K)²) compare-
+     exchange stages.  Threshold = `buf[2·BLOCK_SIZE − K]`.  Routed
+     for columns with length > `TOP_K_BITONIC_THRESHOLD = 256`;
+     narrower columns continue to use the original count-greater
+     kernel.
+  4. **Multi-stream pipelining**:
+     `stream_compute` runs kernels; `stream_transfer` issues async
+     H2D copies of per-iteration matrix arrays.  Inter-stream
+     synchronisation via `cuda.Event` + `stream.wait_for_event` —
+     no host syncs are needed between upload and kernel launch.
+  5. **Degree-aware SpGEMM dispatch** (`_classify_rows_by_degree`):
+     A row is classified once per iteration from its row-length:
+       heavy   (L ≥ block_size = 256) — inner-product fallback;
+       medium  (32 ≤ L < block_size)  — hash SpGEMM, medium hash size;
+       light   (0 < L < 32)           — hash SpGEMM, smaller hash size.
+     Each tier gets a dedicated kernel launch with the per-tier index
+     array passed as `row_list` so a single grid spans only the rows
+     of that tier.
+
+Kernels (compiled once, cached in `_kernel_cache["mcl"]`):
+  - `spgemm_hash`   : `spgemm_hash_row`        (Gustavson, hash table)
+  - `spgemm`        : `spgemm_row_chunk`       (inner-product fallback)
+  - `thresh_prune`  : `threshold_prune`        (writes keep_flag)
+  - `prefix_sum`    : `prefix_sum_block`       (per-block exclusive scan)
+  - `scan_offsets`  : `prefix_sum_add_offsets` (CPU-scanned block sums)
+  - `compact`       : `compact_csr_values`     (stream compaction)
+  - `rebuild_rptr`  : `rebuild_row_ptr`        (post-compaction row_ptr)
+  - `topk_prune`    : `topk_column_prune`      (narrow cols, count-greater)
+  - `topk_bitonic`  : `topk_bitonic_column`    (wide cols, bitonic merge)
+  - `inflate`       : `inflate_values`
+  - `col_sum`       : `column_sum_segmented`
+  - `col_norm`      : `normalize_columns`
+  - `convergence`   : `convergence_frobenius`
 
 Preprocessing (CPU, before any GPU work):
   - `_symmetrize_mcl(graph_csr, network_type)` — network-type aware
@@ -389,37 +444,17 @@ Preprocessing (CPU, before any GPU work):
       ppi         : graph used as-is then add identity
   - `_to_column_stochastic` — divides each column by its sum; zero-sum
     columns get a 1.0 placed on their diagonal (absorbing state).
-  - `_to_ellpack_r` — present but UNUSED; biological networks have high
-    row-length variance (hubs vs. leaves) and padding waste outweighs
-    coalesced-access benefit.  CSR + CSC are the canonical pair.
+  - `_to_ellpack_r` removed; hash SpGEMM does not benefit from
+    ELLPACK padding.
 
-Kernels (compiled once, cached in `_kernel_cache["mcl"]`):
-  - `spgemm_row_chunk` — inner-product SpGEMM (CSR × CSC → COO).
-      One block per output row; threads iterate over output columns;
-      sparse dot via two-pointer merge of sorted index lists.
-      atomicAdd counter on COO output with capacity guard.
-      Chunked by row to bound VRAM growth from fill-in.
-  - `threshold_prune` — mark entries < threshold (CPU compaction follows).
-  - `topk_column_prune` — exact top-k per column with index tie-break;
-      one block per column, O(col_len²) per column (fine because
-      threshold prune ran first).
-  - `inflate_values` — element-wise `powf(x, r)` in FP32.
-  - `column_sum_segmented` — warp-per-column Σ via `__shfl_down_sync`.
-  - `normalize_columns` — warp-per-column in-place divide; epsilon guard.
-  - `convergence_frobenius` — partial ‖M_new − M_old‖_F² with FP64
-      accumulation (FP32 inputs, FP64 partial sums); host sums + sqrt.
-
-SpGEMM chunking strategy:
-  - Free VRAM probed via `cuda.mem_get_info()`; 70 % budget for the COO
-    output (12 bytes per entry: int + int + float).
-  - `chunk_rows = max(1, vram_budget / (density × COO_BYTES))`.
-  - Each chunk's COO capacity probed after kernel completion; overflow
-    raises `MemoryError` with guidance to tighten pruning.
-  - COO triples accumulated CPU-side across chunks → `coo_matrix.tocsr()`.
-
-Pruning order: threshold first (kills bulk of fill-in cheaply), then
-  top-k (operates on survivors in CSC view).  CPU compactions between
-  steps via cumulative-sum row_ptr / col_ptr rebuild.
+Pruning pipeline (fully GPU-side):
+  threshold_prune → prefix_sum_block → prefix_sum_add_offsets →
+  compact_csr_values → rebuild_row_ptr → top-k dispatch (warp count-
+  greater OR bitonic, based on column length vs.
+  `TOP_K_BITONIC_THRESHOLD`).  One CSR D2H + one CSC build remain on
+  CPU between threshold and top-k, since the CSR→CSC transpose is
+  still numpy-side; reducing this further requires a GPU radix sort
+  (future work).
 
 Inflation + normalisation: in-place on CSC.data — pattern unchanged,
   only values updated.
@@ -430,13 +465,13 @@ Convergence check:
   - On mismatch (early iterations): returns `inf`, iteration continues
 
 Precision policy: FP32 for matrix data and arithmetic, FP64 for the
-  convergence reduction only (detects small Δ near convergence without
-  cancellation error).
+  convergence reduction only.
 
 CUDA streams:
-  - `stream_compute`  — kernel execution
-  - `stream_transfer` — async H2D for per-iteration uploads
-                        (CSC view + matrix arrays)
+  - `stream_compute`  — all kernel execution
+  - `stream_transfer` — async H2D of per-iteration CSR / CSC views
+                        (CSR row_ptr / col_idx / values, CSC col_ptr /
+                        row_idx, top-k working buffers)
 
 Context handling: same pattern as HITS / Louvain —
   `retain_primary_context()` and unconditional push.
@@ -447,67 +482,105 @@ Cluster extraction (CPU, post-convergence): attractor method.  Nodes
   diagonal entry is positive.  Cluster IDs renumbered to compact
   `0..K-1`.
 
+Compilation: **adaptive** — `_detect_arch_flag()` queries
+  `cuda.Device(0).compute_capability()` and builds with
+  `-arch=sm_<major><minor> -O3`.  Falls back to `sm_75` (RTX 20-series
+  Turing) if the device cannot be probed.
+
 Does NOT silently fall back to CPU — raises `RuntimeError` /
   `cuda.LogicError` / `MemoryError`.
-Target: `-arch=sm_75` (RTX 20-series Turing), `BLOCK_SIZE = 256`.
+Target: adaptive (RTX 20-series Turing by default), `BLOCK_SIZE = 256`,
+  `TOP_K_BITONIC_THRESHOLD = 256`,
+  `HEAVY_ROW_THRESH = 256`, `LIGHT_ROW_THRESH = 32`.
 
 ---
 
 ## PageRank GPU implementation
 
-Custom PyCUDA kernels — no CuPy dependency.  Hybrid CSR + ELLPACK
-storage for degree-aware access; scatter-form power iteration over the
-original CSR (no transpose / Mᵀ build).
+Custom PyCUDA kernels — no CuPy dependency.  Hybrid push/pull dispatch
+for extreme-hub networks; single CPU–GPU sync per iteration.
+
+Key optimisations over the initial implementation:
+  1. **GPU-side scalar reductions** (`reduce_to_scalar_f32`):
+     Strided load + shared-memory tree reduction in one kernel (grid =
+     (1,1,1)) writes a single FP32 scalar to a pre-allocated GPU pointer.
+     Both the dangling mass sum and the L1 convergence delta stay on the
+     device between kernel launches; no intermediate D2H copies.
+  2. **Single sync per iteration**: all kernel launches queue on
+     `stream_compute`; one `stream_compute.synchronize()` at the end of
+     each iteration (after `reduce_to_scalar_f32` for L1) is the only
+     host–device sync.  The convergence scalar is then fetched with
+     `d_l1_scalar.get()[0]`.
+  3. **Fused init + dangling kernel** (`initialize_pr_with_dangling`):
+     Computes `PR_new[i] = teleport_val` for every node and — in the same
+     kernel — adds `damping * (*d_dangling_sum) / num_eligible` for each
+     eligible node, reading `d_dangling_sum` from a GPU pointer.
+     Eliminates the separate `distribute_dangling_mass` launch and the
+     inter-kernel dependency that previously forced an early sync.
+  4. **Adaptive hub threshold** (`_compute_adaptive_hub_threshold`):
+     `np.percentile(out_degrees, (1 − fraction) × 100)` at
+     `fraction = 0.05` → clamped to `[WARP_SIZE, max_degree]` → snapped
+     to nearest power of 2.  Replaces the hardcoded `HUB_THRESHOLD = 32`
+     with a graph-dependent split that keeps ~5 % of nodes in ELLPACK.
+  5. **Chunked double-buffer pipeline** (`_pagerank_gpu_chunked`):
+     `_ChunkBuffer` (pre-allocated GPU ping-pong pair of row_ptr / col_idx
+     / values / node_ids arrays) enables `stream_transfer` to pre-load
+     chunk i+1 while `stream_compute` scatters chunk i via
+     `cuda.Event.wait_for_event`.  Auto-triggered when estimated VRAM >
+     80 % of free VRAM or `use_chunking=True` from `apply_config`.
+  6. **Pull-mode for extreme in-degree** (`gather_contributions_pull`):
+     One block per pull-target node gathers from incoming edges (CSC /
+     transposed CSR); no atomicAdd — thread 0 writes the final reduced
+     value.  Pull targets are identified by `in_degree ≥ pull_threshold`
+     (disabled by default; zero-overhead when off via an all-zero uint8
+     mask).  Scatter kernels skip edges to pull targets via a
+     `pull_target_mask[v]` check to prevent double-counting.
 
 Kernels (compiled once, cached in `_kernel_cache["pagerank"]`):
-  - `initialize_pr` — writes the teleport baseline `(1 − d) / N` into
-    `PR_new`.  Must precede scatter because scatter atomicAdds INTO
-    `PR_new` and assumes it starts at the teleport value.
-  - `scatter_contributions_csr` — low/medium-degree source nodes via
-    the original CSR arrays.  Three-tier degree-aware dispatch:
-      LOW  (deg < 32)         : thread 0 only, serial scatter
-      MED  (32 ≤ deg < 256)   : first warp, stride-32 scatter
-      HIGH (deg ≥ 256)        : full block + 256-bucket SMEM hash
-    HIGH-tier SMEM hash: open-addressing with linear probing, probe-cap
-    = SMEM_BUCKETS, atomicCAS for slot claim + atomicAdd for value.
-    Saturated chains fall back to direct global atomicAdd (correctness
-    guaranteed).  After `__syncthreads()` each thread flushes its
-    assigned bucket (SMEM_BUCKETS == BLOCK_SIZE).  Order-of-magnitude
-    fewer global atomics per hub block.
-  - `scatter_contributions_ellpack` — hub source nodes via padded
-    ELLPACK arrays (one block per hub, threads stride through
-    `max_row_len`; padding entries are `-1` and skipped).  Win vs. CSR:
-    no `row_ptr` indirection, predictable stride.
-  - `sum_dangling_pr` — block-partial Σ `PR_old[i]` over dangling nodes
-    (host sums the per-block partials).
-  - `distribute_dangling_mass` — adds `d · dangling_sum / |eligible|`
-    via atomicAdd to every eligible node.  Structure-agnostic: the CPU
-    side picks the eligible set per network type.
-  - `compute_l1_convergence` — `Σ |PR_new[i] − PR_old[i]|` per block
-    via warp shuffle reductions (intra-warp) + final 8-lane warp
-    reduction in shared memory (FP32 throughout).
+  - `initialize_pr` — teleport-only init (legacy path, kept for
+    reference; superseded by `initialize_pr_with_dangling` in the GPU
+    iteration loop).
+  - `initialize_pr_with_dangling` — fused teleport + dangling
+    distribution; reads `*dangling_sum_ptr` from GPU memory.
+  - `scatter_contributions_csr` — low/medium/high-degree CSR push.
+    Three-tier dispatch:
+      LOW  (deg < 32)   : thread 0 only, serial atomicAdd
+      MED  (32 ≤ deg < hub_threshold) : first warp, stride-32
+      HIGH (deg ≥ hub_threshold)      : full block + 256-bucket SMEM hash
+    All tiers check `pull_target_mask[v]` and skip pull targets.
+    HIGH-tier SMEM hash: linear-probe open-addressing, atomicCAS slot
+    claim, atomicAdd value accumulation; saturated chains fall back to
+    direct global atomicAdd.
+  - `scatter_contributions_ellpack` — extreme-hub push via padded ELLPACK
+    (one block per hub, stride-`max_row_len`, `-1` padding skipped);
+    also checks `pull_target_mask[v]`.
+  - `sum_dangling_pr` — block-partial Σ `PR_old[i]` for dangling nodes;
+    partials reduced by `reduce_to_scalar_f32`.
+  - `reduce_to_scalar_f32` — strided load + SMEM tree → single FP32
+    scalar at `scalar_output[0]`.  Reused for both dangling sum and L1.
+  - `gather_contributions_pull` — pull gather for extreme in-degree
+    nodes; SMEM tree reduction within block, thread 0 writes
+    `PR_new[u] += damping * partial`.
+  - `compute_l1_convergence` — block-partial Σ `|PR_new[i] − PR_old[i]|`
+    via warp shuffles + 8-lane SMEM reduction; partials reduced by
+    `reduce_to_scalar_f32`.
 
-Hybrid storage split at HUB_THRESHOLD = 32:
-  - 0 < out_degree < 32  → CSR scatter kernel (filtered `node_ids`)
-  - out_degree ≥ 32      → ELLPACK scatter kernel
-  - out_degree == 0      → dangling, handled by dangling kernels
+Hybrid storage split at adaptive `hub_threshold`:
+  - `0 < out_degree < hub_threshold`  → CSR scatter kernel
+  - `out_degree ≥ hub_threshold`      → ELLPACK scatter kernel
+  - `out_degree == 0`                 → dangling, handled by dangling sum
 
-Network-type-aware dangling redistribution:
-  - GRN   : `eligible = where(out_degree > 0)` — regulators only.
-            Preserves TF↔target asymmetry.
-  - PPI   : `eligible = arange(n)` — uniform across all nodes.
-  - miRNA : `eligible = where(out_degree > 0)` — miRNA nodes only
-            (out_degree == 0 ⇒ gene target in a directed bipartite
-            graph).  If a `node_index_map` with type labels were
-            provided, it would override the out-degree proxy.
-  Degenerate fallback (`eligible.size == 0`): logs warning, falls back
-  to uniform.
+Eligible mask (uint8 boolean array, length n):
+  - GRN   : `mask[out_degree > 0] = 1` — regulators only.
+  - PPI   : `mask[:] = 1` — uniform across all nodes.
+  - miRNA : `mask[out_degree > 0] = 1` — miRNA nodes only.
+  Degenerate fallback (all zeros): logs warning, falls back to uniform.
 
 Out-degree storage: FP32 weighted sum (`graph_csr.sum(axis=1)`) so
-  weighted networks (PPI confidence scores, weighted GRN) are handled
-  correctly; for binary graphs this collapses to the integer degree.
+  weighted networks are handled correctly; binary graphs collapse to
+  integer degree.
 
-Result keys by network type (matches CLAUDE.md spec):
+Result keys by network type:
   - GRN   : `scores`, `top_regulators` (top-15, out>0),
             `top_targets` (top-15, out==0)
   - PPI   : `scores`, `top_nodes` (top-20 combined)
@@ -515,124 +588,175 @@ Result keys by network type (matches CLAUDE.md spec):
             `top_target_genes` (top-15, out==0)
 
 Iteration structure:
-  init → sum_dangling (D2H reduction) → scatter_csr → scatter_ellpack
-  → distribute_dangling_mass → compute_l1_convergence (D2H reduction)
-  → pointer swap of `PR_old` / `PR_new` (no data copy).  Implicit
-  serialization within `stream_compute` orders the kernels correctly
-  (scatter sees the post-init `PR_new`; convergence sees the final
-  `PR_new` of the iteration).
+  sum_dangling → reduce_to_scalar (dangling) →
+  initialize_pr_with_dangling → scatter_csr → scatter_ellpack →
+  [gather_pull if enabled] → compute_l1_convergence →
+  reduce_to_scalar (L1) → stream_compute.synchronize() →
+  d_l1_scalar.get()[0] → pointer swap PR_old/PR_new.
 
 CUDA streams:
-  - `stream_compute`  — all six kernels
-  - `stream_transfer` — async H2D during setup (CSR / ELLPACK /
-    out_degree / dangling flags / eligible array / initial `PR_old`)
+  - `stream_compute`  — all kernel launches (ordered implicitly)
+  - `stream_transfer` — async H2D during setup and chunked pipeline
+                        (CSR / ELLPACK / out_degree / masks / PR_old)
 
 Context handling: same pattern as HITS / Louvain / MCL —
   `retain_primary_context()` and unconditional push.
 
-VRAM check: `_estimate_pagerank_vram` is compared against
-  `cuda.mem_get_info()`; raises `MemoryError` if the working set
-  exceeds free VRAM.  Chunked fallback (`use_chunking=True` from
-  `apply_config`) is currently a logged TODO — the regular path runs
-  and `MemoryError` surfaces if allocation fails.
+VRAM check: `_estimate_pagerank_vram` vs `cuda.mem_get_info()`; raises
+  `MemoryError` if working set exceeds free VRAM (before allocating).
+  Chunked path (`_pagerank_gpu_chunked`) auto-activates to avoid OOM.
+
+Compilation: **adaptive** — `_detect_arch_flag()` queries
+  `cuda.Device(0).compute_capability()` and builds with
+  `-arch=sm_<major><minor> -O3`.  Falls back to `sm_75` (RTX 20-series
+  Turing) if the device cannot be probed.
 
 Does NOT silently fall back to CPU — raises `RuntimeError` /
   `cuda.LogicError` / `MemoryError`.
-Target: `-arch=sm_75` (RTX 20-series Turing), `BLOCK_SIZE = 256`,
-  `SMEM_BUCKETS = 256`, `HUB_THRESHOLD = 32`.
+Target: adaptive (RTX 20-series Turing by default), `BLOCK_SIZE = 256`,
+  `SMEM_BUCKETS = 256`, `WARP_SIZE = 32`.
 
 ---
 
-## RWR GPU implementation
+## RWR GPU implementation (optimised)
 
-Custom PyCUDA kernels — no CuPy dependency.  Fused SpMV + restart in a
-single kernel; batched variant for multi-seed-set workloads.
+Custom PyCUDA kernels — no CuPy dependency.  Hybrid CSR + ELLPACK
+storage; SMEM-cached p for small graphs; optional FP16 weights;
+single CPU-GPU sync per iteration; chunked execution for VRAM-bound
+graphs.
+
+Key optimisations over the initial implementation:
+  1. **GPU-side scalar reductions** (`reduce_to_scalar_f32`):
+     Block-partial L1 from `l1_convergence_rwr` is reduced to a single
+     FP32 scalar on the GPU.  Only that one float crosses PCIe per
+     iteration (vs. the full partial-sum array before).  Exactly ONE
+     `stream_compute.synchronize()` per iteration.
+  2. **Hub-row ELLPACK for memory coalescing**
+     (`rwr_spmv_ellpack_hubs`):
+     Rows with `degree >= hub_threshold` are repacked into padded
+     ELLPACK (predictable stride, no `row_ptr` indirection).  Adaptive
+     hub threshold at the 95th degree percentile, clamped to
+     `[WARP_SIZE, max_degree]` and snapped to a power of 2.  Remaining
+     rows continue to use CSR with the existing three-tier dispatch.
+     One block per hub row writes `p_new[node_i]` directly (no atomic).
+  3. **SMEM-cached p for small graphs** (`rwr_spmv_smem_p`):
+     When `n <= SMEM_P_LIMIT` (default 4096), the entire previous-
+     iteration `p` vector is cached in shared memory once per block.
+     Eliminates the gmem reads of `p` during SpMV gather — the main
+     bandwidth-bound step for power-law biological networks.  Auto-
+     selected only when there are no hubs and FP32 (mixed precision
+     paths skip this optimisation).
+  4. **Optional mixed precision** (`precision_mode = "mixed"`):
+     Transition weights stored as FP16 (`unsigned short` half-bit
+     pattern); `p / p_new / p₀` remain FP32; accumulation is FP32.
+     Halves the w_values bandwidth at negligible accuracy cost.
+     Kernel: `rwr_spmv_restart_fp16w` (uses `__half2float` to decode
+     each weight at use time).
+  5. **Multi-stream async overlap**:
+     `stream_compute` runs SpMV + convergence; `stream_transfer`
+     handles async H2D during setup AND the chunked-path double-buffer
+     pipeline.  `cuda.Event` between streams orders launches without a
+     host sync between them.
+  6. **Chunked execution** (`_rwr_gpu_chunked` + `_ChunkBuffer`):
+     `p / p_new / p₀ / partial-sum buffers` stay full-size on the
+     device throughout.  CSR rows stream in chunks via a pre-allocated
+     GPU ping-pong pair (`_ChunkBuffer`); `stream_transfer` pre-loads
+     chunk i+1 while `stream_compute` runs chunk i SpMV (uses the
+     `rwr_spmv_restart_chunk` kernel — same three-tier dispatch but
+     reads `chunk_node_ids[local_i]` to write back into the global
+     `p_new`).  Auto-triggered when estimated VRAM > 80 % of free VRAM
+     or `use_chunking=True` from `apply_config`.
 
 Kernels (compiled once, cached in `_kernel_cache["rwr"]`):
-  - `rwr_spmv_restart` — fused single-seed-set update
-    `p_new[i] = (1 − r) · Σ_j W[i,j] · p[j] + r · p0[i]`.
-    Three-tier degree-aware scheduling:
+  - `reduce_to_scalar_f32` — strided load + SMEM tree → single FP32
+    scalar at `scalar_output[0]`.  Reused for L1 convergence.
+  - `rwr_spmv_restart` — FP32 fused SpMV + restart.  Three-tier:
       LOW  (deg < 32)         : thread 0 only, serial scan
-      MED  (32 ≤ deg < 256)   : first warp, stride-32 +
-                                `__shfl_down_sync` reduction
-      HIGH (deg ≥ 256)        : full block, stride-256 + shared-mem
-                                tree reduction
-    Restart term `r · p0[i]` added by **thread 0 only**, after the
-    reduction, in the same write that stores `p_new[i]` — adding it
-    from every thread would multiply the contribution.
-    Uses `__ldg(&p[col])` on p-neighbour reads to route through the
-    read-only texture cache (separate from L1 data; p is read many
-    times per iteration but never written by this kernel).
+      MED  (32 ≤ deg < 256)   : first warp, stride-32 + `__shfl_down_sync`
+      HIGH (deg ≥ 256)        : full block, stride-256 + SMEM tree
+    Restart term added by **thread 0 only** after the reduction; uses
+    `__ldg(&p[col])` on p reads for read-only texture cache routing.
+  - `rwr_spmv_restart_fp16w` — same dispatch, FP16 weight reads via
+    `__half2float`.  Selected when `precision_mode == "mixed"`.
+  - `rwr_spmv_smem_p` — cooperative load of full `p` into SMEM at the
+    start, then the same three-tier dispatch reading `p_cache[]`.
+    Dynamic SMEM size = `n * sizeof(float)`.  Selected when
+    `n <= SMEM_P_LIMIT` and no hubs and FP32.
+  - `rwr_spmv_ellpack_hubs` — one block per hub row; padded ELLPACK
+    with `col_idx == -1` skipped.  Always FP32 (hub weights are a
+    small fraction of total bytes).
   - `l1_convergence_rwr` — `Σ |p_new[i] − p[i]|` per block via warp
-    shuffles + final 8-lane warp reduction in shared memory (same
-    pattern as `pagerank.compute_l1_convergence`).
+    shuffles + final 8-lane warp reduction in SMEM (FP32).
   - `rwr_spmv_restart_batched` — multi-seed batched kernel.
     `gridDim = (n, B, 1)`; one block per `(node_i, seed_b)` pair;
-    `p` / `p0` / `p_new` stored as `[n × B]` row-major flat arrays
-    (entry `(node, seed) = node * B + seed`).
-    Used only when `1 < B <= MAX_BATCH = 4`; larger batches fall back
-    to the serial-per-seed-set loop to avoid `O(n · B)` VRAM.
+    `p / p₀ / p_new` stored as `[n × B]` row-major flat arrays.
+    Used only when `1 < B <= MAX_BATCH = 4`.
+  - `rwr_spmv_restart_chunk` (separate `_CHUNK_KERNEL_SOURCE` module)
+    — chunked CSR variant; `chunk_node_ids[local_i]` translates
+    block-local row → global node id for writeback to `p_new`.
 
 Transition matrix W construction (CPU, network-type aware):
   - GRN   : directed CSR as-is; `W = (D⁻¹ · A).T`.  Dangling columns
-            (`out_degree == 0`) get a self-loop `W[j,j] = 1` so the
-            absorbing state preserves probability mass during diffusion.
-  - PPI   : `A_sym = A + Aᵀ`, binarised, then the same column-normalise
-            + dangling-column self-loop fix.
-  - miRNA : directed bipartite CSR; same treatment as GRN.  Gene-target
-            nodes (out_degree == 0 in the bipartite digraph) get
-            self-loops.
-  Normalisation runs CPU-side (scipy sparse is well-optimised); the
-  resulting FP32 CSR is transferred to GPU.
+            (`out_degree == 0`) get a self-loop `W[j,j] = 1`.
+  - PPI   : `A_sym = A + Aᵀ`, binarised, then column-normalise + the
+            dangling-column self-loop fix.
+  - miRNA : directed bipartite CSR; same treatment as GRN.
 
 p₀ construction:
   - Non-empty seeds : `p0[seed] = 1 / |seeds|`, zero elsewhere.
   - Empty seeds     : `p0[i] = 1 / n` (uniform — global PageRank-like).
-  Network type does not change the maths, only the semantics of the
-  seed set (GRN seeds = TF indices; PPI seeds = disease proteins;
-  miRNA seeds = miRNA node indices).
 
 Multi-seed-set handling:
   - `seed_nodes = [1, 2, 3]`        → single seed set (`B = 1`)
   - `seed_nodes = [[1,2], [3,4]]`   → multiple seed sets (batched)
   - `B ≤ MAX_BATCH` (= 4)           → batched kernel
   - `B > MAX_BATCH`                  → serial-per-seed-set loop
-  Per-node scores are averaged across all seed sets to form the
-  primary score vector; `batch_results` field carries per-seed-set
-  scores / iterations / converged when `B > 1`.
+  Per-node scores are averaged; `batch_results` field carries
+  per-seed-set scores / iterations / converged when `B > 1`.
+  Note: chunked + batched is not supported in this pass; if both are
+  requested the batched path runs on the full graph (may OOM).
 
 Optional node reordering (`reorder_nodes=False` by default):
   CPU permutes W rows/cols by ascending degree → similar-degree nodes
-  adjacent in CSR → reduced warp divergence inside the three-tier
-  dispatch.  Seed indices are remapped via the inverse permutation
-  before GPU work; final scores remapped back via `scores_orig[perm] =
-  scores_reord`.  Documented as a perf TODO; default path runs
-  unreordered for correctness simplicity.
+  adjacent in CSR → reduced warp divergence.  Seed indices and final
+  scores are remapped via the inverse permutation.
 
-Result keys (per CLAUDE.md spec):
-  `scores`, `top_nodes` (top-20), `top_seeds` (top-10 among the union
-  of all seed indices, or `top_nodes[:10]` if no seeds), `iterations`,
-  `converged`, `note`, and `batch_results` when `B > 1`.
+Result keys: `scores`, `top_nodes` (top-20), `top_seeds` (top-10
+  among the union of seed indices, or `top_nodes[:10]` if no seeds),
+  `iterations`, `converged`, `note`, and `batch_results` when `B > 1`.
+
+Iteration structure (single-seed, regular path):
+  spmv_csr_or_smem_or_fp16w → spmv_ellpack_hubs (if any) →
+  l1_convergence → reduce_to_scalar → stream_compute.synchronize() →
+  d_l1_scalar.get()[0] → pointer swap p/p_new.
 
 CUDA streams:
-  - `stream_compute`  — kernel execution (`spmv_restart`, `l1_conv`)
-  - `stream_transfer` — async H2D of W CSR arrays and p₀ vectors
-                        during setup
-  Pointer swap of `p` / `p_new` each iteration (no data copy).
+  - `stream_compute`  — kernel execution (SpMV + L1 + reduction)
+  - `stream_transfer` — async H2D during setup + chunked pipeline
+  Pointer swap of `p / p_new` each iteration (no data copy).
 
 Context handling: same pattern as HITS / Louvain / MCL / PageRank —
   `retain_primary_context()` and unconditional push.
 
-VRAM check: `_estimate_rwr_vram` compared against `cuda.mem_get_info()`;
-  raises `MemoryError` if the working set exceeds free VRAM.
-  `use_chunking=True` and `use_zero_copy=True` (from `apply_config`)
-  are currently logged TODOs — the regular path runs and `MemoryError`
-  surfaces if allocation fails.
+VRAM check: `_estimate_rwr_vram` (accounts for FP16 weights when
+  `precision_mode == "mixed"`).  If estimated working set exceeds
+  free VRAM AND chunked is not requested/feasible → raises
+  `MemoryError`.  Chunked path auto-activates to avoid OOM for
+  single-seed runs.
+
+Compilation: **adaptive** — `_detect_arch_flag()` queries
+  `cuda.Device(0).compute_capability()` and builds with
+  `-arch=sm_<major><minor> -O3`.  Falls back to `sm_75` (RTX 20-series
+  Turing) if the device cannot be probed.  Kernel source includes
+  `<cuda_fp16.h>` outside the `extern "C"` block to enable `__half`
+  decoding in the FP16-weight variant.
 
 Does NOT silently fall back to CPU — raises `RuntimeError` /
-  `cuda.LogicError` / `MemoryError`.
-Target: `-arch=sm_75` (RTX 20-series Turing), `BLOCK_SIZE = 256`,
-  `MAX_BATCH = 4`.
+  `cuda.LogicError` / `MemoryError`.  CPU mode is provided by a
+  separate package (`src.algorithms.cpu.single_threaded.rwr` and
+  `src.algorithms.cpu.multi_threaded.rwr`) selected by the runner.
+Target: adaptive (RTX 20-series Turing by default), `BLOCK_SIZE = 256`,
+  `MAX_BATCH = 4`, `SMEM_P_LIMIT = 4096`.
 
 ---
 
