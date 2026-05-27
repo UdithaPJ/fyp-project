@@ -413,11 +413,22 @@ def _ensure_pycuda_context_current() -> bool:
     return False
 
 
+def _detect_arch_flag() -> str:
+    """Return ``-arch=sm_XY`` for the current device, with a Turing fallback."""
+    try:
+        cuda.init()
+        cc_major, cc_minor = cuda.Device(0).compute_capability()
+        return f"-arch=sm_{cc_major}{cc_minor}"
+    except Exception:                                   # noqa: BLE001
+        return "-arch=sm_75"
+
+
 def _get_kernels() -> dict[str, Any]:
     """Compile (or fetch from cache) all BFS device kernels."""
     key = "bfs_optimized"
     if key not in _KERNEL_CACHE:
-        options = ["-arch=sm_75"]                       # RTX 20-series target
+        arch_flag = _detect_arch_flag()
+        options = [arch_flag, "-O3"]
         mod = SourceModule(_BFS_CU_SRC, options=options, no_extern_c=True)
         _KERNEL_CACHE[key] = {
             "push":       mod.get_function("bfs_frontier_tiered"),

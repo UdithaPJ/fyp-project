@@ -178,15 +178,129 @@ mcl:      {"expansion": 2, "inflation": 2.0, "prune_threshold": 0.001,
 
 ---
 
-## GPU optimization rules (applied automatically by `algorithm_runner.py`)
+## GPU optimization layer (`src/optimization/gpu_config.py`)
 
-- `apply_config()` from `src/optimization/gpu_config.py` is called by
-  `algorithm_runner.py` before every GPU algorithm run
-- Algorithm files themselves never call `gpu_config` directly
-- GPU config is cached after first call — do not re-detect on every run
-- Target hardware: NVIDIA RTX 20-series (compute capability 7.5, 6–8 GB VRAM)
-  — specifically RTX 2060 with 6 GB VRAM for testing
-- If CUDA unavailable: fall back to `cpu_single` silently, log warning
+Expanded from a hardware-heuristic lookup table into a graph-,
+algorithm-, and runtime-aware optimisation system.  Backward
+compatible — all six algorithm files consume the merged params dict
+via `setdefault` / `.get()`; new keys are additive and unknown keys
+are silently ignored.
+
+### Components
+
+`GraphProfiler`
+  - `fingerprint(csr)`: fast graph hash (shape + nnz + indptr head/tail
+    sample) for cache keying.  Returns a 12-char hex string.
+  - `profile(csr)`: CPU-only structural metrics.  Returns
+    `n`, `m`, `density`, `avg_degree`, `max_degree`, `min_degree`,
+    `std_degree`, `degree_skew`, `hub_fraction`, `isolated_frac`,
+    `is_bipartite` (BFS-sampled), `is_symmetric` (`(A−Aᵀ).nnz == 0`),
+    `nnz_per_mb`, `vram_estimate_mb`, `sparsity_class`, `degree_class`,
+    `format_hint`.
+  - `sparsity_class`: `"ultra_sparse"` (density < 1e-5) | `"sparse"`
+    (< 1e-3) | `"moderate"` (< 0.1) | `"dense"` (>= 0.1).
+  - `degree_class`: `"uniform"` (|skew| < 1) | `"skewed"` (< 3) |
+    `"power_law"` (>= 3).
+  - `format_hint`: `"csr"` | `"hyb"` | `"sell_c"` | `"coo"`.
+
+`MemoryEstimator`
+  - `estimate(algo, profile, gpu_cfg)`: returns `base_mb`,
+    `algorithm_mb`, `total_mb`, `available_mb`, `pressure`
+    (`"low"` / `"medium"` / `"high"` / `"critical"`),
+    `needs_chunking`, `recommended_chunk_size`, `precision_downgrade`.
+  - Algorithm-specific multipliers:
+    - `pagerank`: 1.5, `bfs`: 1.3, `rwr`: 1.6, `louvain`: 3.0,
+      `hits`: 2.5 (A + Aᵀ + 4 score vectors),
+      `mcl`: 4.0 baseline, scaled up to `max(4.0, avg_degree × 2)` to
+      cover SpGEMM fill-in (capped at 20×).
+  - Live `cuda.mem_get_info()` query — chunking decisions reflect the
+    current free VRAM rather than a stale snapshot.  Memory estimates
+    are NOT cached.
+
+`AlgorithmStrategySelector`
+  - `select(algo, profile, gpu_cfg, memory_est)` dispatches to
+    `_pagerank`, `_bfs`, `_hits`, `_louvain`, `_rwr`, `_mcl`.  All
+    returned keys are already understood by the corresponding
+    algorithm file.
+  - Decision matrix:
+    | Algorithm | Key decisions                                          |
+    |-----------|--------------------------------------------------------|
+    | pagerank  | `use_pull` (power_law + hub_fraction > 0.05),          |
+    |           | `pull_threshold` (3 × avg_degree),                     |
+    |           | `ellpack_fraction` (0.02 / 0.05 / 0.10)                |
+    | bfs       | `traversal_mode` (push_only / push_pull),              |
+    |           | `frontier_threshold` (0.25 / 0.50),                    |
+    |           | `use_bitmap_frontier`                                  |
+    | hits      | `use_smem_hash`, `reorder_nodes`, `fuse_spmv_norm`     |
+    | louvain   | `use_smem_hash`, `use_community_freezing`,             |
+    |           | `freeze_threshold` (2 / 4),                            |
+    |           | `early_stop_fraction` (0.005 / 0.01),                  |
+    |           | `coarsening_backend` ("cupy" / "hybrid_gpu")           |
+    | rwr       | `spmv_mode` (csr_fused / edge_parallel),               |
+    |           | `reorder_nodes`, `use_zero_copy`                       |
+    | mcl       | `spgemm_method` (hash / inner_product),                |
+    |           | `prune_threshold` (1e-5 → 1e-2 by sparsity),           |
+    |           | `top_k_per_column` (10–100 by density),                |
+    |           | `use_bitonic_topk` (max_degree > 256)                  |
+
+`RuntimeProfiler`
+  - `record(algo, fp, time, config, meta)`: appends to
+    `_history[(algo, fp)]`, capped at 10 entries.
+  - `get_recommendation(algo, fp)`: requires ≥ 3 runs.  Relaxes
+    `tolerance × 2` if all recent runs converged easily (tol < 1e-4);
+    bumps `max_iter × 1.5` if none converged; emits a `_warning` when
+    execution time grows by ≥ 1.5× across the window (possible memory
+    fragmentation).
+  - `get_history(algo=None)`, `clear(algo=None)` for benchmarking.
+
+`apply_config()` (orchestrator)
+  - Signature unchanged: `apply_config(algo, csr, params,
+    override=False, enable_profiling=False)`.
+  - Merge order (highest wins, default):
+    `user params > runtime_rec > strategy > hw_recommended`.
+    When `override=True`, hw_recommended beats user params on
+    overlapping keys (legacy semantics).
+  - Adds metadata keys to every result (never overridden):
+    `_graph_fingerprint`, `_graph_profile`, `_memory_estimate`,
+    `_strategy_selected`, `_hardware_config`.  Optional
+    `_runtime_note` when feedback recommends a change.
+  - `enable_profiling=True` attaches a full `_profile_report`.
+  - Legacy nnz-based chunking heuristics preserved as a final pass for
+    backward compatibility.
+
+`generate_profile_report(algo, csr, params, execution_result=None)`
+  - Returns a structured dict with sections `hardware`, `graph`,
+    `memory`, `strategy`, `runtime_history`, `recommendations`
+    (list of human-readable strings), plus `execution` when an
+    execution result is supplied.
+
+### Caching
+
+- `_HARDWARE_CONFIG` (= `_CACHED_CONFIG`): detected once per process.
+- `_GRAPH_PROFILE_CACHE`: `{fingerprint: profile}`.
+- `_STRATEGY_CACHE`: `{(algo, fingerprint): strategy}`.
+- `RuntimeProfiler._history`: `{(algo, fingerprint): [records...]}`,
+  last 10 per pair.
+- Memory estimates are intentionally NOT cached (live free-VRAM query).
+
+### Hardware detection
+
+`get_gpu_config()` returns the same legacy keys plus:
+  `cc_major`, `cc_minor`, `shared_mem_per_block_bytes`,
+  `l2_cache_size_bytes`, `architecture` (`"Turing"` / `"Ampere"` /
+  `"Ada"` / `"Hopper"` / etc.).
+Tier classification (`"high"` / `"mid_large"` / `"mid_small"` /
+`"cpu_only"`) and CC adjustments unchanged.
+
+### Rules
+
+- `apply_config()` is called by `algorithm_runner.py` before every GPU
+  algorithm run.
+- Algorithm files themselves never call `gpu_config` directly.
+- GPU config is cached after first call — do not re-detect on every run.
+- Target hardware: NVIDIA RTX 20-series (compute capability 7.5, 6–8 GB
+  VRAM) — specifically RTX 2060 with 6 GB VRAM for testing.
+- If CUDA unavailable: fall back to `cpu_single` silently, log warning.
 
 ---
 
@@ -298,82 +412,111 @@ Target: `-arch=sm_75` (RTX 20-series Turing), `BLOCK_SIZE = 256`,
 
 ---
 
-## Louvain GPU implementation
+## Louvain GPU implementation (optimised)
 
-Custom PyCUDA kernels — no CuPy dependency.
+Custom PyCUDA kernels.  CuPy is **optional** — when present it powers
+the fully-GPU Phase-2 sort+reduce path; without it the implementation
+falls back to a GPU-gather + numpy-sort + GPU-reduce hybrid that still
+keeps the large edge arrays on the device.
 
-Preprocessing (CPU, before any GPU work):
-  - `_symmetrize(graph_csr, network_type)` — network-type-aware
-    undirected conversion.
-      grn / mirna : `A + Aᵀ` (mutual edges weight 2)
-      ppi         : graph used as-is (already undirected)
-  - `_remove_self_loops` — `setdiag(0)` + `eliminate_zeros()`; self-loops
-    are regenerated correctly at higher levels as collapsed
-    intra-community weight.
-  - `_handle_isolated_nodes` — zero-degree nodes are detected and left
-    in singleton communities (the kernel returns `proposed = current`
-    for `degree == 0`); the CSR is NOT mutated.
-  - `_normalize_weights` — divides by max weight.  Modularity Q is
-    invariant under uniform scaling; protects against float32 overflow.
+Key optimisations over the initial implementation:
+  1. **GPU-side Phase 2 coarsening**:
+     - `_coarsen_gpu_cupy()` (when CuPy available) — `cp.argsort` +
+       `cp.add.reduceat` directly on the device.  Only the reduced
+       triples cross PCIe.
+     - `_coarsen_gpu_fallback()` (no CuPy) — compute compound 64-bit
+       sort keys on GPU; only the **keys** are D2H'd, host `np.argsort`
+       computes the permutation, the index array is H2D'd back, then
+       `gather_by_index` + `segmented_weight_reduce` finish on the GPU.
+       ~50 % less PCIe traffic than the original CPU-only path.
+  2. **Shared-memory hash table in `compute_proposed_moves`**:
+     `SMEM_HASH_SIZE = 64` buckets cache `(community → accumulated
+     weight)` during the neighbour scan.  Pass 2 is now a single hash
+     walk over unique neighbour communities instead of a per-edge gain
+     evaluation followed by a block-wide reduction.  Eliminates
+     redundant δQ recomputation for hub nodes with many same-community
+     neighbours.  Saturated probe chains drop entries (documented
+     non-determinism).
+  3. **Community freezing** (`update_freeze_status`):
+     A node unchanged for `freeze_threshold = 3` consecutive passes is
+     marked frozen.  Frozen nodes are skipped at kernel entry in
+     `compute_proposed_moves` (keep their current community).  Any
+     move resets the counter.
+  4. **Early termination via `move_counter`**:
+     `apply_moves` was changed from `improvement_flag` (boolean) to
+     `move_counter` (atomic count of nodes that moved).  Phase 1 stops
+     when `move_counter < early_stop_fraction * n` (default
+     `0.01`, i.e. < 1 % of nodes moved).
+  5. **Adaptive compilation** via `_detect_arch_flag()`:
+     Returns `(-arch=sm_XY, (cc_major, cc_minor))` from
+     `cuda.Device(0).compute_capability()`.  `-use_fast_math` is added
+     on Ampere+ (cc ≥ 8); `-DDISABLE_COOPERATIVE_GROUPS` on pre-Volta
+     (cc < 7).  Falls back to `sm_75` on probe failure.  This pattern
+     is now applied to ALL six GPU algorithm files
+     (`pagerank.py`, `bfs.py`, `hits.py`, `louvain.py`, `mcl.py`,
+     `rwr.py`).
+  6. **Chunked Phase 1** (`_louvain_level_chunked`):
+     Fully implemented for graphs that exceed the VRAM safety budget.
+     `community / comm_degree_sum / proposed / freeze / frozen` stay
+     full-size on the device; CSR rows stream in by chunks.
+     `compute_proposed_moves` runs per chunk with `frozen=NULL` (the
+     chunked path does not currently use the freeze optimisation —
+     prioritises correctness over micro-optimisation in the low-VRAM
+     fallback).  `apply_moves` + `update_freeze_status` run once per
+     pass over the full community array.  Auto-triggered when
+     `est_bytes > VRAM_SAFETY * free_bytes` or `use_chunking=True`.
+
+Preprocessing (CPU, before any GPU work) — unchanged:
+  `_symmetrize`, `_remove_self_loops`, `_handle_isolated_nodes`,
+  `_normalize_weights`.
 
 Kernels (compiled once, cached in `_kernel_cache["louvain"]`):
   - `compute_proposed_moves` — Phase 1 core.  Three-tier degree-aware
-    scheduling (1 thread / 1 warp / 1 block based on `degree[u]`);
-    two-pass design within each block:
-      Pass 1 accumulates `k_self` (sum of edge weights to the current
-        community) via warp shuffles or shared-mem reduction.
-      Pass 2 evaluates per-edge gain for moving u to each neighbour
-        community; block-wide reduction finds the winning (gain, comm).
-    Writes proposals only; community array is never modified here.
-  - `apply_moves` — Phase 1 batch update.  One thread per node, atomic
-    update to `community[]` and `comm_degree_sum[]`; increments
-    `improvement_flag` so the host can loop Phase 1 to convergence.
-    Conflicts (A↔B swap cycles) apply both moves — documented as
-    parallel non-determinism, valid partition.
-  - `count_community_edges` — Phase 2 step 1.  One thread per edge;
-    emits `(comm[src], comm[dst], w)` triples.  Uses precomputed
-    `edge_src[e] = np.repeat(arange(n), diff(indptr))`.
-  - `compute_modularity_partial` — final Q per level.  One thread per
-    edge, partial sums of `w − γ·k_i·k_j·inv_2m` for same-community
-    edges, block-reduced; host sums the partials and scales by `inv_2m`.
+    scheduling.  Pass 1 accumulates `k_self`; Pass 2 builds the SMEM
+    hash table; thread 0 walks the hash to pick the winning community.
+    Accepts an optional `frozen` mask pointer (NULL allowed) for the
+    chunked path.
+  - `apply_moves` — Phase 1 batch update.  Atomic `community[]` and
+    `comm_degree_sum[]` rebalance; increments `move_counter` per
+    moving node.
+  - `update_freeze_status` — per-node freeze counter / mask update.
+  - `count_community_edges` — Phase 2 step 1, edge→community triple
+    emission (unchanged).
+  - `gather_by_index` — GPU-side reorder of `(src, dst, wt)` arrays
+    by an external permutation (Phase 2 fallback).
+  - `segmented_weight_reduce` — segment-head detection + forward-scan
+    weight accumulation; atomic counter for output offsets.  Drops
+    self-loops only when `drop_self_loops=1` (Louvain keeps them).
+  - `compute_modularity_partial` — final Q per level (unchanged).
 
-Phase 2 sort + reduce strategy:
-  - GPU `count_community_edges` → D2H copy of `(csrc, cdst, cwt)`
-  - CPU `np.lexsort((cdst, csrc))` — correctness-first
-  - CPU segment-head detect + `np.add.reduceat` to sum duplicate edges
-  - CPU `scipy.sparse.csr_matrix((wt, (src, dst)), shape=(K, K))`
-  - Self-loops KEPT (intra-community weight contributes to higher
-    levels' modularity)
-  - TODO: GPU radix sort (CUB DeviceRadixSort) once thrust / pycuda-cub
-    bindings justify the dependency cost.
+Phase 2 sort+reduce dispatch (priority order):
+  1. `CUPY_SORT_AVAILABLE=True` → `_coarsen_gpu_cupy()`
+  2. Fallback → `_coarsen_gpu_fallback()` (GPU gather + CPU argsort +
+     GPU segmented reduce)
 
 CUDA streams:
-  - `stream_compute`  — kernel execution (Phase 1 loop, modularity,
-    count_community_edges)
+  - `stream_compute`  — kernel execution
   - `stream_transfer` — async H2D for per-level CSR uploads
 
-Context handling: same pattern as HITS — `retain_primary_context()`
-  and unconditional push.  Coexists with CuPy in the same process.
+Context handling: same pattern as HITS / PageRank / MCL / RWR —
+  `retain_primary_context()` and unconditional push.  Coexists with
+  CuPy in the same process.
 
-Hierarchy bookkeeping:
-  - `global_community[i]` tracks the level-current community of original
-    node i.  After each Phase 1, communities are renumbered to `0..K-1`
-    via `np.unique`, then `global_community = renum[global_community]`.
-  - `hierarchy` field is one list per level, each containing the
-    community ID of every original node at that level.
+Hierarchy bookkeeping (unchanged): `global_community[i]` tracks the
+  level-current community of original node `i`; renumbered to `0..K-1`
+  via `np.unique` between levels.
 
-Non-determinism: parallel move application can produce a different
+Non-determinism: parallel updates + SMEM-hash collisions + frozen
+  communities + early termination together can produce a different
   partition than serial Louvain.  Documented in
   `result["result"]["note"]`.  Modularity remains non-decreasing in
   practice.  `max_phase1_passes` caps oscillation.
 
-Chunked fallback: `apply_config` may set `use_chunking=True` for low
-  VRAM tiers.  Currently treated as advisory (regular path runs); a
-  proper chunked Phase 1 is a future optimisation.
-
 Does NOT silently fall back to CPU — raises `RuntimeError` /
   `cuda.LogicError` / `MemoryError`.
-Target: `-arch=sm_75` (RTX 20-series Turing), `BLOCK_SIZE = 256`.
+Target: adaptive (RTX 20-series Turing by default), `BLOCK_SIZE = 256`,
+  `SMEM_HASH_SIZE = 64`, `freeze_threshold = 3`,
+  `early_stop_fraction = 0.01`.
 
 ---
 

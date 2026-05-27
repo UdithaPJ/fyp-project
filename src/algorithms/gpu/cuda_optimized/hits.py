@@ -543,9 +543,17 @@ def _get_kernels() -> dict[str, Any]:
                 "PyCUDA is required to compile HITS kernels — "
                 "install pycuda and ensure NVCC is on PATH."
             )
+        # Adaptive arch detection — falls back to sm_75 (Turing) if the
+        # device cannot be probed.
+        try:
+            cuda.init()
+            cc_major, cc_minor = cuda.Device(0).compute_capability()
+            arch_flag = f"-arch=sm_{cc_major}{cc_minor}"
+        except Exception:                               # noqa: BLE001
+            arch_flag = "-arch=sm_75"
         mod = SourceModule(
             KERNEL_SOURCE,
-            options=["-arch=sm_75"],        # RTX 20-series Turing
+            options=[arch_flag, "-O3"],
             no_extern_c=True,
         )
         _kernel_cache["hits"] = {
