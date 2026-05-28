@@ -20,10 +20,31 @@ const STEP_TITLES = [
   "Export",
 ];
 
+function networkTypeLabel(nt) {
+  const key = String(nt || "").toLowerCase();
+  if (key === "ppi") return "PPI";
+  if (key === "mirna") return "miRNA";
+  return "GRN";
+}
+
+function networkTypeCaption(nt) {
+  const key = String(nt || "").toLowerCase();
+  if (key === "ppi") return "Undirected";
+  if (key === "mirna") return "Directed bipartite";
+  return "Directed";
+}
+
+function clamp(n, min, max) {
+  return Math.max(min, Math.min(max, n));
+}
+
 function App() {
   const [step, setStep] = useState(0);
   const [error, setError] = useState("");
   const [gpuStatus, setGpuStatus] = useState(null);   // null = checking
+
+  // Network type is selected up-front (Step 0) and forwarded into algorithm params.
+  const [networkType, setNetworkType] = useState("grn");
 
   // Check GPU availability once on mount — before the user does anything.
   useEffect(() => {
@@ -159,6 +180,7 @@ function App() {
     setIsDetecting(false);
     setIsPreprocessing(false);
     setPreprocessProgress({ step: "", percentage: 0 });
+    setNetworkType("grn");
     setAlgorithmConfig(null);
     setJobId(null);
     setAlgorithmResult(null);
@@ -187,29 +209,87 @@ function App() {
   return (
     <div className="app-shell">
       <header className="hero">
-        <div>
-          <p className="eyebrow">Local Graph Preprocessing</p>
-          <h1>Framework</h1>
+        <div className="hero-main">
+          <p className="eyebrow">Multi-Scale Biological Network Analysis</p>
+          <h1>
+            BioNet <span className="hero-title-accent">GPU</span>
+          </h1>
           <p className="subtitle">
-            Upload a file, confirm the column mapping, validate the cleaned
-            output, and build graph data entirely.
+            Upload a dataset, map columns, validate and build the graph once,
+            then run GPU-accelerated network algorithms and export results.
           </p>
+
+          <div className="hero-badges" role="list" aria-label="Session context">
+            <span className="badge badge--soft" role="listitem">
+              <span className="badge-dot" aria-hidden="true" />
+              Network: <strong>{networkTypeLabel(networkType)}</strong>
+              <span className="badge-subtle">({networkTypeCaption(networkType)})</span>
+            </span>
+            <span className="badge badge--soft" role="listitem">
+              <span className="badge-dot badge-dot--primary" aria-hidden="true" />
+              Compute: <strong>GPU</strong>
+              <span className="badge-subtle">(CUDA)</span>
+            </span>
+            <span className="badge badge--soft" role="listitem">
+              Privacy: <strong>Local</strong>
+              <span className="badge-subtle">(no cloud)</span>
+            </span>
+          </div>
         </div>
-        <button className="secondary-button" onClick={handleReset} type="button">
-          Start Over
-        </button>
+        <div className="hero-actions">
+          <button
+            className="secondary-button"
+            onClick={handleReset}
+            type="button"
+          >
+            Start Over
+          </button>
+        </div>
       </header>
 
-      <section className="stepper">
-        {STEP_TITLES.map((title, index) => (
-          <div
-            className={`step ${index === step ? "current" : ""} ${index < step ? "done" : ""}`}
-            key={title}
-          >
-            <span>{index + 1}</span>
-            <strong>{title}</strong>
+      <section className="stepper-wrap">
+        <div className="stepper-meta" role="status" aria-live="polite">
+          <div className="stepper-meta-left">
+            <span className="stepper-meta-kicker">
+              Step {step + 1} of {STEP_TITLES.length}
+            </span>
+            <span className="stepper-meta-title">
+              {STEP_TITLES[clamp(step, 0, STEP_TITLES.length - 1)]}
+            </span>
           </div>
-        ))}
+
+          <div className="stepper-meta-right" aria-label="Current configuration">
+            <span className="badge badge--compact">
+              {networkTypeLabel(networkType)}
+            </span>
+            {gpuStatus && gpuStatus.available ? (
+              <span className="badge badge--compact badge--ok">
+                GPU ready
+              </span>
+            ) : null}
+          </div>
+        </div>
+
+        <div aria-hidden="true" className="stepper-progress-track">
+          <div
+            className="stepper-progress-fill"
+            style={{
+              width: `${Math.round(((step + 1) / STEP_TITLES.length) * 100)}%`,
+            }}
+          />
+        </div>
+
+        <div className="stepper">
+          {STEP_TITLES.map((title, index) => (
+            <div
+              className={`step ${index === step ? "current" : ""} ${index < step ? "done" : ""}`}
+              key={title}
+            >
+              <span>{index + 1}</span>
+              <strong>{title}</strong>
+            </div>
+          ))}
+        </div>
       </section>
 
       {error ? <div className="error-banner">{error}</div> : null}
@@ -246,6 +326,8 @@ function App() {
       <main className={`panel${gpuStatus && !gpuStatus.available ? " panel--disabled" : ""}`}>
         {step === 0 && gpuStatus && !gpuStatus.available ? null : step === 0 ? (
           <Upload
+            networkType={networkType}
+            onNetworkTypeChange={setNetworkType}
             uploadResult={uploadResult}
             isDetecting={isDetecting}
             onUploadSuccess={handleUploadSuccess}
@@ -304,6 +386,7 @@ function App() {
             onBack={() => setStep(3)}
             onNext={handleAlgorithmConfigured}
             uploadId={uploadResult?.upload_id}
+            networkType={networkType}
           />
         ) : null}
 

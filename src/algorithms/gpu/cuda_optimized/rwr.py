@@ -6,7 +6,7 @@ Biological context
 ------------------
 Random Walk with Restart propagates probability mass from a seed set
 across a network.  At each step the walker follows an out-edge with
-probability (1 − r) or teleports back to a seed with probability r.
+probability (1 - r) or teleports back to a seed with probability r.
 The steady-state vector ranks every node by its diffusion-influence
 relative to the seeds:
 
@@ -19,7 +19,7 @@ relative to the seeds:
            candidate co-targeted effectors of the miRNA panel.
 
 Steady-state equation:
-    p* = (1 − r) · W · p* + r · p₀
+    p* = (1 - r) · W · p* + r · p₀
 
 W is the column-stochastic transition matrix (columns sum to 1) and p₀
 is the seed distribution (uniform over seeds; uniform over all nodes
@@ -252,7 +252,7 @@ __global__ void reduce_to_scalar_f32(
 // KERNEL: rwr_spmv_restart  (FP32, three-tier)
 //
 // Fused SpMV + restart for a single seed set:
-//   p_new[i] = (1 − r) * Σ_j W[i,j] * p[j]  +  r * p0[i]
+//   p_new[i] = (1 - r) * Σ_j W[i,j] * p[j]  +  r * p0[i]
 //
 // One block per node i.  Three-tier degree-aware scheduling:
 //   LOW  (deg < 32)         : thread 0 only, serial scan
@@ -558,7 +558,7 @@ __global__ void rwr_spmv_ellpack_hubs(
 // =========================================================================
 // KERNEL: l1_convergence_rwr  (UNCHANGED)
 //
-// Σ |p_new[i] − p[i]| per block via warp-shuffle intra-warp reduction
+// Σ |p_new[i] - p[i]| per block via warp-shuffle intra-warp reduction
 // then a final warp-shuffle across the WARPS_PER_BLOCK partial sums in
 // shared memory.  Partials reduced by reduce_to_scalar_f32.
 // =========================================================================
@@ -737,7 +737,7 @@ def _build_transition_matrix(
 ) -> tuple[sp.csr_matrix, str]:
     """Build the column-stochastic transition matrix W for RWR.
 
-    RWR update: ``p_new = (1 − r) · W · p + r · p₀``.  W must be
+    RWR update: ``p_new = (1 - r) · W · p + r · p₀``.  W must be
     column-stochastic (every column sums to 1) so that the random
     walk preserves probability mass.
     """

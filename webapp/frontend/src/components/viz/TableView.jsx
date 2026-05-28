@@ -38,6 +38,67 @@ function unsupportedNotice(table) {
   return null;
 }
 
+function labelOfIndexed(x) {
+  if (x && typeof x === "object" && "label" in x) return String(x.label);
+  return String(x);
+}
+
+function scoreCell(value) {
+  if (value === null || value === undefined) return "-";
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "-";
+  return n.toFixed(6);
+}
+
+function SimpleTable({ columns, rows, caption }) {
+  const [showAll, setShowAll] = useState(false);
+  const displayRows = showAll ? rows.slice(0, 50) : rows.slice(0, 10);
+
+  return (
+    <>
+      {caption ? <p className="viz-caption">{caption}</p> : null}
+      <div className="preview-table-wrap">
+        <table className="preview-table results-table">
+          <thead>
+            <tr>
+              {columns.map((c) => (
+                <th key={c.key} className="results-table-header">
+                  {c.label}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {displayRows.map((row, idx) => (
+              <tr key={idx} className={idx === 0 ? "results-row-top" : ""}>
+                {columns.map((c) => (
+                  <td key={c.key}>
+                    {idx === 0 && c.key === columns[0].key ? (
+                      <span className="results-top-badge">Top</span>
+                    ) : null}
+                    {c.render ? c.render(row[c.key], row) : formatCell(row[c.key])}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {rows.length > 10 ? (
+        <div className="action-row">
+          <button
+            className="secondary-button"
+            onClick={() => setShowAll((p) => !p)}
+            type="button"
+          >
+            {showAll ? "Show top 10" : `Show more (${Math.min(50, rows.length)})`}
+          </button>
+        </div>
+      ) : null}
+    </>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // BFS cascade view — group rows by depth with collapsible sections
 // ---------------------------------------------------------------------------
@@ -82,6 +143,47 @@ function CascadeTable({ tableData }) {
         );
       })}
     </div>
+  );
+}
+
+function BfsDistanceTable({ rawResult }) {
+  const inner = rawResult?.result || {};
+  const distances = inner.distances || [];
+  const visited = inner.visited_order || [];
+  const visitedIdx = inner.visited_order_indices || [];
+
+  const rows = useMemo(() => {
+    if (!Array.isArray(distances) || distances.length === 0) return [];
+    if (!Array.isArray(visited) || visited.length === 0) return [];
+    if (!Array.isArray(visitedIdx) || visitedIdx.length !== visited.length) return [];
+
+    const out = [];
+    for (let i = 0; i < visited.length; i += 1) {
+      const idx = Number(visitedIdx[i]);
+      const d = distances[idx];
+      if (d === null || d === undefined) continue;
+      const dn = Number(d);
+      if (!Number.isFinite(dn) || dn < 0) continue;
+      out.push({ node: labelOfIndexed(visited[i]), distance: dn });
+    }
+    // Sort by distance asc then node label.
+    out.sort((a, b) => (a.distance - b.distance) || String(a.node).localeCompare(String(b.node)));
+    return out;
+  }, [distances, visited, visitedIdx]);
+
+  if (rows.length === 0) {
+    return <div className="viz-empty">No distance data available.</div>;
+  }
+
+  return (
+    <SimpleTable
+      caption="Traversal distances from the source node."
+      columns={[
+        { key: "node", label: "Node" },
+        { key: "distance", label: "Distance" },
+      ]}
+      rows={rows}
+    />
   );
 }
 
@@ -163,7 +265,7 @@ function GenericSortableTable({ tableData }) {
                 {columns.map((c) => (
                   <td key={c}>
                     {idx === 0 && c === columns[0] ? (
-                      <span className="results-top-badge">🏆</span>
+                      <span className="results-top-badge">Top</span>
                     ) : null}
                     {formatCell(row[c])}
                   </td>
@@ -192,18 +294,85 @@ function GenericSortableTable({ tableData }) {
 // Main export
 // ---------------------------------------------------------------------------
 
-function TableView({ tableData, algorithmName }) {
+function TableView({ tableData, algorithmName, rawResult, jobParams }) {
   const unsupported = unsupportedNotice(tableData);
   if (unsupported) {
     return <div className="viz-empty">{unsupported}</div>;
   }
   if (!Array.isArray(tableData) || tableData.length === 0) {
+    // BFS can still render from rawResult.
+    if (algorithmName === "bfs") {
+      return <BfsDistanceTable rawResult={rawResult} />;
+    }
     return <div className="viz-empty">No table data available.</div>;
   }
 
   if (algorithmName === "bfs") {
-    return <CascadeTable tableData={tableData} />;
+    return (
+      <div className="viz-stack">
+        <BfsDistanceTable rawResult={rawResult} />
+        <div className="viz-divider" />
+        <div>
+          <h3 className="viz-subtitle">Cascade By Depth</h3>
+          <p className="viz-caption">Reachable nodes grouped by BFS depth.</p>
+          <CascadeTable tableData={tableData} />
+        </div>
+      </div>
+    );
   }
+
+  if (algorithmName === "pagerank" || algorithmName === "rwr") {
+    return (
+      <SimpleTable
+        caption={
+          jobParams?.top_k
+            ? `Top-k Results: [ ${jobParams.top_k} ]`
+            : "Top-ranked nodes by score."
+        }
+        columns={[
+          { key: "rank", label: "Rank" },
+          { key: "node_label", label: "Node" },
+          { key: "score", label: "Score", render: (v) => scoreCell(v) },
+        ]}
+        rows={tableData}
+      />
+    );
+  }
+
+  if (algorithmName === "hits") {
+    return (
+      <SimpleTable
+        caption={
+          jobParams?.top_k
+            ? `Top-k Results: [ ${jobParams.top_k} ]`
+            : "Top hub nodes with authority comparison."
+        }
+        columns={[
+          { key: "rank", label: "Rank" },
+          { key: "node_label", label: "Node" },
+          { key: "hub_score", label: "Hub Score", render: (v) => scoreCell(v) },
+          { key: "authority_score", label: "Authority Score", render: (v) => scoreCell(v) },
+        ]}
+        rows={tableData}
+      />
+    );
+  }
+
+  if (algorithmName === "louvain" || algorithmName === "mcl") {
+    const idLabel = algorithmName === "louvain" ? "Community" : "Cluster";
+    return (
+      <SimpleTable
+        caption={`${idLabel} summary (largest first).`}
+        columns={[
+          { key: "cluster_id", label: idLabel },
+          { key: "size", label: "Nodes" },
+          { key: "top_members", label: "Top Members" },
+        ]}
+        rows={tableData}
+      />
+    );
+  }
+
   return <GenericSortableTable tableData={tableData} />;
 }
 

@@ -1,7 +1,14 @@
 import { useState } from "react";
 import { uploadDataset } from "../services/api";
 
-function Upload({ uploadResult, isDetecting, onUploadSuccess, onContinue }) {
+function Upload({
+  networkType,
+  onNetworkTypeChange,
+  uploadResult,
+  isDetecting,
+  onUploadSuccess,
+  onContinue,
+}) {
   const [file, setFile] = useState(null);
   const [isUploading, setIsUploading] = useState(false);
   const [localError, setLocalError] = useState("");
@@ -37,6 +44,20 @@ function Upload({ uploadResult, isDetecting, onUploadSuccess, onContinue }) {
         </p>
       </div>
 
+      <div className="mapping-grid">
+        <label>
+          Network type
+          <select
+            onChange={(event) => onNetworkTypeChange?.(event.target.value)}
+            value={networkType || "grn"}
+          >
+            <option value="grn">GRN (directed)</option>
+            <option value="ppi">PPI (undirected)</option>
+            <option value="mirna">miRNA → target (directed bipartite)</option>
+          </select>
+        </label>
+      </div>
+
       <form className="upload-form" onSubmit={handleSubmit}>
         <input
           accept=".csv,.tsv,.xlsx,.json,.txt,.tab"
@@ -47,6 +68,12 @@ function Upload({ uploadResult, isDetecting, onUploadSuccess, onContinue }) {
           {isUploading ? "Uploading..." : "Upload"}
         </button>
       </form>
+
+      {file ? (
+        <p className="helper-text">
+          Selected: <strong>{file.name}</strong>
+        </p>
+      ) : null}
 
       {localError ? <p className="inline-error">{localError}</p> : null}
 
@@ -83,7 +110,7 @@ function Upload({ uploadResult, isDetecting, onUploadSuccess, onContinue }) {
           <div className="action-row">
             <button
               className="primary-button"
-              disabled={isDetecting}
+              disabled={isDetecting || !uploadResult}
               onClick={onContinue}
               type="button"
             >

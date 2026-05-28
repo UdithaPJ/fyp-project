@@ -386,7 +386,7 @@ def _prune(M: sp.csr_matrix, threshold: float) -> sp.csr_matrix:
 
 
 def _frobenius_diff(A: sp.csr_matrix, B: sp.csr_matrix) -> float:
-    """Frobenius norm of (A − B) for sparse matrices."""
+    """Frobenius norm of (A - B) for sparse matrices."""
     diff = A - B
     return float(np.sqrt(diff.data @ diff.data))
 

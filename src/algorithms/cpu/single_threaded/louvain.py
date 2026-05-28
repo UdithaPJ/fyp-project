@@ -74,8 +74,8 @@ def _phase1_single(
     performs the best greedy move if ΔQ > min_delta_q.
 
     ΔQ (move i from c_old to c_new) =
-        (k_{i,c_new} − k_{i,c_old}) / m
-        − resolution · k_i · (Σ_tot_c_new − Σ_tot_c_old) / (2m²)
+        (k_{i,c_new} - k_{i,c_old}) / m
+        - resolution · k_i · (Σ_tot_c_new - Σ_tot_c_old) / (2m²)
 
     where Σ_tot_c is the sum of degrees of nodes in c (after removing i).
 

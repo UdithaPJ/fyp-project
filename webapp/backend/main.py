@@ -2,11 +2,67 @@
 
 from __future__ import annotations
 
+import io
 import sys
 from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
+
+def _force_utf8_stdio() -> None:
+    """Avoid Windows console UnicodeEncodeError for logs/progress output."""
+    class _SafeTextStream(io.TextIOBase):
+        def __init__(self, stream):
+            self._stream = stream
+
+        def write(self, s: str) -> int:  # type: ignore[override]
+            try:
+                return self._stream.write(s)
+            except UnicodeEncodeError:
+                data = s.encode("utf-8", errors="replace")
+                buf = getattr(self._stream, "buffer", None)
+                if buf is not None:
+                    buf.write(data)
+                    return len(s)
+
+                enc = getattr(self._stream, "encoding", None) or "utf-8"
+                safe = s.encode(enc, errors="replace").decode(enc, errors="replace")
+                return self._stream.write(safe)
+
+        def flush(self) -> None:  # type: ignore[override]
+            if hasattr(self._stream, "flush"):
+                self._stream.flush()
+
+        def isatty(self) -> bool:  # type: ignore[override]
+            return bool(getattr(self._stream, "isatty", lambda: False)())
+
+        def fileno(self) -> int:  # type: ignore[override]
+            return int(getattr(self._stream, "fileno", lambda: -1)())
+
+        def writable(self) -> bool:  # type: ignore[override]
+            return True
+
+        def __getattr__(self, name: str):
+            return getattr(self._stream, name)
+
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            # Python 3.7+: TextIOWrapper supports reconfigure.
+            if hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            # Best-effort only — never block API startup.
+            pass
+
+    # Final guard: prevent any later UnicodeEncodeError from crashing the process.
+    if not isinstance(sys.stdout, _SafeTextStream):
+        sys.stdout = _SafeTextStream(sys.stdout)
+    if not isinstance(sys.stderr, _SafeTextStream):
+        sys.stderr = _SafeTextStream(sys.stderr)
+
+
+_force_utf8_stdio()
 
 CURRENT_DIR  = Path(__file__).resolve().parent   # webapp/backend
 WEBAPP_DIR   = CURRENT_DIR.parent                # webapp

@@ -48,10 +48,35 @@ const ALGO_DESCRIPTIONS = {
   mcl:      "Markov-clustering for tightly co-regulated modules.",
 };
 
+// Small chips to reinforce “biological network analysis” framing.
+const ALGO_CHIPS = {
+  pagerank: ["Centrality", "Ranking"],
+  bfs:      ["Cascade", "Reachability"],
+  louvain:  ["Communities", "Modularity"],
+  rwr:      ["Diffusion", "Seeds"],
+  hits:     ["Hubs", "Authorities"],
+  mcl:      ["Clustering", "Markov"],
+};
+
 // Hardcoded display order — matches the order in the spec.
 const ALGO_DISPLAY_ORDER = ["pagerank", "bfs", "louvain", "rwr", "hits", "mcl"];
 
 function defaultValueFor(paramDef) {
+  // Backend currently returns a plain dict of default values (not typed defs).
+  // Support both shapes: primitive defaults or rich {default,type,...} objects.
+  if (paramDef === null || paramDef === undefined) {
+    return "";
+  }
+  if (Array.isArray(paramDef)) {
+    // Represent list params as comma-separated text in the UI.
+    return "";
+  }
+  if (typeof paramDef !== "object") {
+    return paramDef;
+  }
+  if (Array.isArray(paramDef.default)) {
+    return "";
+  }
   if (paramDef.default !== undefined && paramDef.default !== null) {
     return paramDef.default;
   }
@@ -68,7 +93,32 @@ function paramFormDefaults(schema) {
   return defaults;
 }
 
-function AlgorithmSelector({ uploadId, onBack, onNext }) {
+function inferParamType(def) {
+  if (Array.isArray(def)) {
+    return "list";
+  }
+  if (typeof def === "object" && def && def.type) {
+    return def.type;
+  }
+  if (typeof def === "number") {
+    return Number.isInteger(def) ? "int" : "float";
+  }
+  return "text";
+}
+
+function parseIndexList(text) {
+  if (text === null || text === undefined) return [];
+  const raw = String(text).trim();
+  if (!raw) return [];
+  return raw
+    .split(/[\s,]+/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((s) => Number.parseInt(s, 10))
+    .filter((n) => Number.isFinite(n));
+}
+
+function AlgorithmSelector({ uploadId, networkType, onBack, onNext }) {
   const [catalog, setCatalog]   = useState([]);
   const [isLoading, setLoading] = useState(false);
   const [error, setError]       = useState("");
@@ -89,7 +139,11 @@ function AlgorithmSelector({ uploadId, onBack, onNext }) {
           data.find((a) => a.name === "pagerank") || data[0] || null;
         if (initial) {
           setSelected(initial.name);
-          setParams(paramFormDefaults(initial.param_schema));
+          const defaults = paramFormDefaults(initial.param_schema);
+          setParams({
+            ...defaults,
+            network_type: networkType || defaults.network_type,
+          });
         }
       })
       .catch((err) => {
@@ -118,25 +172,49 @@ function AlgorithmSelector({ uploadId, onBack, onNext }) {
 
   function handleSelectAlgorithm(algo) {
     setSelected(algo.name);
-    setParams(paramFormDefaults(algo.param_schema));
+    const defaults = paramFormDefaults(algo.param_schema);
+    setParams({
+      ...defaults,
+      network_type: networkType || defaults.network_type,
+    });
   }
 
   function handleParamChange(key, rawValue, paramDef) {
     let value = rawValue;
-    if (paramDef.type === "int" || paramDef.type === "integer") {
+    const inferredType = inferParamType(paramDef);
+    if (inferredType === "int" || inferredType === "integer") {
       value = rawValue === "" ? "" : Number.parseInt(rawValue, 10);
-    } else if (paramDef.type === "float" || paramDef.type === "number") {
+    } else if (inferredType === "float" || inferredType === "number") {
       value = rawValue === "" ? "" : Number.parseFloat(rawValue);
+    } else if (inferredType === "list") {
+      // Keep as text in form state; parse on submit.
+      value = rawValue;
     }
     setParams((prev) => ({ ...prev, [key]: value }));
   }
 
   function handleRun() {
     if (!selectedAlgo) return;
+    const schema = selectedAlgo.param_schema || {};
+    const normalized = {};
+    for (const [key, def] of Object.entries(schema)) {
+      if (key === "network_type") continue;
+      const inferred = inferParamType(def);
+      const v = params[key];
+      if (inferred === "list") {
+        normalized[key] = parseIndexList(v);
+      } else {
+        normalized[key] = v;
+      }
+    }
+
     onNext?.({
       algorithm: selectedAlgo.name,
       mode: "gpu",
-      params: { ...params },
+      params: {
+        ...normalized,
+        network_type: networkType || params.network_type || "grn",
+      },
     });
   }
 
@@ -166,8 +244,16 @@ function AlgorithmSelector({ uploadId, onBack, onNext }) {
               onClick={() => handleSelectAlgorithm(algo)}
               type="button"
             >
-              <strong>{algo.name.toUpperCase()}</strong>
-              <span>
+              <div className="algorithm-card-header">
+                <strong>{algo.name.toUpperCase()}</strong>
+                <span className="algorithm-card-badge">GPU</span>
+              </div>
+              <div className="algorithm-chip-row" aria-label="Algorithm category">
+                {(ALGO_CHIPS[algo.name] || []).map((chip) => (
+                  <span className="chip" key={`${algo.name}-${chip}`}>{chip}</span>
+                ))}
+              </div>
+              <span className="algorithm-card-desc">
                 {ALGO_DESCRIPTIONS[algo.name] || algo.description || ""}
               </span>
             </button>
@@ -183,18 +269,32 @@ function AlgorithmSelector({ uploadId, onBack, onNext }) {
             <>
               {Object.entries(selectedAlgo.param_schema || {}).map(
                 ([key, def]) => {
+                  if (key === "network_type") {
+                    return null;
+                  }
                   const tooltipKey = `${selectedAlgo.name}.${key}`;
-                  const tooltip = PARAM_TOOLTIPS[tooltipKey] || def.description || "";
+                  const tooltip =
+                    PARAM_TOOLTIPS[tooltipKey] ||
+                    (typeof def === "object" && def ? def.description : "") ||
+                    "";
+
+                  const inferredType = inferParamType(def);
+
+                  const placeholder =
+                    inferredType === "list"
+                      ? "e.g. 12, 48, 102"
+                      : undefined;
+
                   const inputType =
-                    def.type === "int" || def.type === "integer"
+                    inferredType === "int" || inferredType === "integer" || inferredType === "float" || inferredType === "number"
                       ? "number"
-                      : def.type === "float" || def.type === "number"
-                        ? "number"
-                        : "text";
+                      : "text";
                   const step =
-                    def.type === "float" || def.type === "number"
+                    inferredType === "float" || inferredType === "number"
                       ? "any"
                       : undefined;
+                  const min = typeof def === "object" && def ? def.min : undefined;
+                  const max = typeof def === "object" && def ? def.max : undefined;
                   return (
                     <label key={key} className="param-field">
                       <span className="param-field-label">
@@ -206,11 +306,12 @@ function AlgorithmSelector({ uploadId, onBack, onNext }) {
                         ) : null}
                       </span>
                       <input
-                        max={def.max ?? undefined}
-                        min={def.min ?? undefined}
+                        max={max ?? undefined}
+                        min={min ?? undefined}
                         onChange={(event) =>
                           handleParamChange(key, event.target.value, def)
                         }
+                        placeholder={placeholder}
                         step={step}
                         type={inputType}
                         value={params[key] ?? ""}
@@ -222,6 +323,16 @@ function AlgorithmSelector({ uploadId, onBack, onNext }) {
                   );
                 },
               )}
+
+              <div className="param-field param-field--readonly">
+                <span className="param-field-label">Network type</span>
+                <span className="param-field-value-fixed">
+                  {String(networkType || "grn").toUpperCase()}
+                </span>
+                <small className="param-field-hint">
+                  Set on the Upload step.
+                </small>
+              </div>
 
               <div className="param-field param-field--readonly">
                 <span className="param-field-label">Execution mode</span>

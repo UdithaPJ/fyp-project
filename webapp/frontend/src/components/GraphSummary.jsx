@@ -5,6 +5,26 @@ function GraphSummary({ preprocessResult, onBack }) {
   const graph = preprocessResult?.graph;
   const [showRawData, setShowRawData] = useState(false);
 
+  if (!preprocessResult) {
+    return (
+      <div className="panel-section">
+        <div className="section-header">
+          <h2>Graph Summary</h2>
+          <p>
+            No graph data is available yet. Return to Validation and run the
+            preprocessing step.
+          </p>
+        </div>
+
+        <div className="action-row">
+          <button className="secondary-button" onClick={onBack} type="button">
+            Back
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="panel-section">
       <div className="section-header">
@@ -50,9 +70,6 @@ function GraphSummary({ preprocessResult, onBack }) {
       <div className="action-row">
         <button className="secondary-button" onClick={onBack} type="button">
           Back
-        </button>
-        <button className="primary-button" type="button">
-          Run Analysis
         </button>
       </div>
     </div>

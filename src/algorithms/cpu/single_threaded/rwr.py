@@ -4,7 +4,7 @@ src/algorithms/cpu/single_threaded/rwr.py
 
 Random Walk with Restart (RWR) — single-threaded CPU implementation only.
 
-Iterates  p_new = (1−r)·W·p + r·p₀  until the L1 change drops below
+Iterates  p_new = (1-r)·W·p + r·p₀  until the L1 change drops below
 tolerance or max_iter is reached.  A single flat seed set is supported;
 for parallel multi-seed-set execution see the multi-threaded variant.
 
