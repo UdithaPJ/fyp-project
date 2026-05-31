@@ -30,10 +30,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 try:
-    from ..models.responses import GraphStatsResponse
+    from ..models.responses import GraphStatsResponse, NodeListResponse, NodeEntry
     from ..services.dataset_store import dataset_store
 except ImportError:  # pragma: no cover - fallback for running from backend directory
-    from models.responses import GraphStatsResponse
+    from models.responses import GraphStatsResponse, NodeListResponse, NodeEntry
     from services.dataset_store import dataset_store
 
 from src.preprocessing.pipeline import PreprocessingPipeline
@@ -153,3 +153,66 @@ def graph_preview(
         "total_edges": int(graph_csr.nnz),
         "preview_capped": bool(n > max_nodes or graph_csr.nnz > max_edges),
     }
+
+
+# ---------------------------------------------------------------------------
+# GET /graph/nodes — node-typeahead endpoint for the parameter form
+# ---------------------------------------------------------------------------
+
+_NODES_MAX_LIMIT = 200
+_NODES_DEFAULT_LIMIT = 50
+
+
+@router.get("/nodes", response_model=NodeListResponse)
+def graph_nodes(
+    upload_id: str,
+    search: str = "",
+    limit: int = _NODES_DEFAULT_LIMIT,
+) -> NodeListResponse:
+    """Search-and-paginate the node_index_map of a preprocessed graph.
+
+    Used by the BFS source selector and the RWR seed-nodes multi-selector
+    in the AlgorithmSelector form.  Returns ``{index, label}`` pairs in
+    label-sorted order so the frontend renders them without further
+    sorting.
+
+    Query parameters
+    ----------------
+    upload_id : str (required)
+    search    : str
+        Substring filter applied to node labels (case-insensitive).
+        Empty string returns the first ``limit`` labels in alphabetical
+        order.
+    limit     : int
+        Maximum number of nodes to return.  Default 50, capped at 200.
+    """
+    if limit <= 0:
+        limit = _NODES_DEFAULT_LIMIT
+    limit = min(int(limit), _NODES_MAX_LIMIT)
+
+    _, node_index_map = _get_csr_for_upload(upload_id)
+    needle = (search or "").strip().lower()
+
+    # node_index_map: {label: index}
+    pairs = sorted(node_index_map.items(), key=lambda kv: str(kv[0]).lower())
+
+    if needle:
+        filtered = [
+            (label, idx) for (label, idx) in pairs
+            if needle in str(label).lower()
+        ]
+    else:
+        filtered = pairs
+
+    total = len(filtered)
+    truncated = total > limit
+    capped = filtered[:limit]
+
+    return NodeListResponse(
+        nodes=[
+            NodeEntry(index=int(idx), label=str(label))
+            for (label, idx) in capped
+        ],
+        total=total,
+        truncated=truncated,
+    )

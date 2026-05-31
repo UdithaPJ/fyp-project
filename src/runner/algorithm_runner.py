@@ -356,10 +356,354 @@ def run_algorithm(
 # Public: algorithm introspection
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# UI metadata schema for the algorithm parameter form
+# ---------------------------------------------------------------------------
+#
+# UI_SCHEMA is *purely* metadata used by the frontend to build a typed
+# parameter form (sliders, dropdowns, preset pills, node selectors).
+# It is intentionally kept separate from the algorithm-side ``PARAM_SCHEMA``
+# (which the runner uses for validation) so algorithm code never has to
+# carry UI concerns.
+#
+# Each entry has:
+#   display_name : str
+#   description  : str            (one-paragraph algorithm summary)
+#   category     : str            (used by the algorithm card chip)
+#   params       : list[dict]     (rendered top-down in the form)
+#
+# Each param dict has at least:
+#   key      : str   (matches the backend param name exactly)
+#   label    : str   (human-readable form label)
+#   type     : str   ("slider" | "number" | "select" | "preset_select"
+#                     | "node_selector" | "multi_node_selector")
+#   default  : Any   (initial form value; matches the backend default)
+#   tooltip  : str   (shown on hover)
+#   advanced : bool  (True → behind the "Advanced Settings" toggle)
+#
+# Type-specific additional keys:
+#   slider:              min, max, step, display_format ("scientific" optional)
+#   number:              min, max, step (step may be None for free entry)
+#   select:              options: [{value, label}, ...]
+#   preset_select:       presets: [{label, value}, ...]
+#                        (presets are display affordances; the raw
+#                         float is always what gets submitted)
+#   node_selector:       searchable: bool, placeholder: str
+#   multi_node_selector: searchable: bool, placeholder: str
+# ---------------------------------------------------------------------------
+
+UI_SCHEMA: dict[str, dict] = {
+    "pagerank": {
+        "display_name": "PageRank",
+        "description": (
+            "Ranks nodes by influence propagation.  Higher scores "
+            "= more regulatory influence."
+        ),
+        "category": "Ranking",
+        "params": [
+            {
+                "key": "damping", "label": "Damping Factor",
+                "type": "slider",
+                "default": 0.85, "min": 0.1, "max": 0.99, "step": 0.01,
+                "tooltip": (
+                    "Probability of following a regulatory edge at each "
+                    "step.  0.85 is the standard value for most "
+                    "biological networks."
+                ),
+                "advanced": False,
+            },
+            {
+                "key": "max_iter", "label": "Max Iterations",
+                "type": "number",
+                "default": 100, "min": 10, "max": 1000, "step": 10,
+                "tooltip": (
+                    "Maximum number of update steps before stopping.  "
+                    "Increase if results seem unstable."
+                ),
+                "advanced": False,
+            },
+            {
+                "key": "tolerance", "label": "Convergence Tolerance",
+                "type": "number",
+                "default": 1e-6, "min": 1e-10, "max": 1e-3, "step": None,
+                "tooltip": (
+                    "How precisely the algorithm must converge before "
+                    "stopping.  Smaller = more precise but slower.  "
+                    "Default 1e-6 suits most analyses."
+                ),
+                "advanced": True,
+            },
+        ],
+    },
+    "bfs": {
+        "display_name": "Breadth-First Search",
+        "description": (
+            "Traces regulatory cascades from a starting gene, showing "
+            "how influence spreads step by step."
+        ),
+        "category": "Traversal",
+        "params": [
+            {
+                "key": "source", "label": "Source Node",
+                "type": "node_selector",
+                "default": 0,
+                "searchable": True,
+                "placeholder": "Search by gene name…",
+                "tooltip": (
+                    "The starting gene or transcription factor for "
+                    "cascade tracing.  Try a known regulator like TP53."
+                ),
+                "advanced": False,
+            },
+            {
+                "key": "max_depth", "label": "Maximum Cascade Depth",
+                "type": "slider",
+                "default": 5, "min": 1, "max": 10, "step": 1,
+                "tooltip": (
+                    "How many regulatory steps to trace outward from "
+                    "the source.  Depth 1 = direct targets, depth 2 "
+                    "= targets of targets, etc."
+                ),
+                "advanced": False,
+            },
+        ],
+    },
+    "louvain": {
+        "display_name": "Louvain Community Detection",
+        "description": (
+            "Groups genes into functional modules based on how densely "
+            "they are connected."
+        ),
+        "category": "Clustering",
+        "params": [
+            {
+                "key": "resolution", "label": "Resolution",
+                "type": "slider",
+                "default": 1.0, "min": 0.1, "max": 3.0, "step": 0.1,
+                "tooltip": (
+                    "Higher values produce smaller, more detailed "
+                    "communities.  Lower values produce larger "
+                    "biological modules.  Start with 1.0."
+                ),
+                "advanced": False,
+            },
+            {
+                "key": "max_levels", "label": "Maximum Hierarchy Levels",
+                "type": "slider",
+                "default": 10, "min": 1, "max": 20, "step": 1,
+                "tooltip": (
+                    "Number of coarsening rounds.  Higher values allow "
+                    "deeper hierarchical structure but take longer.  "
+                    "10 is sufficient for most networks."
+                ),
+                "advanced": False,
+            },
+            {
+                "key": "min_delta_q", "label": "Minimum Modularity Gain",
+                "type": "number",
+                "default": 1e-4, "min": 1e-6, "max": 0.1, "step": None,
+                "tooltip": (
+                    "Minimum improvement required to move a node to a "
+                    "new community.  Smaller values allow finer "
+                    "optimisation."
+                ),
+                "advanced": True,
+            },
+        ],
+    },
+    "rwr": {
+        "display_name": "Random Walk with Restart",
+        "description": (
+            "Spreads influence from seed genes through the network to "
+            "find functionally related genes."
+        ),
+        "category": "Propagation",
+        "params": [
+            {
+                "key": "restart_prob", "label": "Restart Probability",
+                "type": "slider",
+                "default": 0.3, "min": 0.1, "max": 0.9, "step": 0.05,
+                "tooltip": (
+                    "Controls how strongly the walk stays near the "
+                    "seed nodes.  Higher values keep results closer to "
+                    "seeds.  0.3 is a standard setting."
+                ),
+                "advanced": False,
+            },
+            {
+                "key": "seed_nodes", "label": "Seed Nodes",
+                "type": "multi_node_selector",
+                "default": [],
+                "searchable": True,
+                "placeholder": "Search and add seed genes…",
+                "tooltip": (
+                    "Starting genes for the walk.  For GRNs, use known "
+                    "transcription factors.  Leave empty to use all "
+                    "nodes equally."
+                ),
+                "advanced": False,
+            },
+            {
+                "key": "max_iter", "label": "Max Iterations",
+                "type": "number",
+                "default": 100, "min": 10, "max": 500, "step": 10,
+                "tooltip": "Maximum walk iterations before stopping.",
+                "advanced": False,
+            },
+            {
+                "key": "tolerance", "label": "Convergence Tolerance",
+                "type": "number",
+                "default": 1e-6, "min": 1e-10, "max": 1e-3, "step": None,
+                "tooltip": (
+                    "How precisely the walk must stabilise before "
+                    "stopping."
+                ),
+                "advanced": True,
+            },
+            {
+                "key": "precision", "label": "Precision Mode",
+                "type": "select",
+                "default": "fp32",
+                "options": [
+                    {"value": "fp32",
+                     "label": "FP32 — Accurate"},
+                    {"value": "fp16_storage",
+                     "label": "Mixed Precision — Faster"},
+                ],
+                "tooltip": (
+                    "FP32 gives full precision.  Mixed Precision uses "
+                    "less memory and runs faster but may have minor "
+                    "numerical differences on large networks."
+                ),
+                "advanced": True,
+            },
+        ],
+    },
+    "hits": {
+        "display_name": "HITS",
+        "description": (
+            "Scores each node as a hub (regulates others) and an "
+            "authority (is regulated by others)."
+        ),
+        "category": "Ranking",
+        "params": [
+            {
+                "key": "max_iter", "label": "Max Iterations",
+                "type": "number",
+                "default": 100, "min": 10, "max": 500, "step": 10,
+                "tooltip": (
+                    "Maximum number of HITS update iterations before "
+                    "stopping.  100 is sufficient for most biological "
+                    "networks."
+                ),
+                "advanced": False,
+            },
+            {
+                "key": "tolerance", "label": "Precision",
+                "type": "preset_select",
+                "default": 1e-6,
+                "presets": [
+                    {"label": "Fast",           "value": 1e-4},
+                    {"label": "Balanced",       "value": 1e-6},
+                    {"label": "High Precision", "value": 1e-8},
+                ],
+                "tooltip": (
+                    "How precisely hub and authority scores must "
+                    "stabilise before stopping.  Balanced is "
+                    "recommended for most analyses."
+                ),
+                "advanced": False,
+            },
+        ],
+    },
+    "mcl": {
+        "display_name": "Markov Clustering (MCL)",
+        "description": (
+            "Finds protein complexes and gene modules by simulating "
+            "random walks on the network."
+        ),
+        "category": "Clustering",
+        "params": [
+            {
+                "key": "inflation", "label": "Inflation",
+                "type": "slider",
+                "default": 2.0, "min": 1.4, "max": 6.0, "step": 0.1,
+                "tooltip": (
+                    "Higher values produce smaller, tighter clusters.  "
+                    "Lower values produce larger, more overlapping "
+                    "communities.  Suggested range: 1.4 – 6.0.  Start "
+                    "with 2.0 for most biological networks."
+                ),
+                "advanced": False,
+            },
+            {
+                "key": "expansion", "label": "Expansion",
+                "type": "select",
+                "default": 2,
+                "options": [
+                    {"value": 2, "label": "2 — Standard (recommended)"},
+                    {"value": 3, "label": "3 — Deeper diffusion"},
+                    {"value": 4, "label": "4 — Maximum diffusion (slow)"},
+                ],
+                "tooltip": (
+                    "Controls how far random walks spread at each "
+                    "step.  Higher values allow deeper diffusion but "
+                    "use significantly more memory.  Value of 2 is "
+                    "standard for MCL."
+                ),
+                "advanced": False,
+            },
+            {
+                "key": "prune_threshold", "label": "Prune Threshold",
+                "type": "slider",
+                "default": 0.001, "min": 0.0001, "max": 0.05, "step": 0.0001,
+                "display_format": "scientific",
+                "tooltip": (
+                    "Removes weak connections below this value to save "
+                    "memory.  Higher values improve speed and reduce "
+                    "memory usage but may remove weak biological "
+                    "relationships.  0.001 is the recommended starting "
+                    "point."
+                ),
+                "advanced": False,
+            },
+            {
+                "key": "max_iter", "label": "Max Iterations",
+                "type": "number",
+                "default": 100, "min": 10, "max": 500, "step": 10,
+                "tooltip": "Maximum clustering iterations before stopping.",
+                "advanced": True,
+            },
+            {
+                "key": "convergence_tol", "label": "Convergence Tolerance",
+                "type": "preset_select",
+                "default": 1e-4,
+                "presets": [
+                    {"label": "Fast",     "value": 1e-3},
+                    {"label": "Standard", "value": 1e-4},
+                    {"label": "Precise",  "value": 1e-5},
+                ],
+                "tooltip": (
+                    "How stable the clustering must be before "
+                    "stopping.  Standard suits most analyses."
+                ),
+                "advanced": True,
+            },
+        ],
+    },
+}
+
+
 def get_algorithm_info(algorithm_name: str) -> dict:
     """
-    Return ``{"name", "param_schema", "description"}`` for one algorithm.
-    Used by the frontend to dynamically build parameter input forms.
+    Return ``{"name", "param_schema", "description",
+    "display_name", "category", "ui_schema"}`` for one algorithm.
+
+    ``param_schema`` is kept (and unchanged) for backend validators;
+    ``ui_schema`` carries the new metadata the frontend uses to build
+    the parameter form.  Algorithms with no UI_SCHEMA entry fall back
+    to an empty ``ui_schema`` list — the legacy form-from-param_schema
+    rendering path still works.
     """
     algo_cls = ALGORITHM_REGISTRY.get(algorithm_name)
     if algo_cls is None:
@@ -367,12 +711,23 @@ def get_algorithm_info(algorithm_name: str) -> dict:
             f"Unknown algorithm '{algorithm_name}'.  "
             f"Available: {sorted(ALGORITHM_REGISTRY.keys())}"
         )
-    return algo_cls.describe()
+    base = dict(algo_cls.describe())
+    ui_entry = UI_SCHEMA.get(algorithm_name, {})
+    base["display_name"] = ui_entry.get("display_name",
+                                        base.get("name", algorithm_name))
+    if "description" not in base or not base.get("description"):
+        base["description"] = ui_entry.get("description", "")
+    elif ui_entry.get("description"):
+        # Prefer the richer UI description when both exist.
+        base["description"] = ui_entry["description"]
+    base["category"]  = ui_entry.get("category", "")
+    base["ui_schema"] = list(ui_entry.get("params", []))
+    return base
 
 
 def list_algorithms() -> list[dict]:
     """Return :func:`get_algorithm_info` for every registered algorithm."""
-    return [algo_cls.describe() for algo_cls in ALGORITHM_REGISTRY.values()]
+    return [get_algorithm_info(name) for name in ALGORITHM_REGISTRY.keys()]
 
 
 # ---------------------------------------------------------------------------

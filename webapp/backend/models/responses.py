@@ -69,3 +69,20 @@ class GraphStatsResponse(BaseModel):
     max_degree: int
     is_directed: bool
     num_components: int
+
+
+class NodeEntry(BaseModel):
+    """Single ``{index, label}`` node identifier pair."""
+    index: int
+    label: str
+
+
+class NodeListResponse(BaseModel):
+    """Response shape for ``GET /graph/nodes`` — node typeahead.
+
+    Returned in label-sorted order so the frontend can render the
+    dropdown without additional client-side sorting.
+    """
+    nodes: list[NodeEntry]
+    total: int        # total matches after filtering (before the limit cap)
+    truncated: bool   # True when nodes length < total

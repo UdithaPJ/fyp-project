@@ -136,6 +136,22 @@ export async function getGraphStats(uploadId) {
   return parseResponse(response);
 }
 
+/**
+ * Search the preprocessed graph's node_index_map for the AlgorithmSelector
+ * node-typeahead controls (BFS source, RWR seed_nodes).
+ *
+ * Returns: { nodes: [{index, label}], total, truncated }
+ */
+export async function getNodes(uploadId, search = "", limit = 50) {
+  const qs = new URLSearchParams({
+    upload_id: uploadId,
+    search:    search || "",
+    limit:     String(limit),
+  });
+  const response = await fetch(`${API_BASE_URL}/graph/nodes?${qs.toString()}`);
+  return parseResponse(response);
+}
+
 export async function getGpuStatus() {
   const response = await fetch(`${API_BASE_URL}/system/gpu-status`);
   return parseResponse(response);

@@ -1060,6 +1060,92 @@ Default view per algorithm:
 
 ---
 
+## Algorithm parameter UI schema
+
+UI metadata for the algorithm parameter form lives in the `UI_SCHEMA`
+dict in `src/runner/algorithm_runner.py`.  It is intentionally
+**separate** from the per-algorithm `PARAM_SCHEMA` (which the runner
+and the algorithm files use for validation) so algorithm code does
+not carry UI concerns.
+
+`UI_SCHEMA[<algo>]` shape:
+```python
+{
+  "display_name": str,
+  "description":  str,
+  "category":     str,      # "Ranking" | "Traversal" | "Clustering" | "Propagation"
+  "params": [
+    {"key": str, "label": str, "type": str, "default": Any,
+     "tooltip": str, "advanced": bool, ...type-specific keys},
+    ...
+  ],
+}
+```
+
+`get_algorithm_info(name)` returns:
+```python
+{
+  "name":         str,
+  "display_name": str,
+  "description":  str,
+  "category":     str,
+  "param_schema": dict,   # backend validator (unchanged)
+  "ui_schema":    list,   # frontend form builder
+}
+```
+
+`list_algorithms()` returns the same shape per algorithm — backward
+compatible because the old keys (`name`, `param_schema`,
+`description`) are preserved.
+
+### Parameter input types
+
+| `type`                  | Renderer                | Notes |
+|-------------------------|-------------------------|-------|
+| `slider`                | `ParamSlider`           | range input + live value chip; honours `min/max/step` and optional `display_format: "scientific"` |
+| `number`                | `ParamNumber`           | numeric text input; `step` may be `None` for free entry |
+| `select`                | `ParamSelect`           | dropdown of `options: [{value, label}]`; coerces to number when all option values are numeric |
+| `preset_select`         | `ParamPresetSelect`     | pill row of `presets: [{label, value}]`; pills are display affordances — the float `value` is what gets submitted |
+| `node_selector`         | `ParamNodeSelector`     | searchable typeahead → single node index |
+| `multi_node_selector`   | `ParamMultiNodeSelector`| searchable typeahead + removable pills → list of node indices |
+
+### Advanced settings
+
+Params with `advanced: true` are hidden behind a collapsible
+"⚙ Advanced Settings" toggle in `AlgorithmSelector.jsx`.  Default
+state is closed; the React component tracks `advancedOpen` per
+algorithm-selection (resets to closed when the user picks a
+different algorithm).
+
+### Node-name data flow
+
+- Preprocessing populates `node_index_map` in `dataset_store`
+  (existing behaviour).
+- `GET /graph/nodes?upload_id=&search=&limit=` filters the map
+  case-insensitively, sorts by label, caps at `limit` (default 50,
+  max 200), and returns `{nodes: [{index, label}], total, truncated}`.
+- `getNodes(uploadId, search, limit)` in `api.js` wraps it.
+- `ParamNodeSelector` / `ParamMultiNodeSelector` debounce the search
+  query at 250 ms.
+
+### Submitted params
+
+`AlgorithmSelector` always submits **raw float / int / list values**
+to `POST /algorithms/run`.  Preset labels are UI-only and never
+cross the network — when a user clicks "Balanced" on a HITS preset,
+`paramValues.tolerance` becomes `1e-6` directly.
+
+### Theme note
+
+The spec's CSS used `var(--accent-cyan)` / `var(--bg-elevated)`
+design tokens for a dark theme.  The current `index.css` is a
+light theme with literal hex colors (`#244154`, `#2f6f7e`,
+`#f4f8fb`).  The new UI components use the existing palette so
+they render correctly in this repo; migrating to design tokens is
+a separate, codebase-wide change.
+
+---
+
 ## Coding conventions
 
 - Python: type hints on all function signatures
