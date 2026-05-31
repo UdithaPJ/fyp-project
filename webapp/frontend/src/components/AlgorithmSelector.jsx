@@ -26,6 +26,42 @@ import { getAlgorithmCatalog, getNodes } from "../services/api";
  *   onNext({ algorithm, mode, params }) : function
  */
 
+// Per-parameter biological tooltips — keyed by `${algoName}.${paramName}`.
+const PARAM_TOOLTIPS = {
+  "pagerank.damping":
+    "Probability of following a regulatory edge vs. teleporting. 0.85 is standard.",
+  "pagerank.max_iter": "Maximum power iterations before stopping.",
+  "bfs.source":
+    "Starting node index for cascade tracing. Use a known TF index.",
+  "bfs.max_depth": "Maximum regulatory cascade depth to explore.",
+  "louvain.resolution": "Higher values find more, smaller communities.",
+  "rwr.restart_prob": "Probability of returning to seed TF at each step.",
+  "rwr.seed_nodes": "Comma-separated node indices for seed TFs.",
+  "hits.max_iter": "Maximum HITS iterations.",
+  "mcl.inflation": "Controls cluster granularity. Higher = more clusters.",
+};
+
+// Friendly one-line descriptions for the algorithm cards.
+const ALGO_DESCRIPTIONS = {
+  pagerank: "Rank regulators by global influence in the network.",
+  bfs: "Trace a regulatory cascade outward from a source TF.",
+  louvain: "Detect communities of co-regulated genes.",
+  rwr: "Find nodes proximal to a set of seed TFs.",
+  hits: "Identify hubs and authorities (transcription factors vs targets).",
+  mcl: "Markov-clustering for tightly co-regulated modules.",
+};
+
+// Small chips to reinforce “biological network analysis” framing.
+const ALGO_CHIPS = {
+  pagerank: ["Centrality", "Ranking"],
+  bfs: ["Cascade", "Reachability"],
+  louvain: ["Communities", "Modularity"],
+  rwr: ["Diffusion", "Seeds"],
+  hits: ["Hubs", "Authorities"],
+  mcl: ["Clustering", "Markov"],
+};
+
+// Hardcoded display order — matches the order in the spec.
 const ALGO_DISPLAY_ORDER = ["pagerank", "bfs", "louvain", "rwr", "hits", "mcl"];
 const DEFAULT_TYPEAHEAD_LIMIT = 50;
 const TYPEAHEAD_DEBOUNCE_MS = 250;
@@ -318,9 +354,7 @@ function ParamNodeSelector({ param, value, onChange, uploadId, initialNodes }) {
               className="node-search-input"
               autoFocus
             />
-            {loading ? (
-              <div className="node-loading">Searching…</div>
-            ) : null}
+            {loading ? <div className="node-loading">Searching…</div> : null}
             <div className="node-list">
               {results.length === 0 && !loading ? (
                 <div className="node-loading">No matches.</div>
@@ -679,9 +713,7 @@ function AlgorithmSelector({ uploadId, onBack, onNext }) {
                     onClick={() => setAdvancedOpen((o) => !o)}
                   >
                     <span>⚙ Advanced Settings</span>
-                    <span className="chevron">
-                      {advancedOpen ? "▲" : "▼"}
-                    </span>
+                    <span className="chevron">{advancedOpen ? "▲" : "▼"}</span>
                   </button>
                   {advancedOpen ? (
                     <div className="advanced-params">
@@ -699,6 +731,16 @@ function AlgorithmSelector({ uploadId, onBack, onNext }) {
                   ) : null}
                 </>
               ) : null}
+
+              <div className="param-field param-field--readonly">
+                <span className="param-field-label">Network type</span>
+                <span className="param-field-value-fixed">
+                  {String(networkType || "grn").toUpperCase()}
+                </span>
+                <small className="param-field-hint">
+                  Set on the Upload step.
+                </small>
+              </div>
 
               <div className="param-field param-field--readonly">
                 <span className="param-field-label">Execution mode</span>

@@ -32,6 +32,27 @@ const CYTOSCAPE_LAYOUT = {
   padding: 32,
 };
 
+function lerp(a, b, t) {
+  return a + (b - a) * t;
+}
+
+function lerpColor(rgbA, rgbB, t) {
+  const r = Math.round(lerp(rgbA[0], rgbB[0], t));
+  const g = Math.round(lerp(rgbA[1], rgbB[1], t));
+  const b = Math.round(lerp(rgbA[2], rgbB[2], t));
+  return `rgb(${r}, ${g}, ${b})`;
+}
+
+function scoreGradient(t) {
+  // Light teal → deep teal (keep consistent with app palette)
+  return lerpColor([152, 193, 217], [47, 111, 126], t);
+}
+
+function bfsDepthGradient(t) {
+  // Source/near nodes darker; far nodes lighter.
+  return lerpColor([47, 111, 126], [152, 193, 217], t);
+}
+
 function colorForCommunity(community) {
   if (community === null || community === undefined) return "#2f6f7e";
   return COMMUNITY_PALETTE[
@@ -39,29 +60,53 @@ function colorForCommunity(community) {
   ];
 }
 
-function buildElements(graphData) {
+function buildElements(graphData, algorithmName) {
   const nodes = graphData?.nodes || [];
   const edges = graphData?.edges || [];
 
-  const scores = nodes
-    .map((n) => Number(n.score || 0))
+  const rawValues = nodes
+    .map((n) => Number(n.score))
     .filter((s) => Number.isFinite(s));
-  const minScore = scores.length ? Math.min(...scores) : 0;
-  const maxScore = scores.length ? Math.max(...scores) : 1;
-  const spread   = Math.max(maxScore - minScore, 1e-12);
+  const minVal = rawValues.length ? Math.min(...rawValues) : 0;
+  const maxVal = rawValues.length ? Math.max(...rawValues) : 1;
+  const spread = Math.max(maxVal - minVal, 1e-12);
+
+  const isCluster = algorithmName === "louvain" || algorithmName === "mcl";
+  const isBfs = algorithmName === "bfs";
+  const isScoreAlgo = algorithmName === "pagerank" || algorithmName === "rwr" || algorithmName === "hits";
 
   const nodeElements = nodes.map((n) => {
-    const norm = scores.length ? (Number(n.score || 0) - minScore) / spread : 0.5;
-    const size = MIN_NODE_SIZE + (MAX_NODE_SIZE - MIN_NODE_SIZE) * norm;
+    const v = Number(n.score);
+    const normRaw = rawValues.length && Number.isFinite(v) ? (v - minVal) / spread : 0.5;
+    const norm = Math.max(0, Math.min(1, normRaw));
+
+    // For BFS, smaller distance should look more important.
+    const sizeNorm = isBfs ? (1 - norm) : norm;
+    const size = MIN_NODE_SIZE + (MAX_NODE_SIZE - MIN_NODE_SIZE) * sizeNorm;
+
+    const isHighlight = Boolean(n.highlight);
+    let color = "#2f6f7e";
+    if (isCluster) {
+      color = colorForCommunity(n.community);
+    } else if (isBfs) {
+      color = bfsDepthGradient(norm);
+      if (isHighlight) color = "#d95f43"; // emphasize source
+    } else if (isScoreAlgo) {
+      color = scoreGradient(norm);
+      if (isHighlight) color = "#d95f43"; // top nodes highlighted
+    } else {
+      color = "#2f6f7e";
+    }
+
     return {
       data: {
         id:        n.id,
         label:     n.label || n.id,
-        score:     Number(n.score || 0),
+        score:     Number.isFinite(v) ? v : 0,
         community: n.community ?? null,
-        highlight: Boolean(n.highlight),
+        highlight: isHighlight,
         size,
-        color:     colorForCommunity(n.community),
+        color,
       },
       classes: n.highlight ? "is-highlight" : "",
     };
@@ -123,10 +168,13 @@ const STYLESHEET = [
   },
 ];
 
-function GraphHighlight({ graphData }) {
+function GraphHighlight({ graphData, algorithmName }) {
   const [tooltip, setTooltip] = useState(null);
 
-  const elements = useMemo(() => buildElements(graphData), [graphData]);
+  const elements = useMemo(
+    () => buildElements(graphData, algorithmName),
+    [graphData, algorithmName],
+  );
   const nodeCount = (graphData?.nodes || []).length;
   const edgeCount = (graphData?.edges || []).length;
   const isCapped  = Boolean(graphData?.node_count_capped);
@@ -201,7 +249,9 @@ function GraphHighlight({ graphData }) {
           >
             <strong>{tooltip.label}</strong>
             {tooltip.score !== undefined ? (
-              <span>score: {Number(tooltip.score).toFixed(6)}</span>
+              <span>
+                {algorithmName === "bfs" ? "distance" : "score"}: {Number(tooltip.score).toFixed(6)}
+              </span>
             ) : null}
             {tooltip.community !== null && tooltip.community !== undefined ? (
               <span>community: {tooltip.community}</span>

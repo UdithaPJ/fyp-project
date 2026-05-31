@@ -190,7 +190,7 @@ function RunAnalysis({ uploadId, algorithmConfig, onBack, onComplete }) {
 
       {phase === "done" && result ? (
         <div className="report-box summary-box">
-          <h3>✅ Analysis Complete</h3>
+          <h3>Analysis Complete</h3>
           <div className="stats-grid">
             <div className="stat-card">
               <span>Execution time</span>

@@ -105,10 +105,29 @@ def _make_adapter(name: str, module_path: str, description: str) -> type[Algorit
     mod = importlib.import_module(module_path)
     defaults: dict = dict(getattr(mod, "_DEFAULT_PARAMS", {}))
 
+    def _looks_like_standard_result(x: object) -> bool:
+        return (
+            isinstance(x, dict)
+            and "algorithm" in x
+            and "mode" in x
+            and "execution_time" in x
+            and "num_nodes" in x
+            and "num_edges" in x
+            and "result" in x
+            and isinstance(x.get("result"), dict)
+        )
+
     def _gpu_staticmethod(graph_csr: sp.csr_matrix, params: dict) -> dict:
         raw = mod._gpu(graph_csr, params)
         # Unpack {"output": ..., "extra_params": ...} wrapper produced by _gpu()
         result_data = raw["output"] if isinstance(raw, dict) and "output" in raw else raw
+
+        # Some cuda_optimized modules already return the fully-standardised
+        # result dict (with {algorithm, mode, execution_time, num_nodes, ...}).
+        # Others return only the inner algorithm-specific payload.
+        if _looks_like_standard_result(result_data):
+            return result_data
+
         return {
             "algorithm":      name,
             "mode":           "gpu",

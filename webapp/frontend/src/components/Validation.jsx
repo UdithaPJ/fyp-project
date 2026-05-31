@@ -16,6 +16,8 @@ function Validation({
     ? progress.step.replaceAll("_", " ")
     : "waiting";
 
+  const hasReport = Boolean(validation);
+
   return (
     <div className="panel-section">
       <div className="section-header">
@@ -45,19 +47,27 @@ function Validation({
         </div>
         <div className="stat-card">
           <span>Duplicate edges</span>
-          <strong>{validation?.duplicate_edges ?? "-"}</strong>
+          <strong>{hasReport ? validation?.duplicate_edges ?? "-" : "—"}</strong>
         </div>
         <div className="stat-card">
           <span>Self-loops</span>
-          <strong>{validation?.self_loops ?? "-"}</strong>
+          <strong>{hasReport ? validation?.self_loops ?? "-" : "—"}</strong>
         </div>
       </div>
 
       <div className="report-box">
         <h3>Missing values</h3>
-        <p>Source: {missingValues.source ?? "-"}</p>
-        <p>Target: {missingValues.target ?? "-"}</p>
-        <p>Weight: {missingValues.weight ?? "-"}</p>
+        {hasReport ? (
+          <>
+            <p>Source: {missingValues.source ?? "-"}</p>
+            <p>Target: {missingValues.target ?? "-"}</p>
+            <p>Weight: {missingValues.weight ?? "-"}</p>
+          </>
+        ) : (
+          <p className="helper-text">
+            Run preprocessing to compute the validation report.
+          </p>
+        )}
       </div>
 
       {isPreprocessing ? (
@@ -104,6 +114,13 @@ function Validation({
           </button>
         )}
       </div>
+
+      {!hasValidMapping ? (
+        <p className="inline-error">
+          Column mapping is incomplete. Select Source and Target columns in the
+          Mapping step.
+        </p>
+      ) : null}
     </div>
   );
 }

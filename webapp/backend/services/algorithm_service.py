@@ -164,8 +164,8 @@ def run_algorithm_job(
         )
 
         # ---- Step 5: visualization payloads ----
-        chart_data  = _build_chart(result, node_index_map)
-        table_data  = _build_table(result, node_index_map)
+        chart_data  = _build_chart(result, node_index_map, params)
+        table_data  = _build_table(result, node_index_map, params)
         graph_viz   = make_highlight_data(result, graph_csr, node_index_map)
 
         # ---- Step 6: mark completed ----
@@ -204,11 +204,24 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _build_chart(result: dict, node_index_map: dict) -> dict:
+def _coerce_top_k(params: Dict[str, Any], default: int, cap: int = 100) -> int:
+    """Best-effort parse for a UI-provided top_k parameter (visualization only)."""
+    raw = (params or {}).get("top_k", None)
+    try:
+        k = int(raw)
+    except Exception:
+        return int(default)
+    if k <= 0:
+        return int(default)
+    return int(min(k, cap))
+
+
+def _build_chart(result: dict, node_index_map: dict, params: Dict[str, Any]) -> dict:
     """Return the most appropriate chart dict for the algorithm result."""
     algo = result.get("algorithm", "")
     if algo in {"pagerank", "hits", "rwr"}:
-        return make_score_chart_data(result, node_index_map)
+        # Always compute a sufficiently large top-K payload; the UI can slice.
+        return make_score_chart_data(result, node_index_map, top_k=200)
     if algo in {"louvain", "mcl"}:
         return make_cluster_size_chart_data(result)
     # BFS — no standard chart; return an empty marker
@@ -216,11 +229,12 @@ def _build_chart(result: dict, node_index_map: dict) -> dict:
             "title": "", "x_label": "", "y_label": ""}
 
 
-def _build_table(result: dict, node_index_map: dict) -> list:
+def _build_table(result: dict, node_index_map: dict, params: Dict[str, Any]) -> list:
     """Return the most appropriate table list for the algorithm result."""
     algo = result.get("algorithm", "")
     if algo in {"pagerank", "hits", "rwr"}:
-        return make_top_nodes_table(result, node_index_map)
+        # Always compute a sufficiently large top-K payload; the UI can slice.
+        return make_top_nodes_table(result, node_index_map, top_k=200)
     if algo in {"louvain", "mcl"}:
         return make_cluster_table(result, node_index_map)
     if algo == "bfs":

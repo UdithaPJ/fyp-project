@@ -19,7 +19,7 @@ Why the graph must be undirected for Louvain
 --------------------------------------------
 Modularity Q is only defined for undirected graphs:
 
-    Q = (1 / 2m) · Σ_{i,j} ( A_{ij} − γ · k_i · k_j / 2m ) · δ(c_i, c_j)
+    Q = (1 / 2m) · Σ_{i,j} ( A_{ij} - γ · k_i · k_j / 2m ) · δ(c_i, c_j)
 
 The null model k_i·k_j / 2m assumes undirected degree.  For GRN / miRNA
 networks this module applies A ← A + Aᵀ internally (mutual edges keep
@@ -84,7 +84,7 @@ block_size   (int,   default 256)   CUDA block dimension.
 #   count_community_edges      — Phase 2: edge-parallel mapping
 #                                (u, v, w) → (comm[u], comm[v], w).
 #   compute_modularity_partial — Final Q: per-block partial sums of
-#                                A_{ij} − γ·k_i·k_j/(2m) over same-
+#                                A_{ij} - γ·k_i·k_j/(2m) over same-
 #                                community edges.
 #
 # Phase 2 sort + reduce now runs on the GPU.  CuPy path (preferred):

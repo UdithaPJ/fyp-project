@@ -24,23 +24,65 @@ function interpolateColor(t) {
   return `rgb(${r}, ${g}, ${b})`;
 }
 
-function ChartView({ chartData }) {
+function makeBfsHistogramChart(rawResult) {
+  const inner = rawResult?.result || {};
+  const distances = inner.distances || [];
+  if (!Array.isArray(distances) || distances.length === 0) return null;
+
+  const reachable = distances
+    .map((d) => Number(d))
+    .filter((d) => Number.isFinite(d) && d >= 0);
+  if (reachable.length === 0) return null;
+
+  const maxD = Math.max(...reachable);
+  const counts = new Array(maxD + 1).fill(0);
+  for (const d of reachable) {
+    counts[d] += 1;
+  }
+
+  return {
+    chart_type: "bar",
+    labels: counts.map((_, i) => String(i)),
+    values: counts,
+    title: "Distance distribution (BFS)",
+    x_label: "Number of nodes",
+    y_label: "Distance level",
+  };
+}
+
+function ChartView({ algorithmName, chartData, rawResult }) {
+  const derivedChart = useMemo(() => {
+    if (algorithmName !== "bfs") return null;
+    return makeBfsHistogramChart(rawResult);
+  }, [algorithmName, rawResult]);
+
+  const effectiveChart = chartData && chartData.chart_type !== "none"
+    ? chartData
+    : derivedChart;
+
   const isUnsupported =
-    !chartData ||
-    chartData.unsupported ||
-    chartData.chart_type === "none" ||
-    !Array.isArray(chartData.labels) ||
-    chartData.labels.length === 0;
+    !effectiveChart ||
+    effectiveChart.unsupported ||
+    effectiveChart.chart_type === "none" ||
+    !Array.isArray(effectiveChart.labels) ||
+    effectiveChart.labels.length === 0;
 
   const bars = useMemo(() => {
     if (isUnsupported) return [];
-    const pairs = (chartData.labels || []).map((label, i) => ({
+    const pairs = (effectiveChart.labels || []).map((label, i) => ({
       label,
-      value: Number(chartData.values?.[i] ?? 0),
+      value: Number(effectiveChart.values?.[i] ?? 0),
+      value2: Array.isArray(effectiveChart.series_auth)
+        ? Number(effectiveChart.series_auth?.[i] ?? 0)
+        : null,
     }));
-    pairs.sort((a, b) => b.value - a.value);
+    if (algorithmName === "bfs") {
+      pairs.sort((a, b) => Number(a.label) - Number(b.label));
+    } else {
+      pairs.sort((a, b) => b.value - a.value);
+    }
     return pairs.slice(0, MAX_BARS);
-  }, [chartData, isUnsupported]);
+  }, [effectiveChart, isUnsupported, algorithmName]);
 
   if (isUnsupported) {
     return (
@@ -50,13 +92,37 @@ function ChartView({ chartData }) {
     );
   }
 
-  const maxValue = Math.max(...bars.map((b) => b.value), 1e-9);
+  const hasSecondSeries = bars.some((b) => b.value2 !== null);
+
+  const maxValue = Math.max(
+    ...bars.map((b) => Math.max(b.value, b.value2 ?? 0)),
+    1e-9,
+  );
   const totalHeight = bars.length * (ROW_HEIGHT + ROW_GAP) + 60;
   const heightStr = `${Math.max(CHART_HEIGHT, totalHeight)}px`;
 
+  const series1Label = effectiveChart?.y_label || "Score";
+  const series2Label = "Authority score";
+  const series2Color = "#d95f43";
+
   return (
     <div className="chart-view-wrap">
-      {chartData.title ? <h3 className="chart-title">{chartData.title}</h3> : null}
+      {effectiveChart.title ? (
+        <h3 className="chart-title">{effectiveChart.title}</h3>
+      ) : null}
+
+      {hasSecondSeries ? (
+        <div className="chart-legend" role="list" aria-label="Chart legend">
+          <span className="chart-legend-item" role="listitem">
+            <span className="chart-legend-swatch" style={{ background: interpolateColor(0.7) }} />
+            {series1Label}
+          </span>
+          <span className="chart-legend-item" role="listitem">
+            <span className="chart-legend-swatch" style={{ background: series2Color }} />
+            {series2Label}
+          </span>
+        </div>
+      ) : null}
 
       <div className="chart-svg-wrap" style={{ height: heightStr }}>
         <svg
@@ -67,7 +133,7 @@ function ChartView({ chartData }) {
           xmlns="http://www.w3.org/2000/svg"
         >
           {/* Y-axis label (rotated) */}
-          {chartData.y_label ? (
+          {effectiveChart.y_label ? (
             <text
               fill="#4f6678"
               fontSize="13"
@@ -76,7 +142,7 @@ function ChartView({ chartData }) {
               x="14"
               y="200"
             >
-              {chartData.y_label}
+              {effectiveChart.y_label}
             </text>
           ) : null}
 
@@ -87,6 +153,11 @@ function ChartView({ chartData }) {
             const fill = interpolateColor(t);
             const widthPct = (bar.value / maxValue);
             const barW = (1000 - LEFT_LABEL_WIDTH - RIGHT_PADDING) * widthPct;
+            const bar2W = bar.value2 !== null
+              ? (1000 - LEFT_LABEL_WIDTH - RIGHT_PADDING) * ((bar.value2 || 0) / maxValue)
+              : 0;
+
+            const subH = hasSecondSeries ? (ROW_HEIGHT - 4) / 2 : ROW_HEIGHT;
             return (
               <g key={`${bar.label}-${i}`}>
                 <text
@@ -99,32 +170,61 @@ function ChartView({ chartData }) {
                 >
                   {bar.label}
                 </text>
+
+                {/* Series 1 */}
                 <rect
                   fill={fill}
-                  height={ROW_HEIGHT}
+                  height={subH}
                   rx="4"
                   ry="4"
                   width={barW}
                   x={LEFT_LABEL_WIDTH}
-                  y={y}
+                  y={y + (hasSecondSeries ? 0 : 0)}
                 />
                 <text
                   dominantBaseline="middle"
                   fill="#1d2935"
                   fontSize="11"
                   x={LEFT_LABEL_WIDTH + barW + 6}
-                  y={y + ROW_HEIGHT / 2}
+                  y={y + (hasSecondSeries ? subH / 2 : ROW_HEIGHT / 2)}
                 >
                   {Number.isInteger(bar.value)
                     ? bar.value.toLocaleString()
                     : bar.value.toFixed(4)}
                 </text>
+
+                {/* Series 2 (HITS authority) */}
+                {hasSecondSeries ? (
+                  <>
+                    <rect
+                      fill={series2Color}
+                      height={subH}
+                      rx="4"
+                      ry="4"
+                      width={bar2W}
+                      x={LEFT_LABEL_WIDTH}
+                      y={y + subH + 4}
+                      opacity="0.9"
+                    />
+                    <text
+                      dominantBaseline="middle"
+                      fill="#1d2935"
+                      fontSize="11"
+                      x={LEFT_LABEL_WIDTH + bar2W + 6}
+                      y={y + subH + 4 + subH / 2}
+                    >
+                      {Number.isInteger(bar.value2 || 0)
+                        ? Number(bar.value2 || 0).toLocaleString()
+                        : Number(bar.value2 || 0).toFixed(4)}
+                    </text>
+                  </>
+                ) : null}
               </g>
             );
           })}
 
           {/* X-axis label */}
-          {chartData.x_label ? (
+          {effectiveChart.x_label ? (
             <text
               fill="#4f6678"
               fontSize="13"
@@ -132,7 +232,7 @@ function ChartView({ chartData }) {
               x={(1000 + LEFT_LABEL_WIDTH) / 2}
               y={Math.max(CHART_HEIGHT, totalHeight) - 6}
             >
-              {chartData.x_label}
+              {effectiveChart.x_label}
             </text>
           ) : null}
         </svg>

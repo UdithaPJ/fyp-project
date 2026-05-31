@@ -28,7 +28,7 @@ Parameter Guide
 source     (int, default 0)   Index of the source TF node.
 max_depth  (int, default 5)   Maximum BFS depth.  Cascade beyond this depth is
                               truncated (nodes at depth > max_depth are left
-                              unreachable, distance = −1).
+                              unreachable, distance = -1).
 block_size (int, default 256) GPU thread block size (push kernel).
 """
 

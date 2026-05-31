@@ -107,7 +107,6 @@ function GraphView({ graph }) {
     cy.on("tap", "node", (event) => {
       cy.nodes().removeClass("is-active");
       event.target.addClass("is-active");
-      console.log("Graph node clicked:", event.target.id());
     });
     cy.on("tap", (event) => {
       if (event.target === cy) {
