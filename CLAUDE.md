@@ -19,6 +19,16 @@ src/algorithms/gpu/cuda_optimized/          ← used by webapp and GPU benchmark
   (_cpu_single, _cpu_multi, _gpu). These are the primary
   contribution of the project.
 
+src/algorithms/gpu/basic/                   ← used exclusively for benchmarking
+  GPU baseline implementations.  Backend priority:
+    1. cuGraph  (RAPIDS, preferred)
+    2. CuPy     (sparse-matrix fallback)
+    3. RuntimeError if neither is installed (never falls back to CPU)
+  Naming:  <algo>_gpu_baseline(graph_csr, params)
+  Mode:    gpu_baseline
+  Purpose: comparison baseline for the cuda_optimized implementations.
+  Never imported by the web application.
+
 src/algorithms/cpu/single_threaded/         ← used by CPU benchmarking only
   Single-threaded CPU implementations (cpu_single only). No _gpu function.
   Never imported by webapp code.
@@ -1018,6 +1028,128 @@ Does NOT silently fall back to CPU — raises `RuntimeError` /
   `src.algorithms.cpu.multi_threaded.rwr`) selected by the runner.
 Target: adaptive (RTX 20-series Turing by default), `BLOCK_SIZE = 256`,
   `MAX_BATCH = 4`, `SMEM_P_LIMIT = 4096`.
+
+---
+
+## GPU baseline implementations (`src/algorithms/gpu/basic/`)
+
+Deliberately simple GPU reference implementations used as a benchmark
+counterweight to the heavily tuned `cuda_optimized` package.  Six files,
+one per algorithm, plus a shared `_utils.py`:
+
+```
+src/algorithms/gpu/basic/_utils.py
+src/algorithms/gpu/basic/pagerank.py
+src/algorithms/gpu/basic/bfs.py
+src/algorithms/gpu/basic/hits.py
+src/algorithms/gpu/basic/louvain.py
+src/algorithms/gpu/basic/rwr.py
+src/algorithms/gpu/basic/mcl.py
+```
+
+### Naming
+Each module exposes one top-level function:
+```python
+<algorithm>_gpu_baseline(graph_csr: sp.csr_matrix, params: dict) -> dict
+```
+The function returns the standard 7-key envelope with `mode="gpu_baseline"`
+and inner-result keys that **exactly match** the corresponding
+`cuda_optimized` per-network-type schema (verified by
+`tests/test_gpu_baseline.py::test_*_baseline_schema`).  All baselines
+additionally include an additive `result["result"]["backend"]` key whose
+value is `"cugraph"` or `"cupy"` for benchmarking provenance.
+
+### Backend selection (per-module, in this priority order)
+1. **cuGraph** (preferred) — chosen at runtime via
+   `cugraph_function(<api_name>)`.  The presence of every cuGraph API is
+   re-checked at call time so the baseline never relies on documentation
+   assumptions about a specific RAPIDS release.  Signatures are inspected
+   via `inspect.signature` and only accepted kwargs are forwarded.
+   Return columns are extracted by `cugraph_extract_column(df, candidates)`
+   which accepts the first matching name from a candidate list (e.g.
+   `["pagerank", "score", "scores"]`) so column renames between releases
+   degrade gracefully.
+2. **CuPy sparse** (fallback) — power iteration / SpMV / matrix powers
+   using `cupy` and `cupyx.scipy.sparse`.  No custom kernels.
+3. **RuntimeError** — raised when neither backend is importable; baselines
+   never silently fall back to CPU.
+
+### Per-algorithm baseline strategy
+| Algorithm | cuGraph API used | CuPy fallback |
+|-----------|------------------|---------------|
+| pagerank  | `cugraph.pagerank`              | power iteration with dangling redistribution (network-type aware) |
+| bfs       | `cugraph.bfs`                   | iterative SpMV frontier expansion on a bitmask |
+| hits      | `cugraph.hits`                  | power iteration on A and A^T with L2 normalization |
+| louvain   | `cugraph.louvain`               | scipy connected-components labelling (degraded fallback — see note) |
+| rwr       | `cugraph.personalized_pagerank` | power iteration with restart vector |
+| mcl       | none (cuGraph has no MCL)       | sparse matrix powers + inflation + threshold pruning |
+
+The Louvain fallback is intentionally crude (weakly-connected components
+seeded label set).  A real GPU Louvain without custom kernels would
+either replicate the optimized implementation or run slower than NetworkX
+on CPU.  The schema is preserved so result-shape comparisons against
+`cuda_optimized` still work even when cuGraph is absent.
+
+### Result envelope and mode
+```python
+{
+  "algorithm":      str,           # "pagerank" | ... | "mcl"
+  "mode":           "gpu_baseline",
+  "network_type":   str,           # "grn" | "ppi" | "mirna"
+  "execution_time": float,
+  "num_nodes":      int,
+  "num_edges":      int,
+  "result":         { ...inner keys identical to cuda_optimized...,
+                      "backend": "cugraph" | "cupy" },
+}
+```
+
+The mode literal `"gpu_baseline"` is added to:
+* `src/algorithms/base.py::VALID_MODES` — extended tuple.
+* `src/algorithms/base.py::AlgorithmBase.gpu_baseline()` — stub raising
+  `NotImplementedError` by default; the adapter overrides it.
+* `src/algorithms/__init__.py::_make_adapter` — lazily imports
+  `src.algorithms.gpu.basic.<name>` on first call and binds the module
+  function as the adapter's `gpu_baseline` staticmethod.
+* `src/runner/algorithm_runner.py::run_algorithm` — mode whitelist
+  accepts `gpu_baseline`; `BenchmarkTimer` treats it as a GPU-class
+  mode (CUDA-event timing when available); `_cuda_context_guard` pushes
+  the primary context exactly as it does for `gpu`.
+
+### RAPIDS environment probe
+A standalone diagnostic script lives at `scripts/rapids_probe.py`.  Run
+on the Linux GPU box where benchmarking takes place:
+```
+python scripts/rapids_probe.py            # human-readable
+python scripts/rapids_probe.py --json     # JSON for archiving
+```
+It reports installed versions, available cuGraph functions, their
+parameter names, and the column names each function returns on a tiny
+test graph — used to verify that the baseline's runtime API probing is
+finding what it expects.
+
+### Tests
+`tests/test_gpu_baseline.py` covers:
+* Outer envelope structure (backend-independent).
+* Inner-key parity with cuda_optimized for every algorithm × network
+  type (skipped when no backend is present).
+* Execution-time recording.
+* Algorithm-runner integration with `mode="gpu_baseline"`.
+* Fallback behaviour: `RuntimeError` when neither cuGraph nor CuPy is
+  available.
+* Adapter sanity: every entry in `ALGORITHM_REGISTRY` exposes a
+  `gpu_baseline` staticmethod.
+
+### Rules
+- **Never** add custom kernels, PyCUDA, warp primitives, SMEM tricks,
+  graph reordering, hybrid push/pull, chunking, or memory-aware
+  execution to `src/algorithms/gpu/basic/`.  Those belong exclusively
+  to `src/algorithms/gpu/cuda_optimized/`.
+- **Never** import the baseline modules from the web application.
+  The webapp's `gpu` mode always uses `cuda_optimized`.
+- **Never** hardcode a cuGraph API signature from documentation —
+  use `cugraph_function(name)` + `inspect.signature` to detect at
+  runtime.
 
 ---
 

@@ -80,10 +80,10 @@ if not _CUDA_AVAILABLE:
 
 def _needs_pycuda_context(algorithm_name: str, mode: str) -> bool:
     """Return True if this run should ensure a PyCUDA context is current."""
-    if mode != "gpu":
+    if mode not in ("gpu", "gpu_baseline"):
         return False
-    # BFS is implemented with raw PyCUDA kernels.
-    if algorithm_name == "bfs":
+    # BFS is implemented with raw PyCUDA kernels (optimized mode only).
+    if mode == "gpu" and algorithm_name == "bfs":
         return True
     # If the timer backend is PyCUDA, we also need a current context.
     return _GPU_TIMER_BACKEND == "pycuda"
@@ -123,7 +123,7 @@ def _cuda_context_guard(algorithm_name: str, mode: str):
     # Ensure CuPy's primary context is current in this thread (no-op if already).
     # Do this AFTER any PyCUDA primary-context push so CuPy events/streams
     # are guaranteed to bind to the same primary context.
-    if mode == "gpu" and _cp is not None:
+    if mode in ("gpu", "gpu_baseline") and _cp is not None:
         try:
             _cp.cuda.Device(0).use()
         except Exception:
@@ -156,7 +156,7 @@ class BenchmarkTimer:
         self._evt_end = None
 
     def __enter__(self) -> "BenchmarkTimer":
-        if self.mode == "gpu" and _CUDA_AVAILABLE:
+        if self.mode in ("gpu", "gpu_baseline") and _CUDA_AVAILABLE:
             if _GPU_TIMER_BACKEND == "cupy":
                 self._evt_start = _cp.cuda.Event()
                 self._evt_end   = _cp.cuda.Event()
@@ -170,7 +170,7 @@ class BenchmarkTimer:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
-        if self.mode == "gpu" and _CUDA_AVAILABLE:
+        if self.mode in ("gpu", "gpu_baseline") and _CUDA_AVAILABLE:
             self._evt_end.record()
             if _GPU_TIMER_BACKEND == "cupy":
                 self._evt_end.synchronize()
@@ -278,8 +278,11 @@ def run_algorithm(
         ``{label: index}`` mapping used to attach human-readable node names
         to result fields like ``top_regulators``.
     mode : str
-        ``"cpu_single"``, ``"cpu_multi"``, or ``"gpu"``.  GPU mode falls
-        back to ``cpu_single`` (with a warning) if no CUDA device is present.
+        ``"cpu_single"``, ``"cpu_multi"``, ``"gpu"``, or ``"gpu_baseline"``.
+        ``gpu`` runs the heavily optimized cuda_optimized implementation;
+        ``gpu_baseline`` runs the simple cuGraph / CuPy baseline used as a
+        benchmark reference.  GPU mode falls back to ``cpu_single`` (with
+        a warning) if no CUDA device is present.
     params : dict, optional
         User-supplied algorithm parameters.  Merged on top of the GPU-tuned
         recommended defaults.
@@ -299,11 +302,11 @@ def run_algorithm(
             f"Available: {sorted(ALGORITHM_REGISTRY.keys())}"
         )
 
-    if mode not in ("cpu_single", "cpu_multi", "gpu"):
+    if mode not in ("cpu_single", "cpu_multi", "gpu", "gpu_baseline"):
         reporter.error(f"Invalid mode '{mode}'")
         raise ValueError(
             f"Invalid mode '{mode}'.  "
-            f"Must be one of: cpu_single, cpu_multi, gpu"
+            f"Must be one of: cpu_single, cpu_multi, gpu, gpu_baseline"
         )
 
     # ---- 2. GPU configuration (hardware-aware param tuning) ----

@@ -49,7 +49,7 @@ REQUIRED_RESULT_KEYS = (
     "result",
 )
 
-VALID_MODES = ("cpu_single", "cpu_multi", "gpu")
+VALID_MODES = ("cpu_single", "cpu_multi", "gpu", "gpu_baseline")
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +85,10 @@ class AlgorithmBase(ABC):
     @staticmethod
     def gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
         raise NotImplementedError("gpu() not implemented")
+
+    @staticmethod
+    def gpu_baseline(graph_csr: sp.csr_matrix, params: dict) -> dict:
+        raise NotImplementedError("gpu_baseline() not implemented")
 
     # ---- Parameter handling ----
 

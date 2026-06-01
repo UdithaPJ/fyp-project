@@ -46,6 +46,7 @@ in ``src/algorithms/cpu/`` and are never used by the webapp.
 from __future__ import annotations
 
 import importlib
+import logging
 
 import scipy.sparse as sp
 
@@ -97,10 +98,14 @@ _ALGO_META: list[tuple[str, str, str]] = [
 def _make_adapter(name: str, module_path: str, description: str) -> type[AlgorithmBase]:
     """
     Create an AlgorithmBase subclass that delegates ``gpu()`` to the
-    corresponding cuda_optimized module's ``_gpu()`` function.
+    corresponding cuda_optimized module's ``_gpu()`` function and
+    ``gpu_baseline()`` to the matching module in
+    ``src/algorithms/gpu/basic/``.
 
-    The module is imported eagerly so import errors surface at startup
-    rather than silently at runtime.
+    The cuda_optimized module is imported eagerly so import errors surface
+    at startup.  The baseline module is imported lazily inside the adapter
+    so a missing RAPIDS/CuPy installation does not break the registry at
+    import time — only at ``gpu_baseline()`` call time.
     """
     mod = importlib.import_module(module_path)
     defaults: dict = dict(getattr(mod, "_DEFAULT_PARAMS", {}))
@@ -137,6 +142,39 @@ def _make_adapter(name: str, module_path: str, description: str) -> type[Algorit
             "result":         result_data,
         }
 
+    # ---- Baseline (gpu_baseline) adapter ----
+    # Imported lazily so a missing cuGraph / CuPy install does not break
+    # the registry at module-import time.  Only fails when the user
+    # actually calls run_algorithm(..., mode="gpu_baseline").
+    baseline_module_path = f"src.algorithms.gpu.basic.{name}"
+    baseline_fn_name     = f"{name}_gpu_baseline"
+
+    def _gpu_baseline_staticmethod(graph_csr: sp.csr_matrix, params: dict) -> dict:
+        try:
+            baseline_mod = importlib.import_module(baseline_module_path)
+        except ImportError as exc:
+            raise RuntimeError(
+                f"gpu_baseline implementation for '{name}' is not "
+                f"available: cannot import {baseline_module_path} ({exc})."
+            ) from exc
+        fn = getattr(baseline_mod, baseline_fn_name, None)
+        if fn is None:
+            raise RuntimeError(
+                f"Module {baseline_module_path} does not expose "
+                f"{baseline_fn_name}(graph_csr, params)."
+            )
+        result_data = fn(graph_csr, params)
+        if _looks_like_standard_result(result_data):
+            return result_data
+        return {
+            "algorithm":      name,
+            "mode":           "gpu_baseline",
+            "execution_time": 0.0,
+            "num_nodes":      int(graph_csr.shape[0]),
+            "num_edges":      int(graph_csr.nnz),
+            "result":         result_data,
+        }
+
     cls: type[AlgorithmBase] = type(
         name.upper(),
         (AlgorithmBase,),
@@ -145,6 +183,7 @@ def _make_adapter(name: str, module_path: str, description: str) -> type[Algorit
             "NAME":         name,
             "PARAM_SCHEMA": defaults,
             "gpu":          staticmethod(_gpu_staticmethod),
+            "gpu_baseline": staticmethod(_gpu_baseline_staticmethod),
         },
     )
     return cls
