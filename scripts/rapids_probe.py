@@ -27,7 +27,7 @@ import inspect
 import json
 import sys
 from typing import Any
-
+from importlib.metadata import version
 
 PROBE_FUNCTIONS = [
     "pagerank",
@@ -40,10 +40,13 @@ PROBE_FUNCTIONS = [
 
 def _version(modname: str) -> str:
     try:
-        m = importlib.import_module(modname)
-        return str(getattr(m, "__version__", "?"))
-    except Exception as exc:                                # noqa: BLE001
-        return f"NOT INSTALLED ({type(exc).__name__})"
+        return version(modname)
+    except Exception:
+        try:
+            m = importlib.import_module(modname)
+            return str(getattr(m, "__version__", "?"))
+        except Exception as exc:
+            return f"NOT INSTALLED ({type(exc).__name__})"
 
 
 def _probe_cugraph_function(name: str) -> dict:
