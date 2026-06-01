@@ -1,0 +1,105 @@
+{
+  "python": "3.12.3",
+  "versions": {
+    "cugraph": "26.04.000",
+    "cudf": "26.04.000",
+    "cupy": "14.1.1",
+    "numpy": "2.4.6",
+    "scipy": "1.17.1",
+    "pycuda": "2026.1"
+  },
+  "device": {
+    "device_count": 1,
+    "device_0": {
+      "name": "NVIDIA GeForce RTX 2060",
+      "compute_capability": [
+        7,
+        5
+      ],
+      "total_mem_mb": 5730
+    }
+  },
+  "cugraph_functions": [
+    {
+      "name": "pagerank",
+      "exists": true,
+      "signature": "(G: cugraph.structure.graph_classes.Graph, alpha=0.85, personalization=None, precomputed_vertex_out_weight=None, max_iter=100, tol=1e-05, nstart=None, dangling=None, fail_on_nonconvergence=True) -> cudf.core.dataframe.DataFrame",
+      "param_names": [
+        "G",
+        "alpha",
+        "personalization",
+        "precomputed_vertex_out_weight",
+        "max_iter",
+        "tol",
+        "nstart",
+        "dangling",
+        "fail_on_nonconvergence"
+      ],
+      "return_type": "DataFrame",
+      "returned_columns": [
+        "vertex",
+        "pagerank"
+      ]
+    },
+    {
+      "name": "personalized_pagerank",
+      "exists": false
+    },
+    {
+      "name": "bfs",
+      "exists": true,
+      "signature": "(G, start=None, depth_limit=None, i_start=None, directed=None, return_predecessors=True)",
+      "param_names": [
+        "G",
+        "start",
+        "depth_limit",
+        "i_start",
+        "directed",
+        "return_predecessors"
+      ],
+      "return_type": "DataFrame",
+      "returned_columns": [
+        "vertex",
+        "distance",
+        "predecessor"
+      ]
+    },
+    {
+      "name": "hits",
+      "exists": true,
+      "signature": "(G: cugraph.structure.graph_classes.Graph, max_iter=100, tol=1e-05, nstart=None, normalized=True) -> cudf.core.dataframe.DataFrame",
+      "param_names": [
+        "G",
+        "max_iter",
+        "tol",
+        "nstart",
+        "normalized"
+      ],
+      "return_type": "DataFrame",
+      "returned_columns": [
+        "vertex",
+        "hubs",
+        "authorities"
+      ]
+    },
+    {
+      "name": "louvain",
+      "exists": true,
+      "signature": "(G: cugraph.structure.graph_classes.Graph, max_level: Optional[int] = None, max_iter: Optional[int] = None, resolution: float = 1.0, threshold: float = 1e-07) -> Tuple[cudf.core.dataframe.DataFrame, float]",
+      "param_names": [
+        "G",
+        "max_level",
+        "max_iter",
+        "resolution",
+        "threshold"
+      ],
+      "return_type": "tuple[DataFrame, float]",
+      "tuple_length": 2,
+      "returned_columns": [
+        "vertex",
+        "partition"
+      ],
+      "second_value": "0.0"
+    }
+  ]
+}

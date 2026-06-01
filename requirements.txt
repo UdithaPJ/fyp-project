@@ -1,3 +1,5 @@
+--extra-index-url=https://pypi.nvidia.com
+
 # =============================================================================
 # FYP Unified Project — Requirements
 # All processing is local; no cloud dependencies.
@@ -14,7 +16,6 @@ openpyxl
 numpy
 scipy
 networkx
-cugraph
 
 # -- GPU Acceleration (optional — requires CUDA-capable NVIDIA GPU) -----------
 # Install the variant matching your CUDA version, e.g.:
@@ -22,12 +23,15 @@ cugraph
 #   pip install cupy-cuda12x   (CUDA 12.x)
 # cupy-cuda11x
 pycuda
-cupy-cuda13x
+cupy-cuda12x
+cugraph-cu12
 # pycuda
 
 # -- Visualization ------------------------------------------------------------
 matplotlib
 seaborn
+
+pytest
 
 # -- Frontend Build -----------------------------------------------------------
 # The React/Vite frontend lives in webapp/frontend/.
