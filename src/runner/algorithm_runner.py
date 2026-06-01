@@ -331,6 +331,26 @@ def run_algorithm(
         with _cuda_context_guard(algorithm_name, mode):
             with BenchmarkTimer(mode) as timer:
                 result = mode_fn(graph_csr, final_params)
+    except ImportError as exc:
+        # gpu_baseline algorithms hard-fail with ImportError when their
+        # required backend (cuGraph for 5 algorithms, CuPy for MCL) is
+        # not installed.  Convert to RuntimeError with install instructions
+        # so the caller always sees RuntimeError from the runner.
+        if mode == "gpu_baseline":
+            reporter.error(
+                f"{algorithm_name}.{mode} backend not installed: {exc}"
+            )
+            raise RuntimeError(
+                f"{algorithm_name}_gpu_baseline requires RAPIDS (cuGraph + "
+                f"cuDF) for cuGraph algorithms, or CuPy for MCL.  "
+                f"Install RAPIDS via:\n"
+                f"  conda install -c rapidsai -c nvidia -c conda-forge "
+                f"rapids=24.02 python=3.10 cudatoolkit=11.8\n"
+                f"Original ImportError: {exc}"
+            ) from exc
+        reporter.error(f"{algorithm_name}.{mode} raised "
+                       f"{type(exc).__name__}: {exc}")
+        raise
     except Exception as exc:
         reporter.error(f"{algorithm_name}.{mode} raised "
                        f"{type(exc).__name__}: {exc}")
@@ -340,7 +360,13 @@ def run_algorithm(
     reporter.update(ProgressReporter.STAGE_PACKING, 80, "Packing results")
     if isinstance(result, dict):
         result["execution_time"] = float(timer.elapsed)
-        result["mode"] = mode   # GPU fallback to cpu_single overwrites this back
+        if mode == "gpu_baseline":
+            # Preserve the algorithm's backend-specific mode string
+            # ("gpu_baseline_cugraph" or "gpu_baseline_cupy") rather than
+            # overwriting with the generic "gpu_baseline".
+            pass
+        else:
+            result["mode"] = mode   # gpu fallback to cpu_single overwrites this back
 
     # ---- 6. Attach node labels to known index-containing fields ----
     result = _attach_labels(result, node_index_map)

@@ -4,11 +4,11 @@ src/algorithms/gpu/basic/hits.py
 
 HITS — GPU baseline implementation.
 
-Backends
---------
-    1. cuGraph ``cugraph.hits``  (preferred)
-    2. CuPy power iteration on A and A.T  (fallback)
-    3. RuntimeError                       (neither installed)
+Backend
+-------
+cuGraph ``cugraph.hits`` only.  Raises ``ImportError`` immediately on
+module import if cuGraph / cuDF (RAPIDS) are not installed.  There is
+no CuPy fallback — the benchmarking baseline must use the cuGraph path.
 
 Result keys (mirror src/algorithms/gpu/cuda_optimized/hits.py)
 -------------------------------------------------------------
@@ -19,19 +19,31 @@ Result keys (mirror src/algorithms/gpu/cuda_optimized/hits.py)
 
 from __future__ import annotations
 
-import logging
 import time
 from typing import Any
 
 import numpy as np
 import scipy.sparse as sp
 
+# Hard-fail: cuGraph + cuDF are required.
+try:
+    import cugraph   # noqa: F401
+    import cudf      # noqa: F401
+except ImportError as _e:
+    raise ImportError(
+        "src/algorithms/gpu/basic/hits.py requires cuGraph and cuDF "
+        "(RAPIDS).  Install via:\n"
+        "  conda install -c rapidsai -c nvidia -c conda-forge "
+        "rapids=24.02 python=3.10 cudatoolkit=11.8\n"
+        f"Original error: {_e}"
+    ) from _e
+
 from ._utils import (
-    CUGRAPH_AVAILABLE, CUPY_AVAILABLE,
+    BASELINE_MODE_CUGRAPH,
     TOP_HITS,
     build_envelope, cugraph_build_graph, cugraph_extract_column,
-    cugraph_function, require_any_backend, symmetrize_for,
-    top_k_global, to_cupy_csr, cupy_get,
+    cugraph_function, symmetrize_for,
+    top_k_global,
 )
 
 
@@ -83,10 +95,9 @@ def _hits_cugraph(
 ) -> tuple[np.ndarray, np.ndarray, int, bool]:
     hits = cugraph_function("hits")
     if hits is None:
-        raise RuntimeError("cugraph.hits is not available.")
+        raise RuntimeError("cugraph.hits is not available in this RAPIDS version.")
 
     nt = str(params.get("network_type", "grn")).lower()
-    # PPI: symmetrize before handing to cuGraph (matches optimized version).
     csr_in = symmetrize_for(graph_csr, nt) if nt == "ppi" else graph_csr
     directed = nt != "ppi"
     G = cugraph_build_graph(csr_in, directed=directed, weighted=False)
@@ -98,9 +109,9 @@ def _hits_cugraph(
         accepted = set()
 
     kwargs: dict[str, Any] = {}
-    if "max_iter" in accepted: kwargs["max_iter"] = int(params["max_iter"])
-    if "tol"      in accepted: kwargs["tol"]      = float(params["tolerance"])
-    if "tolerance"in accepted: kwargs["tolerance"]= float(params["tolerance"])
+    if "max_iter"  in accepted: kwargs["max_iter"]  = int(params["max_iter"])
+    if "tol"       in accepted: kwargs["tol"]       = float(params["tolerance"])
+    if "tolerance" in accepted: kwargs["tolerance"] = float(params["tolerance"])
 
     df = hits(G, **kwargs)
     vertex = cugraph_extract_column(df, ["vertex", "node", "id"]).astype(np.int64)
@@ -116,91 +127,29 @@ def _hits_cugraph(
 
 
 # ---------------------------------------------------------------------------
-# CuPy fallback — power iteration on A and A.T
-# ---------------------------------------------------------------------------
-
-def _hits_cupy(
-    graph_csr: sp.csr_matrix, params: dict,
-) -> tuple[np.ndarray, np.ndarray, int, bool]:
-    import cupy as cp
-
-    n = int(graph_csr.shape[0])
-    if n == 0:
-        return np.zeros(0, np.float32), np.zeros(0, np.float32), 0, True
-
-    max_iter  = int(params["max_iter"])
-    tolerance = float(params["tolerance"])
-    nt = str(params.get("network_type", "grn")).lower()
-
-    A_cpu = symmetrize_for(graph_csr, nt) if nt == "ppi" else graph_csr.astype(np.float32)
-    A_gpu  = to_cupy_csr(A_cpu)
-    AT_gpu = to_cupy_csr(A_cpu.T.tocsr())
-
-    hub  = cp.full((n,), 1.0 / max(1, n) ** 0.5, dtype=cp.float32)
-    auth = cp.full((n,), 1.0 / max(1, n) ** 0.5, dtype=cp.float32)
-
-    converged = False
-    iterations = 0
-    for it in range(max_iter):
-        iterations = it + 1
-        # authority = A^T @ hub  (normalise by L2)
-        new_auth = AT_gpu.dot(hub)
-        nrm = float(cp.sqrt(cp.sum(new_auth * new_auth)).get())
-        if nrm > 0:
-            new_auth = new_auth / cp.float32(nrm)
-
-        # hub = A @ authority  (normalise by L2)
-        new_hub = A_gpu.dot(new_auth)
-        nrm = float(cp.sqrt(cp.sum(new_hub * new_hub)).get())
-        if nrm > 0:
-            new_hub = new_hub / cp.float32(nrm)
-
-        delta_h = float(cp.sum(cp.abs(new_hub  - hub )).get())
-        delta_a = float(cp.sum(cp.abs(new_auth - auth)).get())
-        hub, auth = new_hub, new_auth
-        if (delta_h + delta_a) < tolerance:
-            converged = True
-            break
-
-    return cupy_get(hub).astype(np.float32), cupy_get(auth).astype(np.float32), iterations, converged
-
-
-# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
 def hits_gpu_baseline(
     graph_csr: sp.csr_matrix, params: dict | None = None,
 ) -> dict:
-    """HITS — GPU baseline.  cuGraph preferred, CuPy power iteration fallback."""
-    require_any_backend("hits")
+    """HITS — GPU baseline (cuGraph only).
+
+    Returns
+    -------
+    dict
+        7-key standard result envelope; ``result["mode"]`` is
+        ``"gpu_baseline_cugraph"``.
+    """
     p = {**_DEFAULT_PARAMS, **(params or {})}
     network_type = str(p.get("network_type", "grn")).lower()
 
     t0 = time.perf_counter()
-    backend: str
-    if CUGRAPH_AVAILABLE and cugraph_function("hits") is not None:
-        try:
-            hub, auth, iters, converged = _hits_cugraph(graph_csr, p)
-            backend = "cugraph"
-        except Exception as exc:                            # noqa: BLE001
-            logging.warning(
-                "hits_gpu_baseline: cuGraph path failed (%s) — falling back "
-                "to CuPy.", exc,
-            )
-            if not CUPY_AVAILABLE:
-                raise
-            hub, auth, iters, converged = _hits_cupy(graph_csr, p)
-            backend = "cupy"
-    elif CUPY_AVAILABLE:
-        hub, auth, iters, converged = _hits_cupy(graph_csr, p)
-        backend = "cupy"
-    else:
-        raise RuntimeError("Unreachable — require_any_backend should have raised.")
+    hub, auth, iters, converged = _hits_cugraph(graph_csr, p)
     elapsed = time.perf_counter() - t0
 
     inner = _pack_result(hub, auth, iters, converged, network_type)
-    inner["backend"] = backend
+    inner["backend"] = "cugraph"
 
     return build_envelope(
         algorithm="hits",
@@ -208,4 +157,5 @@ def hits_gpu_baseline(
         execution_time=elapsed,
         graph_csr=graph_csr,
         inner=inner,
+        mode=BASELINE_MODE_CUGRAPH,
     )

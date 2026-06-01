@@ -20,12 +20,17 @@ src/algorithms/gpu/cuda_optimized/          ← used by webapp and GPU benchmark
   contribution of the project.
 
 src/algorithms/gpu/basic/                   ← used exclusively for benchmarking
-  GPU baseline implementations.  Backend priority:
-    1. cuGraph  (RAPIDS, preferred)
-    2. CuPy     (sparse-matrix fallback)
-    3. RuntimeError if neither is installed (never falls back to CPU)
+  GPU baseline implementations.  Hard-fail policy (no silent fallbacks):
+    pagerank, bfs, hits, louvain, rwr  → cuGraph (RAPIDS) only
+      ImportError at import time if cuGraph/cuDF absent.
+      result["mode"] = "gpu_baseline_cugraph"
+    mcl  → CuPy only (cuGraph has no MCL equivalent)
+      ImportError at import time if CuPy absent.
+      result["mode"] = "gpu_baseline_cupy"
+    Never falls back to CPU.  Never falls back from cuGraph to CuPy.
   Naming:  <algo>_gpu_baseline(graph_csr, params)
-  Mode:    gpu_baseline
+  Mode:    "gpu_baseline_cugraph" (cuGraph algos) | "gpu_baseline_cupy" (MCL)
+  Backend key: result["result"]["backend"] = "cugraph" | "cupy"
   Purpose: comparison baseline for the cuda_optimized implementations.
   Never imported by the web application.
 
@@ -1091,20 +1096,37 @@ on CPU.  The schema is preserved so result-shape comparisons against
 `cuda_optimized` still work even when cuGraph is absent.
 
 ### Result envelope and mode
+
+Mode strings reflect the actual backend used (not the generic `"gpu_baseline"`):
+
 ```python
+# cuGraph algorithms (pagerank, bfs, hits, louvain, rwr):
 {
-  "algorithm":      str,           # "pagerank" | ... | "mcl"
-  "mode":           "gpu_baseline",
-  "network_type":   str,           # "grn" | "ppi" | "mirna"
+  "algorithm":      str,                    # "pagerank" | "bfs" | "hits" | "louvain" | "rwr"
+  "mode":           "gpu_baseline_cugraph", # strict cuGraph-only
+  "network_type":   str,                    # "grn" | "ppi" | "mirna"
   "execution_time": float,
   "num_nodes":      int,
   "num_edges":      int,
   "result":         { ...inner keys identical to cuda_optimized...,
-                      "backend": "cugraph" | "cupy" },
+                      "backend": "cugraph" },
+}
+
+# MCL (CuPy — cuGraph has no MCL):
+{
+  "algorithm":      "mcl",
+  "mode":           "gpu_baseline_cupy",   # CuPy only
+  ...
+  "result":         { ..., "backend": "cupy" },
 }
 ```
 
-The mode literal `"gpu_baseline"` is added to:
+The runner whitelist accepts `"gpu_baseline"` as the requested mode.  The
+algorithm itself sets the specific mode string (`"gpu_baseline_cugraph"` or
+`"gpu_baseline_cupy"`), and the runner preserves it (does **not** overwrite
+with the generic `"gpu_baseline"`).
+
+The mode string `"gpu_baseline"` (generic) is wired to:
 * `src/algorithms/base.py::VALID_MODES` — extended tuple.
 * `src/algorithms/base.py::AlgorithmBase.gpu_baseline()` — stub raising
   `NotImplementedError` by default; the adapter overrides it.
@@ -1114,7 +1136,20 @@ The mode literal `"gpu_baseline"` is added to:
 * `src/runner/algorithm_runner.py::run_algorithm` — mode whitelist
   accepts `gpu_baseline`; `BenchmarkTimer` treats it as a GPU-class
   mode (CUDA-event timing when available); `_cuda_context_guard` pushes
-  the primary context exactly as it does for `gpu`.
+  the primary context exactly as it does for `gpu`.  An `ImportError`
+  from a missing backend is converted to `RuntimeError` with RAPIDS
+  install instructions.
+
+### Benchmarking consistency
+
+**Hard-fail policy (no silent CuPy fallback for cuGraph algorithms):**
+Each of pagerank, bfs, hits, louvain, rwr raises `ImportError` at module
+import time if cuGraph or cuDF is not installed.  This guarantees every
+benchmark result tagged `"gpu_baseline_cugraph"` actually used cuGraph.
+
+MCL uses CuPy (`"gpu_baseline_cupy"`) and does **not** import from
+`_utils.py` (which requires cuGraph), so it remains independently
+importable on a CuPy-only machine.
 
 ### RAPIDS environment probe
 A standalone diagnostic script lives at `scripts/rapids_probe.py`.  Run
@@ -1132,11 +1167,14 @@ finding what it expects.
 `tests/test_gpu_baseline.py` covers:
 * Outer envelope structure (backend-independent).
 * Inner-key parity with cuda_optimized for every algorithm × network
-  type (skipped when no backend is present).
+  type (skipped when cuGraph / CuPy not present).
+* `result["mode"]` is `"gpu_baseline_cugraph"` for cuGraph algorithms
+  and `"gpu_baseline_cupy"` for MCL.
+* `result["result"]["backend"]` is `"cugraph"` or `"cupy"`.
+* Hard-fail: importing a cuGraph algorithm without RAPIDS raises
+  `ImportError` with an install hint.
+* Runner converts `ImportError` to `RuntimeError` with RAPIDS instructions.
 * Execution-time recording.
-* Algorithm-runner integration with `mode="gpu_baseline"`.
-* Fallback behaviour: `RuntimeError` when neither cuGraph nor CuPy is
-  available.
 * Adapter sanity: every entry in `ALGORITHM_REGISTRY` exposes a
   `gpu_baseline` staticmethod.
 
@@ -1150,6 +1188,9 @@ finding what it expects.
 - **Never** hardcode a cuGraph API signature from documentation —
   use `cugraph_function(name)` + `inspect.signature` to detect at
   runtime.
+- **Never** add a CuPy fallback to a cuGraph algorithm file.  If the
+  cuGraph API is absent in the installed RAPIDS version, raise
+  `RuntimeError` — do not silently switch to CuPy.
 
 ---
 

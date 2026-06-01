@@ -4,25 +4,11 @@ src/algorithms/gpu/basic/louvain.py
 
 Louvain — GPU baseline implementation.
 
-Backends
---------
-    1. cuGraph ``cugraph.louvain``  (preferred — the only practical baseline)
-    2. CuPy fallback                — a simple connected-components-style
-                                      label-propagation pass, used purely so
-                                      benchmarks can still produce a result
-                                      dict with the correct schema when
-                                      cuGraph is missing.
-    3. RuntimeError                 — neither backend installed.
-
-Why such a simple CuPy fallback
--------------------------------
-Louvain is iterative and inherently irregular; a faithful GPU Louvain
-without custom kernels would either replicate the optimized implementation
-(violating the "baseline" rule) or be slower than CPU networkx.  The
-baseline therefore degrades gracefully: when cuGraph is present we use
-its native Louvain; otherwise we report communities via GPU label
-propagation seeded by connected components.  This preserves the schema
-and execution-time metric without competing with the optimized version.
+Backend
+-------
+cuGraph ``cugraph.louvain`` only.  Raises ``ImportError`` immediately on
+module import if cuGraph / cuDF (RAPIDS) are not installed.  There is
+no CuPy fallback — the benchmarking baseline must use the cuGraph path.
 
 Result keys (mirror src/algorithms/gpu/cuda_optimized/louvain.py)
 -----------------------------------------------------------------
@@ -32,19 +18,30 @@ Result keys (mirror src/algorithms/gpu/cuda_optimized/louvain.py)
 
 from __future__ import annotations
 
-import logging
 import time
 from typing import Any
 
 import numpy as np
 import scipy.sparse as sp
-import scipy.sparse.csgraph as csgraph
+
+# Hard-fail: cuGraph + cuDF are required.
+try:
+    import cugraph   # noqa: F401
+    import cudf      # noqa: F401
+except ImportError as _e:
+    raise ImportError(
+        "src/algorithms/gpu/basic/louvain.py requires cuGraph and cuDF "
+        "(RAPIDS).  Install via:\n"
+        "  conda install -c rapidsai -c nvidia -c conda-forge "
+        "rapids=24.02 python=3.10 cudatoolkit=11.8\n"
+        f"Original error: {_e}"
+    ) from _e
 
 from ._utils import (
-    CUGRAPH_AVAILABLE, CUPY_AVAILABLE,
+    BASELINE_MODE_CUGRAPH,
     LOUVAIN_TOP_COMMUNITIES,
     build_envelope, cugraph_build_graph, cugraph_extract_column,
-    cugraph_function, require_any_backend, symmetrize_for,
+    cugraph_function, symmetrize_for,
 )
 
 
@@ -57,28 +54,8 @@ _DEFAULT_PARAMS: dict = {
 
 
 # ---------------------------------------------------------------------------
-# Modularity (CPU, simple — used only for the CuPy fallback path).
+# Community helpers
 # ---------------------------------------------------------------------------
-
-def _modularity(adj: sp.csr_matrix, communities: np.ndarray) -> float:
-    """Compute Newman-Girvan modularity Q for an undirected graph."""
-    if adj.nnz == 0:
-        return 0.0
-    m2 = float(adj.sum())
-    if m2 <= 0:
-        return 0.0
-    degrees = np.asarray(adj.sum(axis=1)).flatten()
-    # Vectorized Q = (1/2m) * sum_{i,j in same community} (A_ij - k_i k_j / 2m)
-    coo = adj.tocoo()
-    same = communities[coo.row] == communities[coo.col]
-    edge_term = float(coo.data[same].sum())
-
-    unique, inv = np.unique(communities, return_inverse=True)
-    deg_sum_per_comm = np.bincount(inv, weights=degrees, minlength=len(unique))
-    deg_term = float(np.sum(deg_sum_per_comm ** 2)) / m2
-
-    return (edge_term - deg_term) / m2
-
 
 def _build_top_communities(
     communities: np.ndarray, k: int = LOUVAIN_TOP_COMMUNITIES,
@@ -93,7 +70,7 @@ def _build_top_communities(
         out.append({
             "community_id": cid,
             "size":         int(counts[idx]),
-            "member_nodes": [int(x) for x in members[: 50]],   # cap for payload
+            "member_nodes": [int(x) for x in members[:50]],
         })
     return out
 
@@ -107,11 +84,9 @@ def _louvain_cugraph(
 ) -> tuple[np.ndarray, float, str]:
     louvain = cugraph_function("louvain")
     if louvain is None:
-        raise RuntimeError("cugraph.louvain is not available.")
+        raise RuntimeError("cugraph.louvain is not available in this RAPIDS version.")
 
     nt = str(params.get("network_type", "grn")).lower()
-    # GRN / miRNA / PPI all run through cuGraph's undirected Louvain;
-    # we symmetrize the input first so the directed graphs become valid.
     A_sym = symmetrize_for(graph_csr, "grn") if nt != "ppi" else graph_csr
     G = cugraph_build_graph(A_sym, directed=False, weighted=True)
 
@@ -127,7 +102,6 @@ def _louvain_cugraph(
     if "max_level"  in accepted: kwargs["max_level"]  = int(params["max_levels"])
 
     res = louvain(G, **kwargs)
-    # cuGraph signature has been a 2-tuple (df, modularity) for many releases.
     if isinstance(res, tuple) and len(res) == 2:
         df, modularity_val = res
     else:
@@ -148,75 +122,25 @@ def _louvain_cugraph(
 
 
 # ---------------------------------------------------------------------------
-# CuPy fallback — connected-components label propagation
-# ---------------------------------------------------------------------------
-
-def _louvain_cupy(
-    graph_csr: sp.csr_matrix, params: dict,
-) -> tuple[np.ndarray, float, str]:
-    """Simple fallback partitioning when cuGraph is unavailable.
-
-    We use scipy's weakly-connected-components result (CPU) as the
-    "communities."  This is intentionally crude — the goal is only to
-    keep the result-schema valid and the timer measuring *something*
-    GPU-related (the matrix upload + a couple of CuPy reductions).
-    """
-    import cupy as cp
-
-    nt = str(params.get("network_type", "grn")).lower()
-    A_sym = symmetrize_for(graph_csr, nt)
-
-    # Tiny GPU step so the timer reflects real GPU work — sum degrees.
-    A_gpu_data = cp.asarray(A_sym.data, dtype=cp.float32)
-    _ = float(cp.sum(A_gpu_data).get())
-
-    n_components, labels = csgraph.connected_components(
-        A_sym, directed=False, connection="weak",
-    )
-    assignments = labels.astype(np.int64)
-    Q = _modularity(A_sym, assignments)
-
-    note = (
-        f"CuPy baseline fallback (no cuGraph): communities = weakly "
-        f"connected components.  {n_components} components, "
-        f"modularity={Q:.6f}.  Use cuGraph for a proper Louvain "
-        f"partition."
-    )
-    return assignments, float(Q), note
-
-
-# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
 def louvain_gpu_baseline(
     graph_csr: sp.csr_matrix, params: dict | None = None,
 ) -> dict:
-    """Louvain — GPU baseline.  cuGraph preferred, CuPy-CC fallback."""
-    require_any_backend("louvain")
+    """Louvain community detection — GPU baseline (cuGraph only).
+
+    Returns
+    -------
+    dict
+        7-key standard result envelope; ``result["mode"]`` is
+        ``"gpu_baseline_cugraph"``.
+    """
     p = {**_DEFAULT_PARAMS, **(params or {})}
     network_type = str(p.get("network_type", "grn")).lower()
 
     t0 = time.perf_counter()
-    backend: str
-    if CUGRAPH_AVAILABLE and cugraph_function("louvain") is not None:
-        try:
-            assignments, modularity_val, note = _louvain_cugraph(graph_csr, p)
-            backend = "cugraph"
-        except Exception as exc:                            # noqa: BLE001
-            logging.warning(
-                "louvain_gpu_baseline: cuGraph path failed (%s) — falling "
-                "back to CuPy-CC.", exc,
-            )
-            if not CUPY_AVAILABLE:
-                raise
-            assignments, modularity_val, note = _louvain_cupy(graph_csr, p)
-            backend = "cupy"
-    elif CUPY_AVAILABLE:
-        assignments, modularity_val, note = _louvain_cupy(graph_csr, p)
-        backend = "cupy"
-    else:
-        raise RuntimeError("Unreachable — require_any_backend should have raised.")
+    assignments, modularity_val, note = _louvain_cugraph(graph_csr, p)
     elapsed = time.perf_counter() - t0
 
     # Renumber to compact 0..K-1.
@@ -231,9 +155,9 @@ def louvain_gpu_baseline(
         "num_communities":       num_communities,
         "modularity":            float(modularity_val),
         "top_communities":       top_communities,
-        "hierarchy":             [],   # baseline does not track hierarchy
-        "note":                  f"{note}  Backend={backend}.",
-        "backend":               backend,
+        "hierarchy":             [],
+        "note":                  f"{note}  Backend=cugraph.",
+        "backend":               "cugraph",
     }
 
     return build_envelope(
@@ -242,4 +166,5 @@ def louvain_gpu_baseline(
         execution_time=elapsed,
         graph_csr=graph_csr,
         inner=inner,
+        mode=BASELINE_MODE_CUGRAPH,
     )

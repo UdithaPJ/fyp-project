@@ -4,15 +4,18 @@ src/algorithms/gpu/basic/mcl.py
 
 Markov Clustering — GPU baseline implementation.
 
-Backends
---------
-cuGraph has no native MCL routine in any released version, so the
-baseline is always CuPy-driven:
+Backend
+-------
+CuPy sparse matrix powers + element-wise inflation.  Raises
+``ImportError`` immediately on module import if CuPy is not installed.
 
-    1. CuPy sparse matrix powers + element-wise inflation  (fallback path)
-    2. RuntimeError                                        (CuPy missing)
+cuGraph has no native MCL routine in any released version, so CuPy is
+the correct and only GPU baseline for MCL.  This module deliberately
+does NOT import from ``_utils.py`` so that it remains independently
+importable on a CuPy-only installation (``_utils.py`` requires
+cuGraph).
 
-This is the simplest correct MCL: it stays on the GPU via CuPy's sparse
+This is a simple correct MCL: it stays on the GPU via CuPy's sparse
 linear algebra without any custom kernels.  It is deliberately less
 sophisticated than the optimized implementation in
 ``src/algorithms/gpu/cuda_optimized/mcl.py`` (which uses hash SpGEMM,
@@ -33,10 +36,59 @@ import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.csgraph as csgraph
 
-from ._utils import (
-    CUPY_AVAILABLE,
-    build_envelope, require_any_backend, symmetrize_for,
-)
+# Hard-fail: CuPy is required for MCL.  cuGraph has no MCL equivalent.
+try:
+    import cupy as cp                         # noqa: F401
+    import cupyx.scipy.sparse as cpsp         # noqa: F401
+except ImportError as _e:
+    raise ImportError(
+        "src/algorithms/gpu/basic/mcl.py requires CuPy "
+        "(cuGraph has no MCL equivalent).  Install via:\n"
+        "  pip install cupy-cuda12x   # or cupy-cuda11x\n"
+        f"Original error: {_e}"
+    ) from _e
+
+
+# ---------------------------------------------------------------------------
+# Mode identifier (does not import from _utils to avoid cuGraph dependency)
+# ---------------------------------------------------------------------------
+
+_BASELINE_MODE_CUPY: str = "gpu_baseline_cupy"
+
+
+# ---------------------------------------------------------------------------
+# Inlined helpers (copied from _utils to avoid cuGraph dependency)
+# ---------------------------------------------------------------------------
+
+def _build_envelope(
+    *,
+    algorithm: str,
+    network_type: str,
+    execution_time: float,
+    graph_csr: sp.csr_matrix,
+    inner: dict,
+) -> dict:
+    """Assemble the standard 7-key result dict for the MCL CuPy baseline."""
+    return {
+        "algorithm":      algorithm,
+        "mode":           _BASELINE_MODE_CUPY,
+        "network_type":   network_type,
+        "execution_time": float(execution_time),
+        "num_nodes":      int(graph_csr.shape[0]),
+        "num_edges":      int(graph_csr.nnz),
+        "result":         inner,
+    }
+
+
+def _symmetrize_for(graph_csr: sp.csr_matrix, network_type: str) -> sp.csr_matrix:
+    """Network-type-aware undirected conversion (GRN/miRNA → binarise A+Aᵀ)."""
+    nt = str(network_type).lower()
+    if nt == "ppi":
+        return graph_csr.astype(np.float32).tocsr()
+    A = (graph_csr + graph_csr.T).astype(np.float32)
+    if A.nnz > 0:
+        A.data = np.ones_like(A.data, dtype=np.float32)
+    return A.tocsr()
 
 
 _DEFAULT_PARAMS: dict = {
@@ -106,8 +158,8 @@ def _mcl_cupy(
     Overflow is reported but never re-raised: the baseline favours
     correctness of the schema over raw speed.
     """
-    import cupy as cp
-    import cupyx.scipy.sparse as cpsp
+    import cupy as _cp
+    import cupyx.scipy.sparse as _cpsp
 
     n = int(graph_csr.shape[0])
     if n == 0:
@@ -120,15 +172,15 @@ def _mcl_cupy(
     convergence_tol = float(params["convergence_tol"])
     nt              = str(params.get("network_type", "grn")).lower()
 
-    A_sym = symmetrize_for(graph_csr, nt)
+    A_sym = _symmetrize_for(graph_csr, nt)
     M = _to_column_stochastic(A_sym)
 
     # Upload once; iterate entirely on the GPU.
-    M_gpu = cpsp.csr_matrix(
+    M_gpu = _cpsp.csr_matrix(
         (
-            cp.asarray(M.data,    dtype=cp.float32),
-            cp.asarray(M.indices, dtype=cp.int32),
-            cp.asarray(M.indptr,  dtype=cp.int32),
+            _cp.asarray(M.data,    dtype=_cp.float32),
+            _cp.asarray(M.indices, dtype=_cp.int32),
+            _cp.asarray(M.indptr,  dtype=_cp.int32),
         ),
         shape=M.shape,
     )
@@ -144,7 +196,7 @@ def _mcl_cupy(
         try:
             for _ in range(expansion - 1):
                 M_new = M_new @ M_gpu
-        except cp.cuda.memory.OutOfMemoryError as exc:
+        except _cp.cuda.memory.OutOfMemoryError as exc:
             overflow_warning = (
                 f"CuPy SpGEMM out-of-memory at iteration {it}: {exc}.  "
                 f"Returning current state without further expansion."
@@ -153,31 +205,24 @@ def _mcl_cupy(
             break
 
         # ---- Prune: threshold ----
-        # CuPy CSR has no in-place threshold; rebuild the values.
         if prune_threshold > 0.0:
             data = M_new.data
-            mask = data >= cp.float32(prune_threshold)
+            mask = data >= _cp.float32(prune_threshold)
             if not bool(mask.all()):
-                M_new.data = cp.where(mask, data, cp.float32(0.0))
+                M_new.data = _cp.where(mask, data, _cp.float32(0.0))
                 M_new.eliminate_zeros()
 
         # ---- Inflation: element-wise power then column-renormalize ----
-        M_new.data = cp.power(M_new.data, cp.float32(inflation))
+        M_new.data = _cp.power(M_new.data, _cp.float32(inflation))
 
-        # Column sums via CSC view.
         M_csc = M_new.tocsc()
-        col_sums = cp.zeros((n,), dtype=cp.float32)
-        # Simple sum-of-segments via dense temporary — baseline simplicity over
-        # micro-optimisation.  Falls back to one reduction per column.
-        # CuPy supports cp.add.reduceat with sorted segment starts.
+        col_sums = _cp.zeros((n,), dtype=_cp.float32)
         try:
-            col_sums = cp.add.reduceat(M_csc.data, M_csc.indptr[:-1].astype(cp.int32))
-            # Fix segments that are empty (would otherwise read from the next).
-            empty = (cp.diff(M_csc.indptr) == 0)
+            col_sums = _cp.add.reduceat(M_csc.data, M_csc.indptr[:-1].astype(_cp.int32))
+            empty = (_cp.diff(M_csc.indptr) == 0)
             if bool(empty.any()):
-                col_sums = cp.where(empty, cp.float32(0.0), col_sums)
-        except Exception:                                   # noqa: BLE001
-            # Conservative fallback — host loop over columns.
+                col_sums = _cp.where(empty, _cp.float32(0.0), col_sums)
+        except Exception:                                    # noqa: BLE001
             indptr_host = M_csc.indptr.get()
             data_host   = M_csc.data.get()
             col_sums_h  = np.zeros(n, dtype=np.float32)
@@ -185,10 +230,10 @@ def _mcl_cupy(
                 s, e = indptr_host[j], indptr_host[j + 1]
                 if e > s:
                     col_sums_h[j] = float(data_host[s:e].sum())
-            col_sums = cp.asarray(col_sums_h)
+            col_sums = _cp.asarray(col_sums_h)
 
-        inv = cp.where(col_sums > 0, cp.float32(1.0) / col_sums, cp.float32(0.0))
-        D_inv = cpsp.diags(inv, format="csc", dtype=cp.float32)
+        inv = _cp.where(col_sums > 0, _cp.float32(1.0) / col_sums, _cp.float32(0.0))
+        D_inv = _cpsp.diags(inv, format="csc", dtype=_cp.float32)
         M_new = (M_csc @ D_inv).tocsr()
 
         # ---- Convergence check (Frobenius on matching pattern) ----
@@ -199,7 +244,7 @@ def _mcl_cupy(
         )
         if same_pattern:
             diff = M_new.data - M_gpu.data
-            frob = float(cp.sqrt(cp.sum(diff * diff)).get())
+            frob = float(_cp.sqrt(_cp.sum(diff * diff)).get())
             M_gpu = M_new
             if frob < convergence_tol:
                 converged = True
@@ -228,12 +273,14 @@ def _mcl_cupy(
 def mcl_gpu_baseline(
     graph_csr: sp.csr_matrix, params: dict | None = None,
 ) -> dict:
-    """Markov clustering — GPU baseline (CuPy)."""
-    require_any_backend("mcl")
-    if not CUPY_AVAILABLE:
-        raise RuntimeError(
-            "mcl_gpu_baseline requires CuPy — cuGraph does not provide MCL."
-        )
+    """Markov clustering — GPU baseline (CuPy; no cuGraph equivalent).
+
+    Returns
+    -------
+    dict
+        7-key standard result envelope; ``result["mode"]`` is
+        ``"gpu_baseline_cupy"``.
+    """
     p = {**_DEFAULT_PARAMS, **(params or {})}
     network_type = str(p.get("network_type", "grn")).lower()
 
@@ -256,7 +303,7 @@ def mcl_gpu_baseline(
         "backend":             "cupy",
     }
 
-    return build_envelope(
+    return _build_envelope(
         algorithm="mcl",
         network_type=network_type,
         execution_time=elapsed,

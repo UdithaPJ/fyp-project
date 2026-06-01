@@ -549,7 +549,7 @@ function ParamRenderer({ param, value, onChange, uploadId, initialNodes }) {
 // Top-level component
 // ===========================================================================
 
-function AlgorithmSelector({ uploadId, onBack, onNext }) {
+function AlgorithmSelector({ uploadId, onBack, onNext, networkType }) {
   const [catalog, setCatalog] = useState([]);
   const [isLoading, setLoading] = useState(false);
   const [error, setError] = useState("");

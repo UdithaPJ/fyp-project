@@ -4,16 +4,16 @@ src/algorithms/gpu/basic/rwr.py
 
 Random Walk with Restart — GPU baseline implementation.
 
-Backends
---------
-    1. cuGraph ``cugraph.personalized_pagerank``  (preferred)
-    2. CuPy power iteration with restart vector   (fallback)
-    3. RuntimeError                               (neither installed)
+Backend
+-------
+cuGraph ``cugraph.personalized_pagerank`` only.  Raises ``ImportError``
+immediately on module import if cuGraph / cuDF (RAPIDS) are not
+installed.  There is no CuPy fallback — the benchmarking baseline must
+use the cuGraph path.
 
 The "restart" formulation of RWR is mathematically equivalent to
 personalized PageRank with the seed nodes as the personalization
-distribution and ``alpha = 1 - restart_prob``.  We use that equivalence
-in the cuGraph path.
+distribution and ``alpha = 1 - restart_prob``.
 
 Result keys (mirror src/algorithms/gpu/cuda_optimized/rwr.py)
 -------------------------------------------------------------
@@ -22,20 +22,31 @@ Result keys (mirror src/algorithms/gpu/cuda_optimized/rwr.py)
 
 from __future__ import annotations
 
-import logging
 import time
 from typing import Any
 
 import numpy as np
 import scipy.sparse as sp
 
+# Hard-fail: cuGraph + cuDF are required.
+try:
+    import cugraph   # noqa: F401
+    import cudf      # noqa: F401
+except ImportError as _e:
+    raise ImportError(
+        "src/algorithms/gpu/basic/rwr.py requires cuGraph and cuDF "
+        "(RAPIDS).  Install via:\n"
+        "  conda install -c rapidsai -c nvidia -c conda-forge "
+        "rapids=24.02 python=3.10 cudatoolkit=11.8\n"
+        f"Original error: {_e}"
+    ) from _e
+
 from ._utils import (
-    CUGRAPH_AVAILABLE, CUDF_AVAILABLE, CUPY_AVAILABLE,
+    BASELINE_MODE_CUGRAPH,
     TOP_RWR_NODES, TOP_RWR_SEEDS,
     build_envelope, cugraph_build_graph, cugraph_extract_column,
-    cugraph_function, out_in_degrees, require_any_backend,
+    cugraph_function, out_in_degrees,
     symmetrize_for, top_k_among, top_k_global,
-    to_cupy_csr, cupy_get,
 )
 
 
@@ -73,6 +84,8 @@ def _flatten_seeds(seed_nodes) -> list[int]:
 def _rwr_cugraph(
     graph_csr: sp.csr_matrix, params: dict, seeds: list[int],
 ) -> tuple[np.ndarray, int, bool, str]:
+    import cudf as _cudf
+
     ppr = cugraph_function("personalized_pagerank")
     if ppr is None:
         # Some RAPIDS releases route through a single ``pagerank`` with a
@@ -81,7 +94,7 @@ def _rwr_cugraph(
         if pr is None:
             raise RuntimeError(
                 "Neither cugraph.personalized_pagerank nor cugraph.pagerank "
-                "is available."
+                "is available in this RAPIDS version."
             )
         ppr = pr
 
@@ -92,21 +105,13 @@ def _rwr_cugraph(
 
     n = int(graph_csr.shape[0])
     restart_prob = float(params["restart_prob"])
-    alpha = 1.0 - restart_prob   # standard equivalence
-
-    if not CUDF_AVAILABLE:
-        raise RuntimeError(
-            "cuDF is required to pass the personalization vector to "
-            "cuGraph personalized PageRank."
-        )
-    import cudf
+    alpha = 1.0 - restart_prob
 
     if not seeds:
-        # No seeds => uniform; reduce to plain PageRank.
         personalization = None
     else:
         weight = 1.0 / float(len(seeds))
-        personalization = cudf.DataFrame({
+        personalization = _cudf.DataFrame({
             "vertex": np.asarray(seeds, dtype=np.int32),
             "values": np.full(len(seeds), weight, dtype=np.float32),
         })
@@ -134,71 +139,10 @@ def _rwr_cugraph(
     np.put(scores, vertex, score)
 
     note = (
-        f"cuGraph personalized_pagerank used (alpha={alpha:.3f}, "
+        f"cuGraph personalized_pagerank (alpha={alpha:.3f}, "
         f"seeds={len(seeds)})."
     )
     return scores, int(params["max_iter"]), True, note
-
-
-# ---------------------------------------------------------------------------
-# CuPy fallback — power iteration with restart
-# ---------------------------------------------------------------------------
-
-def _rwr_cupy(
-    graph_csr: sp.csr_matrix, params: dict, seeds: list[int],
-) -> tuple[np.ndarray, int, bool, str]:
-    import cupy as cp
-
-    n = int(graph_csr.shape[0])
-    if n == 0:
-        return np.zeros(0, np.float32), 0, True, "Empty graph."
-
-    restart_prob = float(params["restart_prob"])
-    max_iter     = int(params["max_iter"])
-    tolerance    = float(params["tolerance"])
-    nt           = str(params.get("network_type", "grn")).lower()
-
-    A = symmetrize_for(graph_csr, nt) if nt == "ppi" else graph_csr.astype(np.float32)
-    # Column-normalize so M^T @ p computes one walk step.
-    out_deg, _ = out_in_degrees(A)
-    inv_out = np.zeros(n, dtype=np.float32)
-    nz = out_deg > 0.0
-    inv_out[nz] = 1.0 / out_deg[nz]
-    D_inv = sp.diags(inv_out, format="csr", dtype=np.float32)
-    M_T = (D_inv @ A).T.tocsr().astype(np.float32)
-    M_T_gpu = to_cupy_csr(M_T)
-
-    if seeds:
-        p0_np = np.zeros(n, dtype=np.float32)
-        w = 1.0 / float(len(seeds))
-        for s in seeds:
-            if 0 <= int(s) < n:
-                p0_np[int(s)] += w
-    else:
-        p0_np = np.full(n, 1.0 / n, dtype=np.float32)
-    p0 = cp.asarray(p0_np)
-    p  = p0.copy()
-
-    converged = False
-    iterations = 0
-    for it in range(max_iter):
-        iterations = it + 1
-        p_new = cp.float32(1.0 - restart_prob) * M_T_gpu.dot(p) + cp.float32(restart_prob) * p0
-        # Renormalize for numerical safety.
-        s = float(cp.sum(p_new).get())
-        if s > 0:
-            p_new = p_new / cp.float32(s)
-        delta = float(cp.sum(cp.abs(p_new - p)).get())
-        p = p_new
-        if delta < tolerance:
-            converged = True
-            break
-
-    note = (
-        f"CuPy power iteration with restart (restart_prob={restart_prob}, "
-        f"seeds={len(seeds)})."
-    )
-    return cupy_get(p).astype(np.float32), iterations, converged, note
 
 
 # ---------------------------------------------------------------------------
@@ -208,35 +152,20 @@ def _rwr_cupy(
 def rwr_gpu_baseline(
     graph_csr: sp.csr_matrix, params: dict | None = None,
 ) -> dict:
-    """Random Walk with Restart — GPU baseline."""
-    require_any_backend("rwr")
+    """Random Walk with Restart — GPU baseline (cuGraph only).
+
+    Returns
+    -------
+    dict
+        7-key standard result envelope; ``result["mode"]`` is
+        ``"gpu_baseline_cugraph"``.
+    """
     p = {**_DEFAULT_PARAMS, **(params or {})}
     network_type = str(p.get("network_type", "grn")).lower()
     seeds = _flatten_seeds(p.get("seed_nodes", []))
 
     t0 = time.perf_counter()
-    backend: str
-    if CUGRAPH_AVAILABLE and (
-        cugraph_function("personalized_pagerank") is not None
-        or cugraph_function("pagerank") is not None
-    ):
-        try:
-            scores, iters, converged, note = _rwr_cugraph(graph_csr, p, seeds)
-            backend = "cugraph"
-        except Exception as exc:                            # noqa: BLE001
-            logging.warning(
-                "rwr_gpu_baseline: cuGraph path failed (%s) — falling back "
-                "to CuPy.", exc,
-            )
-            if not CUPY_AVAILABLE:
-                raise
-            scores, iters, converged, note = _rwr_cupy(graph_csr, p, seeds)
-            backend = "cupy"
-    elif CUPY_AVAILABLE:
-        scores, iters, converged, note = _rwr_cupy(graph_csr, p, seeds)
-        backend = "cupy"
-    else:
-        raise RuntimeError("Unreachable — require_any_backend should have raised.")
+    scores, iters, converged, note = _rwr_cugraph(graph_csr, p, seeds)
     elapsed = time.perf_counter() - t0
 
     top_nodes = top_k_global(scores, TOP_RWR_NODES)
@@ -252,8 +181,8 @@ def rwr_gpu_baseline(
         "top_seeds":  top_seeds,
         "iterations": iters,
         "converged":  converged,
-        "note":       f"{note}  Backend={backend}.",
-        "backend":    backend,
+        "note":       f"{note}  Backend=cugraph.",
+        "backend":    "cugraph",
     }
 
     return build_envelope(
@@ -262,4 +191,5 @@ def rwr_gpu_baseline(
         execution_time=elapsed,
         graph_csr=graph_csr,
         inner=inner,
+        mode=BASELINE_MODE_CUGRAPH,
     )

@@ -8,27 +8,40 @@ These baselines are intentionally simple — they exist as a benchmarking
 reference point against the highly tuned implementations in
 ``src/algorithms/gpu/cuda_optimized/``.
 
-Backend selection
------------------
-Every baseline algorithm uses the same fallback chain:
+Backend policy
+--------------
+The five cuGraph-backed algorithms (pagerank, bfs, hits, louvain, rwr)
+**require** cuGraph + cuDF.  Importing this module on a machine without
+RAPIDS raises ``ImportError`` immediately with installation instructions.
 
-    1. cuGraph (RAPIDS) — preferred when available.
-    2. CuPy sparse — fallback that still runs entirely on the GPU.
-    3. RuntimeError — neither backend installed → propagate to the runner.
+MCL has no cuGraph equivalent and uses CuPy directly from its own module
+(``src/algorithms/gpu/basic/mcl.py``).  MCL **does not** import from
+this file so that it remains independently importable on a CuPy-only
+installation.
 
-We never silently fall back to CPU here — that path belongs to
-``src/algorithms/cpu/`` and is selected explicitly by the runner via
-``mode="cpu_single"`` / ``"cpu_multi"``.
+Hard-fail import
+----------------
+The following block raises ``ImportError`` (not a silent flag) when
+cuGraph or cuDF is missing.  This guarantees that benchmarking runs
+always use the cuGraph backend — there is no silent CuPy fallback.
+
+Install RAPIDS:
+    conda install -c rapidsai -c nvidia -c conda-forge \\
+        rapids=24.02 python=3.10 cudatoolkit=11.8
 
 Reusable contracts
 ------------------
-* ``detect_backends()``      — returns a tuple of availability flags.
-* ``BASELINE_MODE``          — the literal string mode identifier.
+* ``BASELINE_MODE_CUGRAPH``  — mode string for cuGraph-backed results.
+* ``BASELINE_MODE_CUPY``     — mode string for CuPy-backed results (MCL).
+* ``BASELINE_MODE``          — backward-compat alias for BASELINE_MODE_CUGRAPH.
 * ``build_envelope(...)``    — assemble the 7-key outer result dict.
 * ``top_k_global(...)``      — top-K indices over a score vector.
 * ``top_k_among(...)``       — top-K indices over a subset of a score vector.
 * ``symmetrize_for(...)``    — network-type-aware symmetrization.
 * ``out_in_degrees(...)``    — out / in degree arrays from a CSR.
+* ``cugraph_function(...)``  — runtime API probe (no hard-coding signatures).
+* ``cugraph_build_graph(...)``— version-adaptive cuGraph.Graph construction.
+* ``cugraph_extract_column(...)`` — flexible column extraction from cuGraph DFs.
 """
 
 from __future__ import annotations
@@ -39,12 +52,31 @@ from typing import Any
 import numpy as np
 import scipy.sparse as sp
 
+# ---------------------------------------------------------------------------
+# Hard-fail: cuGraph + cuDF are required for this module.
+# MCL (mcl.py) does NOT import from here to avoid this dependency.
+# ---------------------------------------------------------------------------
+
+try:
+    import cugraph          # noqa: F401
+    import cudf             # noqa: F401
+except ImportError as _e:
+    raise ImportError(
+        "src/algorithms/gpu/basic/ requires cuGraph and cuDF (RAPIDS). "
+        "Install via:\n"
+        "  conda install -c rapidsai -c nvidia -c conda-forge "
+        "rapids=24.02 python=3.10 cudatoolkit=11.8\n"
+        f"Original error: {_e}"
+    ) from _e
+
 
 # ---------------------------------------------------------------------------
-# Mode identifier (single source of truth — runner / base.py imports this)
+# Mode identifiers (single source of truth)
 # ---------------------------------------------------------------------------
 
-BASELINE_MODE: str = "gpu_baseline"
+BASELINE_MODE_CUGRAPH: str = "gpu_baseline_cugraph"
+BASELINE_MODE_CUPY: str    = "gpu_baseline_cupy"
+BASELINE_MODE: str         = BASELINE_MODE_CUGRAPH   # backward-compat alias
 
 
 # ---------------------------------------------------------------------------
@@ -61,96 +93,30 @@ LOUVAIN_TOP_COMMUNITIES: int = 5   # Louvain top_communities
 
 
 # ---------------------------------------------------------------------------
-# Backend detection
+# cuGraph version probe
 # ---------------------------------------------------------------------------
-
-def detect_backends() -> tuple[bool, bool, bool]:
-    """Probe for cuGraph + cuDF + CuPy availability.
-
-    Returns
-    -------
-    (cugraph_available, cudf_available, cupy_available) : tuple[bool, bool, bool]
-    """
-    try:
-        import cugraph        # noqa: F401  (probe only)
-        cugraph_available = True
-    except Exception:                                       # noqa: BLE001
-        cugraph_available = False
-
-    try:
-        import cudf           # noqa: F401
-        cudf_available = True
-    except Exception:                                       # noqa: BLE001
-        cudf_available = False
-
-    try:
-        import cupy           # noqa: F401
-        import cupyx.scipy.sparse  # noqa: F401
-        cupy_available = True
-    except Exception:                                       # noqa: BLE001
-        cupy_available = False
-
-    return cugraph_available, cudf_available, cupy_available
-
-
-CUGRAPH_AVAILABLE, CUDF_AVAILABLE, CUPY_AVAILABLE = detect_backends()
-
-
-def require_any_backend(algorithm_name: str) -> None:
-    """Raise a clear ``RuntimeError`` when neither cuGraph nor CuPy is present.
-
-    Baselines never fall back to CPU silently.
-    """
-    if not CUGRAPH_AVAILABLE and not CUPY_AVAILABLE:
-        raise RuntimeError(
-            f"{algorithm_name}_gpu_baseline requires either cuGraph or CuPy "
-            f"on the GPU.  Install one of:\n"
-            f"  - cugraph (preferred — full RAPIDS stack)\n"
-            f"  - cupy-cuda12x or cupy-cuda13x (CuPy fallback path)\n"
-            f"This implementation never falls back to CPU."
-        )
-
-
-# ---------------------------------------------------------------------------
-# cuGraph version probe — used by every algorithm before invoking an API.
-# ---------------------------------------------------------------------------
-
-def cugraph_function(name: str):
-    """Return ``cugraph.<name>`` if it exists, else None.
-
-    Per the user's instruction, we never hardcode the existence of a cuGraph
-    API — we look it up at runtime so version drift between RAPIDS releases
-    never silently breaks the baseline.
-    """
-    if not CUGRAPH_AVAILABLE:
-        return None
-    try:
-        import cugraph
-        return getattr(cugraph, name, None)
-    except Exception:                                       # noqa: BLE001
-        return None
-
 
 def cugraph_version() -> str:
-    """Return the installed cuGraph version, or ``"?"`` when unavailable."""
-    if not CUGRAPH_AVAILABLE:
-        return "unavailable"
+    """Return the installed cuGraph version string."""
     try:
-        import cugraph
-        return str(getattr(cugraph, "__version__", "?"))
-    except Exception:                                       # noqa: BLE001
+        import cugraph as _cg
+        return str(getattr(_cg, "__version__", "?"))
+    except Exception:                                        # noqa: BLE001
         return "?"
 
 
-def cupy_version() -> str:
-    """Return the installed CuPy version, or ``"unavailable"`` otherwise."""
-    if not CUPY_AVAILABLE:
-        return "unavailable"
+def cugraph_function(name: str):
+    """Return ``cugraph.<name>`` if it exists, else ``None``.
+
+    We never hardcode the existence of a cuGraph API — we look it up at
+    runtime so version drift between RAPIDS releases never silently
+    breaks the baseline.
+    """
     try:
-        import cupy
-        return str(getattr(cupy, "__version__", "?"))
-    except Exception:                                       # noqa: BLE001
-        return "?"
+        import cugraph as _cg
+        return getattr(_cg, name, None)
+    except Exception:                                        # noqa: BLE001
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -164,15 +130,20 @@ def build_envelope(
     execution_time: float,
     graph_csr: sp.csr_matrix,
     inner: dict,
+    mode: str = BASELINE_MODE_CUGRAPH,
 ) -> dict:
     """Assemble the standard 7-key result dict for a baseline run.
 
-    The runner overwrites ``execution_time`` with its CUDA-event timer, but
-    we still populate the internal value for direct (non-runner) callers.
+    Parameters
+    ----------
+    mode:
+        ``"gpu_baseline_cugraph"`` (default) or ``"gpu_baseline_cupy"``
+        (MCL).  The runner may overwrite this for gpu / cpu modes but
+        preserves it for gpu_baseline runs.
     """
     return {
         "algorithm":      algorithm,
-        "mode":           BASELINE_MODE,
+        "mode":           mode,
         "network_type":   network_type,
         "execution_time": float(execution_time),
         "num_nodes":      int(graph_csr.shape[0]),
@@ -238,44 +209,6 @@ def symmetrize_for(
 
 
 # ---------------------------------------------------------------------------
-# scipy CSR <-> CuPy sparse helpers (only loaded if CuPy is present)
-# ---------------------------------------------------------------------------
-
-def to_cupy_csr(graph_csr: sp.csr_matrix):
-    """Convert a scipy CSR to a cupyx.scipy.sparse CSR (float32)."""
-    if not CUPY_AVAILABLE:
-        raise RuntimeError("CuPy is not available — cannot upload CSR.")
-    import cupy as cp
-    import cupyx.scipy.sparse as cpsp
-
-    if graph_csr.dtype != np.float32:
-        graph_csr = graph_csr.astype(np.float32)
-    return cpsp.csr_matrix(
-        (
-            cp.asarray(graph_csr.data,    dtype=cp.float32),
-            cp.asarray(graph_csr.indices, dtype=cp.int32),
-            cp.asarray(graph_csr.indptr,  dtype=cp.int32),
-        ),
-        shape=graph_csr.shape,
-    )
-
-
-def to_cupy_array(arr: np.ndarray):
-    """Move a numpy array to the GPU.  Type-preserving."""
-    if not CUPY_AVAILABLE:
-        raise RuntimeError("CuPy is not available — cannot upload array.")
-    import cupy as cp
-    return cp.asarray(arr)
-
-
-def cupy_get(cp_arr) -> np.ndarray:
-    """Move a CuPy array (or array-like) back to host as numpy."""
-    if hasattr(cp_arr, "get"):
-        return cp_arr.get()
-    return np.asarray(cp_arr)
-
-
-# ---------------------------------------------------------------------------
 # cuGraph helpers — build / extract that adapt to the installed version.
 # ---------------------------------------------------------------------------
 
@@ -294,10 +227,8 @@ def cugraph_build_graph(
     construction so weight / directedness semantics are reproducible
     across RAPIDS versions.
     """
-    if not CUGRAPH_AVAILABLE:
-        raise RuntimeError("cuGraph is not available.")
-    import cugraph
-    import numpy as np
+    import cugraph as _cg
+    import cudf as _cudf
 
     coo = graph_csr.tocoo()
     src = coo.row.astype(np.int32)
@@ -305,38 +236,36 @@ def cugraph_build_graph(
     wts = coo.data.astype(np.float32) if weighted else None
 
     # Try cuDF first (the modern path).
-    if CUDF_AVAILABLE:
-        try:
-            import cudf
-            edge_df = cudf.DataFrame({"src": src, "dst": dst})
-            if weighted:
-                edge_df["weight"] = wts
+    try:
+        edge_df = _cudf.DataFrame({"src": src, "dst": dst})
+        if weighted and wts is not None:
+            edge_df["weight"] = wts
 
-            G = cugraph.Graph(directed=directed)
-            kwargs: dict[str, Any] = {"source": "src", "destination": "dst"}
-            if weighted:
-                kwargs["edge_attr"] = "weight"
-            G.from_cudf_edgelist(edge_df, **kwargs)
-            return G
-        except Exception as exc:                            # noqa: BLE001
-            logging.debug(
-                "cugraph_build_graph: cuDF edge list path failed (%s) — "
-                "trying pandas fallback.", exc,
-            )
+        G = _cg.Graph(directed=directed)
+        kwargs: dict[str, Any] = {"source": "src", "destination": "dst"}
+        if weighted and wts is not None:
+            kwargs["edge_attr"] = "weight"
+        G.from_cudf_edgelist(edge_df, **kwargs)
+        return G
+    except Exception as exc:                                 # noqa: BLE001
+        logging.debug(
+            "cugraph_build_graph: cuDF edge list path failed (%s) — "
+            "trying pandas fallback.", exc,
+        )
 
-    # Pandas fallback (older RAPIDS or cuDF missing).
+    # Pandas fallback (older RAPIDS).
     try:
         import pandas as pd
         edge_df = pd.DataFrame({"src": src, "dst": dst})
-        if weighted:
+        if weighted and wts is not None:
             edge_df["weight"] = wts
-        G = cugraph.Graph(directed=directed)
+        G = _cg.Graph(directed=directed)
         kwargs = {"source": "src", "destination": "dst"}
-        if weighted:
+        if weighted and wts is not None:
             kwargs["edge_attr"] = "weight"
         G.from_pandas_edgelist(edge_df, **kwargs)
         return G
-    except Exception as exc:                                # noqa: BLE001
+    except Exception as exc:                                 # noqa: BLE001
         raise RuntimeError(
             f"Failed to construct cuGraph.Graph from scipy CSR — neither "
             f"cuDF nor pandas edge-list construction succeeded ({exc})."
@@ -363,23 +292,16 @@ def cugraph_extract_column(df, candidates: list[str]) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Diagnostic logging — runs once on first import so it shows up in benchmarks.
+# Diagnostic logging — runs once on first import.
 # ---------------------------------------------------------------------------
 
 def log_backend_selection() -> None:
-    """Emit a single info-level log line documenting backend availability."""
-    backends = []
-    if CUGRAPH_AVAILABLE:
-        backends.append(f"cuGraph={cugraph_version()}")
-    if CUPY_AVAILABLE:
-        backends.append(f"CuPy={cupy_version()}")
-    if not backends:
-        logging.warning(
-            "gpu_baseline: neither cuGraph nor CuPy is available — every "
-            "<algorithm>_gpu_baseline() call will raise RuntimeError."
-        )
-    else:
-        logging.info("gpu_baseline backends detected: %s", ", ".join(backends))
+    """Emit a single info-level log line documenting the cuGraph backend."""
+    logging.info(
+        "gpu_baseline: cuGraph backend active (version=%s). "
+        "MCL uses CuPy independently.",
+        cugraph_version(),
+    )
 
 
 log_backend_selection()
