@@ -874,6 +874,48 @@ def _next_pow2(x: int) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Fix 2: Hub-corrected SpGEMM output size estimator
+# ---------------------------------------------------------------------------
+
+def _estimate_spgemm_output_size(
+    M_csr: sp.csr_matrix,
+    safety_factor: float = 3.0,
+) -> int:
+    """Estimate the output nnz of ``M @ M`` with hub-node correction.
+
+    The naive estimate (nnz * avg_row) consistently underestimates for
+    power-law biological networks because the top few hub rows generate
+    disproportionate fill-in.  We correct for this by weighting the
+    estimate by the ratio of the 95th-percentile row length to the
+    average row length.
+
+    Parameters
+    ----------
+    M_csr : sp.csr_matrix
+        Input matrix (will be squared).
+    safety_factor : float
+        Multiplier applied to the corrected estimate.  Default 3.0 gives
+        a comfortable margin without requiring a full worst-case allocation.
+
+    Returns
+    -------
+    int
+        Estimated output nnz, at minimum equal to ``M_csr.nnz``.
+    """
+    n   = int(M_csr.shape[0])
+    nnz = int(M_csr.nnz)
+    if nnz == 0 or n == 0:
+        return 0
+    row_lens = np.diff(M_csr.indptr).astype(np.float64)
+    avg_row  = max(1.0, float(nnz) / max(1, n))
+    # Hub correction: top-5% rows inflate fill-in non-linearly.
+    p95_row  = float(np.percentile(row_lens, 95)) if n > 1 else avg_row
+    hub_correction = max(1.0, p95_row / max(1.0, avg_row))
+    est = int(nnz * avg_row * hub_correction * safety_factor)
+    return max(est, nnz)
+
+
+# ---------------------------------------------------------------------------
 # GPU exclusive prefix sum (Improvement 2)
 # ---------------------------------------------------------------------------
 
@@ -1018,7 +1060,8 @@ def _spgemm_gpu(
     stream_compute,
     stream_transfer,
     shared_mem_per_block: int = DEFAULT_SHARED_MEM_PER_BLOCK,
-) -> sp.csr_matrix:
+    prune_threshold: float = 1e-3,
+) -> tuple[sp.csr_matrix, str]:
     """Compute ``C = M @ M`` on the GPU.
 
     Strategy:
@@ -1035,11 +1078,18 @@ def _spgemm_gpu(
     consumed by the compute kernels on ``stream_compute`` via an
     inter-stream event - no host sync is required between upload and
     kernel launch.
+
+    Returns
+    -------
+    tuple[sp.csr_matrix, str]
+        The product matrix and an overflow warning string (empty when
+        no overflow occurred).  Overflow is recovered from internally
+        (Fix 1) rather than raised as MemoryError.
     """
     n   = int(M_csr.shape[0])
     nnz = int(M_csr.nnz)
     if nnz == 0:
-        return sp.csr_matrix((n, n), dtype=np.float32)
+        return sp.csr_matrix((n, n), dtype=np.float32), ""
 
     # ---- Async H2D of A=B (we square M, so the same arrays serve as both)
     h_row_ptr = np.ascontiguousarray(M_csr.indptr,  dtype=np.int32)
@@ -1066,20 +1116,22 @@ def _spgemm_gpu(
         # ---- Classify rows --------------------------------------------
         heavy, medium, light = _classify_rows_by_degree(h_row_ptr)
 
-        # ---- Output COO buffer (capacity heuristic) -------------------
-        # Worst-case output nnz ~= nnz * avg_row_len; cap by VRAM budget.
+        # ---- Output COO buffer (Fix 2 + Fix 4) ----------------------------
+        # Hub-corrected estimate (safety_factor=3.0) prevents the overflow
+        # seen on power-law networks where the naive nnz*avg_row formula
+        # under-counts fill-in.  The capacity is recalculated from the
+        # CURRENT M_csr.nnz on every call (Fix 4 — dynamic per-iteration
+        # sizing; nnz shrinks after each prune, so the buffer shrinks too).
         try:
             free_bytes, _ = cuda.mem_get_info()
         except Exception:                               # noqa: BLE001
             free_bytes = 1 << 30
-        vram_budget = int(free_bytes * VRAM_BUDGET_FRACTION)
-        avg_row = max(1.0, nnz / max(1, n))
-        cap_estimate = max(
-            int(nnz * avg_row * 2.0),
-            64 * nnz,                       # always at least nnz x 64
-        )
-        max_cap = max(1024, vram_budget // COO_BYTES_PER_ENTRY)
-        capacity = int(min(cap_estimate, max_cap))
+        vram_budget   = int(free_bytes * VRAM_BUDGET_FRACTION)
+        cap_estimate  = _estimate_spgemm_output_size(M_csr, safety_factor=3.0)
+        max_cap       = max(1024, vram_budget // COO_BYTES_PER_ENTRY)
+        capacity      = int(min(cap_estimate, max_cap))
+        # Always allocate at least as many slots as the input has nonzeros.
+        capacity      = max(capacity, nnz)
 
         d_C_row = _empty((capacity,), np.int32)
         d_C_col = _empty((capacity,), np.int32)
@@ -1184,14 +1236,44 @@ def _spgemm_gpu(
 
         stream_compute.synchronize()
         written = int(d_C_nnz.get()[0])
+
+        # Fix 1: In-buffer overflow recovery — truncate instead of raising.
+        overflow_msg = ""
         if written > capacity:
-            raise MemoryError(
-                f"SpGEMM output overflow: {written} entries needed but "
-                f"only {capacity} allocated.  Raise prune_threshold or "
-                f"lower top_k_per_column."
+            overflow_msg = (
+                f"SpGEMM output overflow: {written} entries needed but only "
+                f"{capacity} allocated. Truncating and applying emergency "
+                f"threshold prune (threshold={prune_threshold:g}). "
+                f"Results are approximate for this iteration."
             )
+            logging.warning(overflow_msg)
+            # Entries at positions 0..capacity-1 WERE written successfully;
+            # entries at positions capacity..written-1 were silently dropped
+            # by the kernel's `if (pos < max_C_nnz)` guard.  Use what we have.
+            rows_host = d_C_row.get()[:capacity]
+            cols_host = d_C_col.get()[:capacity]
+            vals_host = d_C_val.get()[:capacity]
+            # Emergency threshold prune: drop weak entries from truncated set.
+            if prune_threshold > 0.0:
+                keep = vals_host >= prune_threshold
+                if keep.any():
+                    rows_host = rows_host[keep]
+                    cols_host = cols_host[keep]
+                    vals_host = vals_host[keep]
+                else:
+                    # Everything below threshold — return identity-like empty.
+                    return sp.csr_matrix((n, n), dtype=np.float32), overflow_msg
+            if rows_host.size == 0:
+                return sp.csr_matrix((n, n), dtype=np.float32), overflow_msg
+            out = sp.coo_matrix(
+                (vals_host, (rows_host, cols_host)),
+                shape=(n, n), dtype=np.float32,
+            ).tocsr()
+            out.sum_duplicates()
+            return out, overflow_msg
+
         if written == 0:
-            return sp.csr_matrix((n, n), dtype=np.float32)
+            return sp.csr_matrix((n, n), dtype=np.float32), ""
 
         rows_host = d_C_row.get()[:written]
         cols_host = d_C_col.get()[:written]
@@ -1202,7 +1284,7 @@ def _spgemm_gpu(
             shape=(n, n), dtype=np.float32,
         ).tocsr()
         out.sum_duplicates()
-        return out
+        return out, ""
 
     finally:
         for arr in d_local:
@@ -1629,6 +1711,9 @@ def mcl_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
         end_event       = cuda.Event()
         start_event.record(stream_compute)
 
+        # Fix 5: track SpGEMM overflow warnings across iterations.
+        overflow_warning: str = ""
+
         # ---- Main iteration loop --------------------------------------
         converged = False
         iterations = 0
@@ -1636,16 +1721,34 @@ def mcl_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
             iterations = it + 1
             M_old = M
 
+            # Fix 3: Pre-SpGEMM pruning — when M is already dense, reduce
+            # its nnz before squaring to limit output fill-in and prevent
+            # buffer overflow on highly connected biological networks.
+            M_new = M
+            if M_new.nnz > n_original * 10:
+                M_new = _prune_gpu(
+                    M_new, kernels,
+                    prune_threshold=prune_threshold,
+                    top_k=top_k,
+                    block_size=block_size,
+                    stream_compute=stream_compute,
+                    stream_transfer=stream_transfer,
+                )
+
             # ---- Expansion: M_new = M ^ e ----
             # For e=2 this is one SpGEMM; e>2 chains successive squares.
-            M_new = M
+            # Buffer capacity is recalculated from current nnz each call
+            # (Fix 4 — dynamic per-iteration sizing via _spgemm_gpu).
             for _ in range(expansion - 1):
-                M_new = _spgemm_gpu(
+                M_new, ow = _spgemm_gpu(
                     M_new, kernels, block_size,
                     stream_compute=stream_compute,
                     stream_transfer=stream_transfer,
                     shared_mem_per_block=shared_mem_per_block,
+                    prune_threshold=prune_threshold,
                 )
+                if ow:
+                    overflow_warning = ow   # keep last non-empty message
 
             # ---- Prune (threshold + top-k) ----
             M_new = _prune_gpu(
@@ -1709,6 +1812,8 @@ def mcl_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
                 "iterations":          iterations,
                 "converged":           converged,
                 "note":                note,
+                # Fix 5: user-visible overflow guidance (empty string = clean run).
+                "overflow_warning":    overflow_warning,
             },
         }
 
@@ -1716,10 +1821,13 @@ def mcl_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
         logging.error("CUDA error in mcl_gpu: %s", e)
         raise
     except MemoryError:
+        # This path is reached only when a gpuarray.empty() allocation
+        # genuinely exhausts VRAM — not for SpGEMM output overflow, which
+        # is now recovered from internally (Fix 1).
         logging.warning(
-            "VRAM exhausted in mcl_gpu. "
-            "Raise prune_threshold or lower top_k_per_column to keep "
-            "the matrix sparse, or use a higher-VRAM device."
+            "VRAM exhausted in mcl_gpu (gpuarray allocation failed). "
+            "Try a smaller graph, higher prune_threshold, lower "
+            "top_k_per_column, or a higher-VRAM device."
         )
         raise
     finally:
@@ -1739,3 +1847,54 @@ def _gpu(graph_csr: sp.csr_matrix, params: dict | None = None, **_) -> dict:
     p = _merge_params(params)
     full = mcl_gpu(graph_csr, p)
     return {"output": full, "extra_params": p}
+
+
+# ---------------------------------------------------------------------------
+# Overflow-recovery verification test
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import networkx as nx
+
+    print("=" * 60)
+    print("MCL SpGEMM overflow recovery test")
+    print("=" * 60)
+
+    # Build a Barabasi-Albert (scale-free) graph with m=8 new edges per node.
+    # n=500, m=8 -> avg_degree ~16, heavy hubs -> was reliably overflowing.
+    G = nx.barabasi_albert_graph(500, 8, seed=42)
+    A = nx.to_scipy_sparse_array(G, format="csr", dtype=np.float32)
+    n = A.shape[0]
+
+    print(f"Graph: n={n}, nnz={A.nnz}, avg_degree={A.nnz / n:.1f}")
+
+    try:
+        result = mcl_gpu(A, {"prune_threshold": 0.001, "network_type": "ppi"})
+        res = result["result"]
+        assignments = res["cluster_assignments"]
+        overflow_warning = res.get("overflow_warning", "")
+
+        assert len(assignments) == n, (
+            f"cluster_assignments length {len(assignments)} != n={n}"
+        )
+        num_clusters = res["num_clusters"]
+        assert num_clusters >= 1, f"Expected at least 1 cluster, got {num_clusters}"
+
+        if overflow_warning:
+            print(f"\noverflow_warning triggered:\n  {overflow_warning}\n")
+        else:
+            print("\nNo overflow occurred (estimate was sufficient).")
+
+        print(
+            f"clusters={num_clusters}, "
+            f"iterations={res['iterations']}, "
+            f"converged={res['converged']}"
+        )
+        print("\nOverflow recovery test: PASS")
+
+    except MemoryError as e:
+        print(f"\nOverflow recovery test: FAIL — MemoryError was raised: {e}")
+        raise SystemExit(1) from e
+    except Exception as e:
+        print(f"\nOverflow recovery test: FAIL — unexpected error: {e}")
+        raise

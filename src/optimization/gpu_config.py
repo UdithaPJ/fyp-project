@@ -857,6 +857,21 @@ class AlgorithmStrategySelector:
         prune_thr = density_map.get(gp["sparsity_class"], 1e-3)
         density_factor = max(gp["density"] / 1e-4, 1.0)
         top_k = max(10, min(100, int(50 / density_factor)))
+
+        # Fix 6: Density-based safety adjustment — high avg_degree means
+        # M^2 fill-in grows super-linearly, requiring tighter pruning to
+        # prevent SpGEMM output buffer overflow on biological networks.
+        avg_deg = float(gp.get("avg_degree", 0.0))
+        density = float(gp.get("density", 0.0))
+        if avg_deg > 50:
+            # Very dense: force prune_threshold high enough to keep nnz bounded.
+            prune_thr = max(density * 10.0, 0.01, prune_thr)
+            top_k     = min(top_k, 20)
+        elif avg_deg > 20:
+            # Moderately dense: gentle tightening.
+            prune_thr = max(density * 5.0, 0.005, prune_thr)
+            top_k     = min(top_k, 30)
+
         return {
             "spgemm_method":    "inner_product" if
                                 gp["sparsity_class"] == "dense"
