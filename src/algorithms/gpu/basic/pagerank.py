@@ -112,7 +112,17 @@ def _pack_result(
 def _pagerank_cugraph(
     graph_csr: sp.csr_matrix, params: dict,
 ) -> tuple[np.ndarray, int, bool]:
-    """Run cuGraph PageRank.  Returns ``(scores, iterations, converged)``."""
+    """Run cuGraph PageRank.  Returns ``(scores, iterations, converged)``.
+
+    RAPIDS 26.04 compatibility notes
+    ---------------------------------
+    * ``fail_on_nonconvergence=False`` is passed when accepted so that partial
+      results are returned instead of ``FailedToConvergeError`` being raised.
+    * Tolerance is floored at 1e-5 (``max(user_tol, 1e-5)``) to reduce
+      spurious non-convergence on small benchmark graphs.
+    * Some cuGraph versions return a ``(df, converged_bool)`` 2-tuple; this
+      is unwrapped automatically.
+    """
     pagerank = cugraph_function("pagerank")
     if pagerank is None:
         raise RuntimeError("cugraph.pagerank is not available in this RAPIDS version.")
@@ -129,14 +139,42 @@ def _pagerank_cugraph(
     except (TypeError, ValueError):
         accepted = set()
 
-    kwargs: dict[str, Any] = {}
-    if "alpha"          in accepted: kwargs["alpha"]          = float(params["damping"])
-    if "damping_factor" in accepted: kwargs["damping_factor"] = float(params["damping"])
-    if "max_iter"       in accepted: kwargs["max_iter"]       = int(params["max_iter"])
-    if "tol"            in accepted: kwargs["tol"]            = float(params["tolerance"])
-    if "tolerance"      in accepted: kwargs["tolerance"]      = float(params["tolerance"])
+    # Floor tolerance at 1e-5 so strict user values don't cause FailedToConvergeError.
+    tol_val = max(float(params.get("tolerance", 1e-6)), 1e-5)
 
-    df = pagerank(G, **kwargs)
+    kwargs: dict[str, Any] = {}
+    if "alpha"                  in accepted: kwargs["alpha"]                  = float(params["damping"])
+    if "damping_factor"         in accepted: kwargs["damping_factor"]         = float(params["damping"])
+    if "max_iter"               in accepted: kwargs["max_iter"]               = int(params["max_iter"])
+    if "tol"                    in accepted: kwargs["tol"]                    = tol_val
+    if "tolerance"              in accepted: kwargs["tolerance"]              = tol_val
+    # RAPIDS 26.04+: return partial result instead of raising on non-convergence.
+    if "fail_on_nonconvergence" in accepted: kwargs["fail_on_nonconvergence"] = False
+
+    converged = True
+    try:
+        raw = pagerank(G, **kwargs)
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "converge" in msg or "failed" in msg:
+            # Retry without fail_on_nonconvergence in case the installed RAPIDS
+            # version ignores the flag but still raises (older releases).
+            kwargs_retry = {k: v for k, v in kwargs.items() if k != "fail_on_nonconvergence"}
+            try:
+                raw = pagerank(G, **kwargs_retry)
+                converged = False
+            except Exception:
+                raise exc   # re-raise original if retry also fails
+        else:
+            raise
+
+    # Some cuGraph releases return (df, converged_bool) instead of just df.
+    if isinstance(raw, tuple) and len(raw) == 2 and not hasattr(raw, "columns"):
+        df, _conv_flag = raw
+        if isinstance(_conv_flag, bool):
+            converged = bool(_conv_flag)
+    else:
+        df = raw
 
     score_col  = cugraph_extract_column(df, ["pagerank", "score", "scores"])
     vertex_col = cugraph_extract_column(df, ["vertex", "node", "id"])
@@ -145,8 +183,7 @@ def _pagerank_cugraph(
     scores = np.zeros(n, dtype=np.float32)
     np.put(scores, vertex_col.astype(np.int64), score_col.astype(np.float32))
 
-    # cuGraph does not surface (iterations, converged) — assume convergence.
-    return scores, int(params["max_iter"]), True
+    return scores, int(params["max_iter"]), converged
 
 
 # ---------------------------------------------------------------------------

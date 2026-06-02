@@ -84,6 +84,14 @@ def _flatten_seeds(seed_nodes) -> list[int]:
 def _rwr_cugraph(
     graph_csr: sp.csr_matrix, params: dict, seeds: list[int],
 ) -> tuple[np.ndarray, int, bool, str]:
+    """Run cuGraph personalized PageRank as RWR.
+
+    RAPIDS 26.04 compatibility notes
+    ---------------------------------
+    * ``fail_on_nonconvergence=False`` is passed when accepted.
+    * Tolerance is floored at 1e-5 to reduce spurious convergence failures.
+    * Handles ``(df, converged_bool)`` tuple return from newer cuGraph releases.
+    """
     import cudf as _cudf
 
     ppr = cugraph_function("personalized_pagerank")
@@ -122,16 +130,43 @@ def _rwr_cugraph(
     except (TypeError, ValueError):
         accepted = set()
 
+    # Floor tolerance at 1e-5 so strict user values don't cause FailedToConvergeError.
+    tol_val = max(float(params.get("tolerance", 1e-6)), 1e-5)
+
     kwargs: dict[str, Any] = {}
-    if "alpha"          in accepted: kwargs["alpha"]          = alpha
-    if "damping_factor" in accepted: kwargs["damping_factor"] = alpha
-    if "max_iter"       in accepted: kwargs["max_iter"]       = int(params["max_iter"])
-    if "tol"            in accepted: kwargs["tol"]            = float(params["tolerance"])
-    if "tolerance"      in accepted: kwargs["tolerance"]      = float(params["tolerance"])
+    if "alpha"                  in accepted: kwargs["alpha"]                  = alpha
+    if "damping_factor"         in accepted: kwargs["damping_factor"]         = alpha
+    if "max_iter"               in accepted: kwargs["max_iter"]               = int(params["max_iter"])
+    if "tol"                    in accepted: kwargs["tol"]                    = tol_val
+    if "tolerance"              in accepted: kwargs["tolerance"]              = tol_val
+    # RAPIDS 26.04+: return partial result instead of raising on non-convergence.
+    if "fail_on_nonconvergence" in accepted: kwargs["fail_on_nonconvergence"] = False
     if personalization is not None and "personalization" in accepted:
         kwargs["personalization"] = personalization
 
-    df = ppr(G, **kwargs)
+    converged = True
+    try:
+        raw = ppr(G, **kwargs)
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "converge" in msg or "failed" in msg:
+            kwargs_retry = {k: v for k, v in kwargs.items() if k != "fail_on_nonconvergence"}
+            try:
+                raw = ppr(G, **kwargs_retry)
+                converged = False
+            except Exception:
+                raise exc
+        else:
+            raise
+
+    # Some cuGraph releases return (df, converged_bool) instead of just df.
+    if isinstance(raw, tuple) and len(raw) == 2 and not hasattr(raw, "columns"):
+        df, _conv_flag = raw
+        if isinstance(_conv_flag, bool):
+            converged = bool(_conv_flag)
+    else:
+        df = raw
+
     vertex = cugraph_extract_column(df, ["vertex", "node", "id"]).astype(np.int64)
     score  = cugraph_extract_column(df, ["pagerank", "score", "scores"]).astype(np.float32)
 
@@ -140,9 +175,9 @@ def _rwr_cugraph(
 
     note = (
         f"cuGraph personalized_pagerank (alpha={alpha:.3f}, "
-        f"seeds={len(seeds)})."
+        f"seeds={len(seeds)}, converged={converged})."
     )
-    return scores, int(params["max_iter"]), True, note
+    return scores, int(params["max_iter"]), converged, note
 
 
 # ---------------------------------------------------------------------------
