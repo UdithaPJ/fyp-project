@@ -49,7 +49,18 @@ REQUIRED_RESULT_KEYS = (
     "result",
 )
 
-VALID_MODES = ("cpu_single", "cpu_multi", "gpu", "gpu_baseline")
+VALID_MODES = (
+    "cpu_single",
+    "cpu_multi",
+    "gpu",
+    "gpu_baseline",
+    # Backend-specific GPU baseline modes returned by src/algorithms/gpu/basic/
+    # when cuGraph (RAPIDS) or CuPy is the active backend.  More specific than
+    # the generic "gpu_baseline" dispatch mode so benchmark provenance is
+    # unambiguous in result dictionaries.
+    "gpu_baseline_cugraph",
+    "gpu_baseline_cupy",
+)
 
 
 # ---------------------------------------------------------------------------
