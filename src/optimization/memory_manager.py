@@ -7,7 +7,7 @@ kernel pipeline should access its inputs.  Five execution modes are
 supported:
 
   ============================  =============================================
-  ``normal_gpu``                fits comfortably in VRAM → standard device
+    ``normal_gpu``                fits comfortably in VRAM -> standard device
                                 allocation.
   ``chunked_gpu``               graph too big for one upload but small enough
                                 that streaming row-chunks works.  Used by the
@@ -29,11 +29,11 @@ supported:
 
 Decision order (highest-priority first, first match wins):
 
-    estimate < 70 % of free VRAM                    → normal_gpu
-    algorithm supports chunking                     → chunked_gpu
-    driver supports cudaMallocManaged               → unified_memory
-    driver supports pagelocked + DEVICEMAP          → zero_copy
-    otherwise                                       → partitioned_gpu
+    estimate < 70 % of free VRAM                    -> normal_gpu
+    algorithm supports chunking                     -> chunked_gpu
+    driver supports cudaMallocManaged               -> unified_memory
+    driver supports pagelocked + DEVICEMAP          -> zero_copy
+    otherwise                                       -> partitioned_gpu
 
 The plan is a *recommendation* — algorithm files inspect the plan and
 either honour it (PageRank/RWR/Louvain do) or raise ``MemoryError``
@@ -81,8 +81,8 @@ _UNIFIED_FRIENDLY_ALGORITHMS: frozenset[str] = frozenset({
 })
 
 # Pressure thresholds for the decision matrix.
-_NORMAL_THRESHOLD: float   = 0.70   # < 70 % free VRAM → normal_gpu
-_CHUNKING_THRESHOLD: float = 1.50   # < 150 % free VRAM → chunked_gpu works
+_NORMAL_THRESHOLD: float   = 0.70   # < 70 % free VRAM -> normal_gpu
+_CHUNKING_THRESHOLD: float = 1.50   # < 150 % free VRAM -> chunked_gpu works
 
 
 # ---------------------------------------------------------------------------

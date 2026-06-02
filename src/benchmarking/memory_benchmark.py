@@ -44,7 +44,7 @@ max_graph_edges_supported
 Derived metrics
 ---------------
 vram_reduction_pct
-    ``(peak_vram_baseline − peak_vram_gpu) / peak_vram_baseline * 100``
+    ``(peak_vram_baseline - peak_vram_gpu) / peak_vram_baseline * 100``
     Positive means the optimised GPU uses less peak VRAM.
 
 graph_capacity_gain
@@ -52,7 +52,7 @@ graph_capacity_gain
     > 1 means the optimised GPU can handle larger graphs.
 
 runtime_overhead_pct
-    ``(runtime_gpu − runtime_baseline) / runtime_baseline * 100``
+    ``(runtime_gpu - runtime_baseline) / runtime_baseline * 100``
     Negative means the optimised GPU is *faster* (common); positive means
     the custom kernels have overhead on this particular graph size.
 

@@ -167,8 +167,8 @@ class BenchmarkTimer:
     Context manager that measures algorithm execution time.
 
     GPU timing uses CUDA events in the *same* context as the algorithm:
-      - CuPy backend  → cp.cuda.Event  (preferred; matches CuPy algorithms)
-      - PyCUDA backend → cuda.Event    (fallback for raw-kernel algorithms)
+            - CuPy backend  -> cp.cuda.Event  (preferred; matches CuPy algorithms)
+            - PyCUDA backend -> cuda.Event    (fallback for raw-kernel algorithms)
     CPU timing uses time.perf_counter().
 
     Usage:
@@ -203,7 +203,7 @@ class BenchmarkTimer:
             self._evt_end.record()
             if _GPU_TIMER_BACKEND == "cupy":
                 self._evt_end.synchronize()
-                # get_elapsed_time returns milliseconds → convert to seconds
+                # get_elapsed_time returns milliseconds -> convert to seconds
                 self.elapsed = cp.cuda.get_elapsed_time(
                     self._evt_start, self._evt_end
                 ) / 1000.0
@@ -399,7 +399,7 @@ def run_benchmark(
             "extra_params": json.dumps(_to_jsonable(extra_params)),
         })
 
-        print(f"[DONE]  {mode}: {timer.elapsed:.4f}s → {out_path}")
+        print(f"[DONE]  {mode}: {timer.elapsed:.4f}s - {out_path}")
 
     if not results:
         print("[WARN]  No modes executed successfully — nothing to write.")
@@ -409,7 +409,7 @@ def run_benchmark(
         _RES_DIR, f"{algorithm_name}_{dataset_name}_{timestamp}.csv"
     )
     _write_csv(results, csv_path)
-    print(f"[INFO]  Timing results saved → {csv_path}")
+    print(f"[INFO]  Timing results saved - {csv_path}")
 
     return results
 

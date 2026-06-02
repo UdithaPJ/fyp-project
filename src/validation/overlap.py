@@ -114,9 +114,9 @@ def fisher_exact_p(a: int, b: int, c: int, d: int) -> float:
         c  d
 
         a = predicted ∩ reference  (success in sample)
-        b = predicted − reference  (failure in sample)
-        c = reference − predicted  (success in background \\ sample)
-        d = background − predicted − reference + overlap (failure in background \\ sample)
+        b = predicted - reference  (failure in sample)
+        c = reference - predicted  (success in background \\ sample)
+        d = background - predicted - reference + overlap (failure in background \\ sample)
 
     Returns P(X >= a) under the hypergeometric model.
     """

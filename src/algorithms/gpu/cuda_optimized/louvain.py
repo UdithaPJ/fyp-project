@@ -19,11 +19,11 @@ Why the graph must be undirected for Louvain
 --------------------------------------------
 Modularity Q is only defined for undirected graphs:
 
-    Q = (1 / 2m) · Σ_{i,j} ( A_{ij} - γ · k_i · k_j / 2m ) · δ(c_i, c_j)
+    Q = (1 / 2m) * sum_{i,j} ( A_ij - gamma * k_i * k_j / (2m) ) * delta(c_i, c_j)
 
-The null model k_i·k_j / 2m assumes undirected degree.  For GRN / miRNA
-networks this module applies A ← A + Aᵀ internally (mutual edges keep
-their summed weight = 2 × original, encoding tighter coupling).  PPI
+The null model k_i*k_j / (2m) assumes undirected degree.  For GRN / miRNA
+networks this module applies A <- A + A^T internally (mutual edges keep
+their summed weight = 2 * original, encoding tighter coupling).  PPI
 networks are already undirected and are used as-is.
 
 The symmetrisation step happens *inside* this module rather than during
@@ -44,7 +44,7 @@ valid.
 Algorithm outline
 -----------------
 Phase 1 — node-level moves (GPU):
-    For each node u, compute ΔQ for moving u to each neighbouring
+    For each node u, compute dQ for moving u to each neighbouring
     community.  Propose the best move.  Apply all proposals as a batch.
     Repeat until no node moves, or ``max_phase1_passes`` reached.
 
@@ -55,11 +55,11 @@ Phase 2 — graph coarsening (mixed GPU + CPU):
 
 Parameter guide
 ---------------
-min_delta_q  (float, default 1e-4)  Minimum ΔQ to accept a move.
+min_delta_q  (float, default 1e-4)  Minimum dQ to accept a move.
 max_levels   (int,   default 10)    Maximum Phase 1+2 recursion depth.
-resolution   (float, default 1.0)   γ in the modularity formula.
-                                    > 1.0 → more, smaller communities.
-                                    < 1.0 → fewer, larger communities.
+resolution   (float, default 1.0)   gamma in the modularity formula.
+                                    > 1.0 -> more, smaller communities.
+                                    < 1.0 -> fewer, larger communities.
 network_type (str,   default "grn") One of "grn", "ppi", "mirna".
 block_size   (int,   default 256)   CUDA block dimension.
 """
@@ -74,7 +74,7 @@ block_size   (int,   default 256)   CUDA block dimension.
 #   src.algorithms.cpu.multi_threaded.louvain
 #
 # Four PyCUDA kernels (one SourceModule, compiled once, cached):
-#   compute_proposed_moves     — Phase 1: three-tier degree-aware ΔQ scan
+#   compute_proposed_moves     — Phase 1: three-tier degree-aware dQ scan
 #                                + block-wide best-move reduction.
 #                                Writes proposals only; never touches the
 #                                community array directly.
@@ -82,9 +82,9 @@ block_size   (int,   default 256)   CUDA block dimension.
 #                                Updates community + comm_degree_sum via
 #                                atomicAdd.
 #   count_community_edges      — Phase 2: edge-parallel mapping
-#                                (u, v, w) → (comm[u], comm[v], w).
+#                                (u, v, w) -> (comm[u], comm[v], w).
 #   compute_modularity_partial — Final Q: per-block partial sums of
-#                                A_{ij} - γ·k_i·k_j/(2m) over same-
+#                                A_ij - gamma*k_i*k_j/(2m) over same-
 #                                community edges.
 #
 # Phase 2 sort + reduce now runs on the GPU.  CuPy path (preferred):
@@ -692,17 +692,17 @@ def _symmetrize(
 ) -> tuple[sp.csr_matrix, str]:
     """Convert the graph to an undirected weighted CSR for Louvain.
 
-    Louvain requires an undirected graph — modularity Q is undefined for
-    directed edges (the null model k_i·k_j / 2m assumes undirected degree).
+    Louvain requires an undirected graph - modularity Q is undefined for
+    directed edges (the null model k_i*k_j / (2m) assumes undirected degree).
 
     Behaviour by network type
     -------------------------
-    GRN    : A_sym = A + Aᵀ.  Mutual TF↔gene edges get weight 2 (stronger
-             co-regulation).  One-way TF→gene edges keep their original
+    GRN    : A_sym = A + A^T.  Mutual TF<->gene edges get weight 2 (stronger
+             co-regulation).  One-way TF->gene edges keep their original
              weight.
     PPI    : graph used as-is (already undirected; symmetrising would
              double every edge weight).
-    miRNA  : A_sym = A + Aᵀ (bipartite → mutual reads as weight 2).
+    miRNA  : A_sym = A + A^T (bipartite -> mutual reads as weight 2).
 
     Returns
     -------
@@ -713,10 +713,10 @@ def _symmetrize(
         A = graph_csr.astype(np.float32).tocsr()
         A.sum_duplicates()
         return A, "PPI: graph used as-is (already undirected)"
-    # grn / mirna / anything else → symmetrise
+    # grn / mirna / anything else -> symmetrise
     A = (graph_csr + graph_csr.T).astype(np.float32).tocsr()
     A.sum_duplicates()
-    return A, f"{nt.upper()}: A + Aᵀ applied (mutual edges weight 2)"
+    return A, f"{nt.upper()}: A + A^T applied (mutual edges weight 2)"
 
 
 def _remove_self_loops(csr: sp.csr_matrix) -> sp.csr_matrix:

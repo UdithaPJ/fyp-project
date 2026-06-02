@@ -32,7 +32,7 @@ GRN    : directed CSR, column-normalised by out-degree.
          probability mass is conserved during diffusion.
 PPI    : A_sym = A + Aᵀ, binarised, then column-normalised.
 PPI    bidirectional interactions get equal weight per direction.
-miRNA  : directed bipartite CSR (miRNA → gene), column-normalised.
+miRNA  : directed bipartite CSR (miRNA - gene), column-normalised.
          Gene-target nodes (out_degree == 0) get self-loops.
 
 Optimised GPU pipeline (this module)
@@ -202,7 +202,7 @@ VRAM_BUDGET_FRACTION: float = 0.80
 #                                     half-bit) weights, FP32 accumulation.
 #   rwr_spmv_smem_p                — small-graph SMEM-cached p variant.
 #   rwr_spmv_ellpack_hubs          — padded ELLPACK kernel for hub rows.
-#   l1_convergence_rwr             — Σ|p_new - p| block-partial.
+#   l1_convergence_rwr             — (total)|p_new - p| block-partial.
 #   rwr_spmv_restart_batched       — multi-seed batched variant (B <= 4).
 #
 # All kernels live in one SourceModule (compiled once, cached).
@@ -252,7 +252,7 @@ __global__ void reduce_to_scalar_f32(
 // KERNEL: rwr_spmv_restart  (FP32, three-tier)
 //
 // Fused SpMV + restart for a single seed set:
-//   p_new[i] = (1 - r) * Σ_j W[i,j] * p[j]  +  r * p0[i]
+//   p_new[i] = (1 - r) * total_j W[i,j] * p[j]  +  r * p0[i]
 //
 // One block per node i.  Three-tier degree-aware scheduling:
 //   LOW  (deg < 32)         : thread 0 only, serial scan
@@ -558,7 +558,7 @@ __global__ void rwr_spmv_ellpack_hubs(
 // =========================================================================
 // KERNEL: l1_convergence_rwr  (UNCHANGED)
 //
-// Σ |p_new[i] - p[i]| per block via warp-shuffle intra-warp reduction
+// (total) |p_new[i] - p[i]| per block via warp-shuffle intra-warp reduction
 // then a final warp-shuffle across the WARPS_PER_BLOCK partial sums in
 // shared memory.  Partials reduced by reduce_to_scalar_f32.
 // =========================================================================

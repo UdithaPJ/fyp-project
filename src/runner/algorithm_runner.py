@@ -24,9 +24,9 @@ Pipeline
 
 Public API
 ----------
-    run_algorithm(...)            → standardised result dict
-    get_algorithm_info(name)      → schema for one algorithm
-    list_algorithms()             → schemas for all 6 algorithms
+    run_algorithm(...)            -> standardised result dict
+    get_algorithm_info(name)      -> schema for one algorithm
+    list_algorithms()             -> schemas for all 6 algorithms
 
 The runner intentionally does NOT do any file I/O — it returns the
 result dict for the caller (web service, CLI, notebook) to persist.
@@ -222,7 +222,7 @@ def _attach_labels(
     if not isinstance(result, dict) or "result" not in result:
         return result
 
-    # Build reverse map: int → label
+    # Build reverse map: int -> label
     index_to_label = {int(v): str(k) for k, v in node_index_map.items()}
 
     def _label(idx: int) -> str:
@@ -408,7 +408,7 @@ def run_algorithm(
 #                     | "node_selector" | "multi_node_selector")
 #   default  : Any   (initial form value; matches the backend default)
 #   tooltip  : str   (shown on hover)
-#   advanced : bool  (True → behind the "Advanced Settings" toggle)
+#   advanced : bool  (True -> behind the "Advanced Settings" toggle)
 #
 # Type-specific additional keys:
 #   slider:              min, max, step, display_format ("scientific" optional)

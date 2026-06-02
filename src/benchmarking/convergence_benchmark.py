@@ -414,7 +414,7 @@ class ConvergenceBenchmarker:
         tol: float,
     ) -> float:
         """
-        Compute a final-error proxy as L2(scores − reference).
+        Compute a final-error proxy as L2(scores - reference).
 
         Reference is the tightest tolerance run for the *same* mode,
         or (if no tighter tolerance exists) the other mode's result.

@@ -4,7 +4,7 @@ algorithms/bfs.py — Breadth-First Search for Biological Regulatory Cascade Tra
 
 Biological Context
 ------------------
-In a Gene Regulatory Network (GRN), a directed edge TF → gene encodes a
+In a Gene Regulatory Network (GRN), a directed edge TF -> gene encodes a
 transcriptional regulatory event.  BFS from a *source TF* therefore traces its
 full *regulatory cascade*: the set of genes reachable via successive regulatory
 steps.
@@ -45,9 +45,9 @@ block_size (int, default 256) GPU thread block size (push kernel).
 # -------------------------------------------------------------
 # 1) Three-tier degree-aware scheduling inside a single push kernel
 #    (`bfs_frontier_tiered`):
-#       degree < WARP_SIZE      → 1 thread per node (serial scan)
-#       WARP_SIZE ≤ d < BLOCK   → 1 warp per node  (warp-stride loop)
-#       degree ≥ BLOCK_SIZE     → full block per node (block-stride loop)
+#       degree < WARP_SIZE      -> 1 thread per node (serial scan)
+#       WARP_SIZE <= d < BLOCK  -> 1 warp per node  (warp-stride loop)
+#       degree >= BLOCK_SIZE    -> full block per node (block-stride loop)
 #    This eliminates the hub-node tail-latency problem of one-thread-per-vertex.
 #
 # 2) Block-local shared-memory buffer + warp-level deduplication.  Each block
@@ -68,12 +68,12 @@ block_size (int, default 256) GPU thread block size (push kernel).
 #    automatically.
 #
 # 5) Adaptive push/pull direction switching (Beamer 2012).  Each level decides
-#    between push and pull based on `frontier_size > n / (4 · avg_degree)`.
+#    between push and pull based on `frontier_size > n / (4 * avg_degree)`.
 #    Pull uses the CSR-transpose and a bitmap frontier; push uses the dense
 #    int32 worklist.  Per-level decisions are recorded in `traversal_modes`.
 #
 # Compilation: `-arch=sm_75` (RTX 20-series, Turing — explicit project target).
-# Fallback chain: optimised GPU → CPU single-thread.
+# Fallback chain: optimised GPU -> CPU single-thread.
 # ──────────────────────────────────────────────────────────────────────────
 
 from __future__ import annotations
@@ -183,7 +183,7 @@ __global__ void bfs_frontier_tiered(
     // - low tier  : single thread does the work, others sit out.
     // - mid tier  : first warp (lanes 0..31) participates.
     // - high tier : the whole block participates.
-    int thread_start = -1;          // -1 → this thread is idle
+    int thread_start = -1;          // -1 -> this thread is idle
     int thread_stride = 1;
 
     if (degree < WARP_SIZE) {
@@ -305,7 +305,7 @@ __global__ void bfs_pull(
         const unsigned int uw = ((unsigned int)u) >> 5;
         const unsigned int ub = 1u << (((unsigned int)u) & 31u);
         if ((frontier_bitmap[uw] & ub) != 0u) {
-            // u is in the current frontier → v joins next level.
+            // u is in the current frontier -> v joins next level.
             // Atomic on the visited bit guarantees a single update even if
             // multiple incoming edges fire simultaneously.
             const unsigned int prev =
@@ -322,10 +322,10 @@ __global__ void bfs_pull(
 
 
 // =========================================================================
-// SUPPORT KERNELS — bitmap ↔ worklist conversion
+// SUPPORT KERNELS — bitmap <-> worklist conversion
 // =========================================================================
 
-// Build a bitmap from a dense worklist (used when switching push → pull).
+// Build a bitmap from a dense worklist (used when switching push -> pull).
 __global__ void worklist_to_bitmap(
     const int* __restrict__ worklist,
     const int                worklist_size,
@@ -339,7 +339,7 @@ __global__ void worklist_to_bitmap(
     atomicOr(&out_bitmap[w], b);
 }
 
-// Compact a bitmap back into a dense worklist (used when switching pull → push).
+// Compact a bitmap back into a dense worklist (used when switching pull -> push).
 __global__ void bitmap_to_worklist(
     const unsigned int* __restrict__ bitmap,
     const int                bitmap_words,
@@ -526,7 +526,7 @@ def _bfs_gpu_optimized(graph_csr: sp.csr_matrix, params: dict) -> dict:
 
         nnz       = int(g_eff.nnz)
         avg_deg   = max(nnz / max(N, 1), 1e-9)
-        # Beamer push→pull threshold.
+        # Beamer push->pull threshold.
         pp_threshold = N / max(4.0 * avg_deg, 1.0)
 
         bitmap_words = (N + 31) // 32
@@ -615,7 +615,7 @@ def _bfs_gpu_optimized(graph_csr: sp.csr_matrix, params: dict) -> dict:
                 if use_pull:
                     # Ensure d_cur_bmp holds the current frontier as a bitmap.
                     if mode_is_push:
-                        # Push-worklist → bitmap conversion.
+                        # Push-worklist -> bitmap conversion.
                         k_fill_u(
                             d_cur_bmp, np.int32(bitmap_words), np.uint32(0),
                             block=(block_size, 1, 1), grid=(grid_words, 1, 1),
@@ -640,7 +640,7 @@ def _bfs_gpu_optimized(graph_csr: sp.csr_matrix, params: dict) -> dict:
                 else:  # push
                     # Ensure d_cur_push holds the current frontier as a worklist.
                     if not mode_is_push:
-                        # Bitmap → worklist conversion.
+                        # Bitmap -> worklist conversion.
                         cuda.memcpy_htod(d_next_size, zero_i32)
                         gw = (bitmap_words + block_size - 1) // block_size
                         k_b2w(
