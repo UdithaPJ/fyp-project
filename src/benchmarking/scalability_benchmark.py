@@ -254,6 +254,81 @@ _GRAPH_GENERATORS: dict[str, Callable[[int], sp.csr_matrix]] = {
 
 
 # ---------------------------------------------------------------------------
+# Pre-generated graph loader
+# ---------------------------------------------------------------------------
+
+def _find_pregenerated(
+    graphs_dir: Path,
+    graph_type: str,
+    target_n: int | None = None,
+    target_m: int | None = None,
+    tolerance: float = 0.20,
+) -> tuple[sp.csr_matrix, int, int] | None:
+    """Load the best-matching pre-generated graph from *graphs_dir*.
+
+    Lookup priority
+    ---------------
+    1. Exact match on ``target_m`` (edge count) within ``tolerance``.
+    2. Exact match on ``target_n`` (node count) within ``tolerance``.
+    3. Closest-by-edge-count among all files of the requested type.
+
+    Returns ``(csr, actual_n, actual_m)`` or ``None`` if no file found.
+
+    File naming convention (produced by ``scripts/generate_benchmark_graphs.py``):
+        ``{graph_type}_n{N}_m{M}.npz``
+    """
+    import json as _json
+
+    pattern = f"{graph_type}_n*_m*.npz"
+    candidates: list[Path] = sorted(graphs_dir.glob(pattern))
+    if not candidates:
+        return None
+
+    def _parse(p: Path) -> tuple[int, int]:
+        """Extract (n, m) from filename.  Returns (0, 0) on failure."""
+        try:
+            stem = p.stem           # e.g. "barabasi_albert_n500000_m2997000"
+            n_part = stem.split("_n")[1].split("_m")[0]
+            m_part = stem.split("_m")[1]
+            return int(n_part), int(m_part)
+        except Exception:
+            return 0, 0
+
+    scored: list[tuple[float, Path, int, int]] = []
+    for cand in candidates:
+        cn, cm = _parse(cand)
+        if cn == 0:
+            continue
+        if target_m is not None:
+            diff = abs(cm - target_m) / max(target_m, 1)
+        elif target_n is not None:
+            diff = abs(cn - target_n) / max(target_n, 1)
+        else:
+            diff = 0.0
+        scored.append((diff, cand, cn, cm))
+
+    if not scored:
+        return None
+
+    scored.sort(key=lambda x: x[0])
+    best_diff, best_path, best_n, best_m = scored[0]
+
+    if best_diff > tolerance:
+        _LOG.warning(
+            "Best match for %s target_m=%s target_n=%s is %s "
+            "(diff=%.1f%% > tolerance=%.0f%%) — loading anyway.",
+            graph_type, target_m, target_n, best_path.name,
+            best_diff * 100, tolerance * 100,
+        )
+
+    _LOG.info("Loading pre-generated graph: %s", best_path.name)
+    csr = sp.load_npz(str(best_path)).tocsr()
+    csr.sum_duplicates()
+    csr.eliminate_zeros()
+    return csr, int(csr.shape[0]), int(csr.nnz)
+
+
+# ---------------------------------------------------------------------------
 # CPU / GPU runner (same pattern as runtime_benchmark.py)
 # ---------------------------------------------------------------------------
 
@@ -326,25 +401,38 @@ class ScalabilityBenchmarker:
 
     def __init__(
         self,
-        graph_sizes:  Iterable[int]  = GRAPH_SIZES,
-        graph_types:  Iterable[str]  = GRAPH_TYPES,
-        algorithms:   Iterable[str]  = ALGORITHMS,
-        modes:        Iterable[str]  = MODES,
-        network_type: str = "ppi",
-        output_dir:   str | Path = "experiments/outputs",
-        n_runs: int = 1,
+        graph_sizes:     Iterable[int]  = GRAPH_SIZES,
+        graph_types:     Iterable[str]  = GRAPH_TYPES,
+        algorithms:      Iterable[str]  = ALGORITHMS,
+        modes:           Iterable[str]  = MODES,
+        network_type:    str = "ppi",
+        output_dir:      str | Path = "experiments/outputs",
+        n_runs:          int = 1,
+        # Pre-generated graph support -----------------------------------
+        pregenerated_dir: str | Path | None = None,
+        edge_targets:    Iterable[int] | None = None,
     ) -> None:
-        self.graph_sizes  = tuple(sorted(set(graph_sizes)))
-        self.graph_types  = tuple(graph_types)
-        self.algorithms   = tuple(algorithms)
-        self.modes        = tuple(modes)
-        self.network_type = str(network_type).lower()
-        self.output_dir   = Path(output_dir)
-        self.reports_dir  = self.output_dir / "reports"
-        self.plots_dir    = self.output_dir / "plots"
+        self.graph_sizes     = tuple(sorted(set(graph_sizes)))
+        self.graph_types     = tuple(graph_types)
+        self.algorithms      = tuple(algorithms)
+        self.modes           = tuple(modes)
+        self.network_type    = str(network_type).lower()
+        self.output_dir      = Path(output_dir)
+        self.reports_dir     = self.output_dir / "reports"
+        self.plots_dir       = self.output_dir / "plots"
         self.reports_dir.mkdir(parents=True, exist_ok=True)
         self.plots_dir.mkdir(parents=True, exist_ok=True)
-        self.n_runs       = max(1, int(n_runs))
+        self.n_runs          = max(1, int(n_runs))
+        # Pre-generated graph directory; when set, graphs are loaded from
+        # disk instead of being generated on the fly.
+        self.pregenerated_dir: Path | None = (
+            Path(pregenerated_dir) if pregenerated_dir else None
+        )
+        # Optional edge-count targets used when pregenerated_dir is set.
+        # Each target maps to the closest pre-generated graph for each type.
+        self.edge_targets: tuple[int, ...] = (
+            tuple(sorted(set(edge_targets))) if edge_targets else ()
+        )
 
         self.records: list[ScalabilityRecord] = []
 
@@ -355,86 +443,127 @@ class ScalabilityBenchmarker:
         algorithms: Optional[Iterable[str]] = None,
     ) -> None:
         algos = tuple(algorithms) if algorithms else self.algorithms
-        total = (len(algos) * len(self.graph_types)
-                 * len(self.graph_sizes) * len(self.modes))
+
+        # Build the list of (label, loader) pairs to iterate.
+        # When pregenerated_dir is set:
+        #   • if edge_targets was given → one entry per (type, edge_target)
+        #   • otherwise                 → one entry per (type, node_size),
+        #     loading the closest matching file for each size
+        # When pregenerated_dir is not set → on-the-fly generation as before.
+        graph_jobs: list[tuple[str, int | None, int | None]] = []
+        if self.pregenerated_dir and self.edge_targets:
+            for gt in self.graph_types:
+                for et in self.edge_targets:
+                    graph_jobs.append((gt, None, et))
+        else:
+            for gt in self.graph_types:
+                for sz in self.graph_sizes:
+                    graph_jobs.append((gt, sz, None))
+
+        total = len(algos) * len(graph_jobs) * len(self.modes)
         done  = 0
 
-        for graph_type in self.graph_types:
-            gen = _GRAPH_GENERATORS.get(graph_type)
-            if gen is None:
-                _LOG.warning("unknown graph_type %r — skipping", graph_type)
-                continue
-
-            for target_n in self.graph_sizes:
-                _LOG.info("generating %s n=%d…", graph_type, target_n)
-                log_memory(f"Before generating {graph_type} n={target_n}", _LOG)
+        for graph_type, target_n, target_m in graph_jobs:
+            # ---- Graph acquisition ------------------------------------
+            if self.pregenerated_dir is not None:
+                label = (
+                    f"{graph_type} m≈{target_m:,}"
+                    if target_m else f"{graph_type} n≈{target_n:,}"
+                )
+                _LOG.info("Loading %s from %s …",
+                          label, self.pregenerated_dir)
+                log_memory(f"Before loading {label}", _LOG)
+                loaded = _find_pregenerated(
+                    self.pregenerated_dir,
+                    graph_type,
+                    target_n=target_n,
+                    target_m=target_m,
+                )
+                if loaded is None:
+                    _LOG.error(
+                        "No pre-generated file found for %s "
+                        "(target_n=%s, target_m=%s) in %s — skipping.",
+                        graph_type, target_n, target_m, self.pregenerated_dir,
+                    )
+                    continue
+                g, actual_n, actual_m = loaded
+                log_memory(f"After loading {label}", _LOG)
+            else:
+                target_n_use = target_n or 10_000
+                gen = _GRAPH_GENERATORS.get(graph_type)
+                if gen is None:
+                    _LOG.warning("unknown graph_type %r — skipping", graph_type)
+                    continue
+                _LOG.info("generating %s n=%d…", graph_type, target_n_use)
+                log_memory(f"Before generating {graph_type} n={target_n_use}", _LOG)
                 try:
-                    g = gen(target_n).tocsr()
+                    g = gen(target_n_use).tocsr()
                     g.sum_duplicates()
                     g.eliminate_zeros()
                 except Exception as exc:
                     _LOG.error("graph generation failed: %s", exc)
                     continue
-                log_memory(f"After generating {graph_type} n={target_n}", _LOG)
+                log_memory(f"After generating {graph_type} n={target_n_use}", _LOG)
+                actual_n = int(g.shape[0])
+                actual_m = int(g.nnz)
 
-                actual_n = g.shape[0]
-                actual_m = g.nnz
+            # ---- Algorithm × mode loop (shared by both paths) --------
+            for algorithm in algos:
+                params = dict(_DEFAULT_PARAMS.get(algorithm, {}))
+                params["network_type"] = self.network_type
+                # Ensure BFS source / RWR seeds are valid for this graph
+                if "source" in params:
+                    params["source"] = 0
+                if "seed_nodes" in params:
+                    params["seed_nodes"] = [0]
 
-                for algorithm in algos:
-                    params = dict(_DEFAULT_PARAMS.get(algorithm, {}))
-                    params["network_type"] = self.network_type
-                    # Ensure BFS source / RWR seeds are valid for this graph
-                    if "source" in params:
-                        params["source"] = 0
-                    if "seed_nodes" in params:
-                        params["seed_nodes"] = [0]
+                for mode in self.modes:
+                    done += 1
+                    _LOG.info("[%d/%d] %s/%s/%s n=%d m=%d",
+                              done, total, algorithm, graph_type, mode,
+                              actual_n, actual_m)
 
-                    for mode in self.modes:
-                        done += 1
-                        _LOG.info("[%d/%d] %s/%s/%s n=%d",
-                                  done, total, algorithm, graph_type, mode, actual_n)
+                    # Average over n_runs
+                    times: list[float] = []
+                    mems:  list[float] = []
+                    err:   Optional[str] = None
 
-                        # Average over n_runs
-                        times: list[float] = []
-                        mems:  list[float] = []
-                        err:   Optional[str] = None
+                    for _ in range(self.n_runs):
+                        gc.collect()
+                        try:
+                            t, mb = _run_once_timed(algorithm, mode, g, params)
+                            times.append(t)
+                            mems.append(mb)
+                        except Exception as exc:
+                            err = f"{type(exc).__name__}: {exc}"
+                            _LOG.warning("%s/%s/%s n=%d: %s",
+                                         algorithm, graph_type, mode,
+                                         actual_n, err)
+                            break
 
-                        for _ in range(self.n_runs):
-                            gc.collect()
-                            try:
-                                t, mb = _run_once_timed(algorithm, mode, g, params)
-                                times.append(t)
-                                mems.append(mb)
-                            except Exception as exc:
-                                err = f"{type(exc).__name__}: {exc}"
-                                _LOG.warning("%s/%s/%s n=%d: %s",
-                                             algorithm, graph_type, mode,
-                                             actual_n, err)
-                                break
-
-                        if times:
-                            self.records.append(ScalabilityRecord(
-                                algorithm=algorithm,
-                                graph_type=graph_type,
-                                n_nodes=actual_n,
-                                n_edges=actual_m,
-                                mode=mode,
-                                runtime_s=float(np.mean(times)),
-                                peak_mb=float(np.mean(mems)),
-                                success=True,
-                            ))
-                        else:
-                            self.records.append(ScalabilityRecord(
-                                algorithm=algorithm,
-                                graph_type=graph_type,
-                                n_nodes=actual_n,
-                                n_edges=actual_m,
-                                mode=mode,
-                                runtime_s=float("nan"),
-                                peak_mb=float("nan"),
-                                success=False,
-                                error=err,
-                            ))
+                    if times:
+                        self.records.append(ScalabilityRecord(
+                            algorithm=algorithm,
+                            graph_type=graph_type,
+                            n_nodes=actual_n,
+                            n_edges=actual_m,
+                            mode=mode,
+                            runtime_s=float(np.mean(times)),
+                            peak_mb=float(np.mean(mems)),
+                            success=True,
+                        ))
+                    else:
+                        self.records.append(ScalabilityRecord(
+                            algorithm=algorithm,
+                            graph_type=graph_type,
+                            n_nodes=actual_n,
+                            n_edges=actual_m,
+                            mode=mode,
+                            runtime_s=float("nan"),
+                            peak_mb=float("nan"),
+                            success=False,
+                            error=err,
+                        ))
 
     # ---- CSV output ----
 

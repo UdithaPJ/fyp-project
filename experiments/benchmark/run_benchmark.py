@@ -135,6 +135,15 @@ def _run_scalability(args: argparse.Namespace) -> None:
     sizes = [int(s) for s in str(args.sizes).split(",") if s.strip()]
     types = [t.strip() for t in args.graph_types.split(",") if t.strip()]
 
+    # Pre-generated graph support: parse --edge-targets if provided.
+    edge_targets = None
+    if hasattr(args, "edge_targets") and args.edge_targets:
+        edge_targets = [int(e) for e in str(args.edge_targets).split(",")
+                        if e.strip()]
+
+    # graphs_dir: None means on-the-fly generation.
+    graphs_dir = getattr(args, "graphs_dir", None)
+
     sb = ScalabilityBenchmarker(
         graph_sizes=sizes,
         graph_types=types,
@@ -143,9 +152,22 @@ def _run_scalability(args: argparse.Namespace) -> None:
         output_dir=args.output_dir,
         network_type=args.network_type,
         n_runs=args.n_runs,
+        pregenerated_dir=graphs_dir,
+        edge_targets=edge_targets,
     )
+
+    if graphs_dir:
+        print(f"[benchmark] Using pre-generated graphs from: {graphs_dir}")
+        if edge_targets:
+            print(f"[benchmark] Edge targets: {edge_targets}")
+        else:
+            print(f"[benchmark] Node sizes (closest match): {sizes}")
+    else:
+        print(f"[benchmark] Generating graphs on the fly.")
+
     print(f"[benchmark] ScalabilityBenchmarker: "
-          f"{len(sb.graph_types)} types × {len(sb.graph_sizes)} sizes × "
+          f"{len(sb.graph_types)} types × "
+          f"{len(edge_targets or sizes)} sizes × "
           f"{len(sb.algorithms)} algos × {len(sb.modes)} modes")
     sb.run()
     csv_path   = sb.write_csv()
@@ -207,9 +229,30 @@ def _add_real_dataset_args(p: argparse.ArgumentParser) -> None:
 
 def _add_scalability_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--sizes", default="10000,50000,100000,500000",
-                   help="comma-separated target node counts")
+                   help="comma-separated target node counts (on-the-fly generation)")
     p.add_argument("--graph-types",
                    default="barabasi_albert,erdos_renyi,watts_strogatz")
+    # Pre-generated graph options (use when graphs are too large to generate
+    # on the benchmark machine — run scripts/generate_benchmark_graphs.py
+    # on a high-end system first, then point --graphs-dir here).
+    p.add_argument(
+        "--graphs-dir", default=None, metavar="DIR",
+        help=(
+            "Path to a directory of pre-generated .npz graph files "
+            "(produced by scripts/generate_benchmark_graphs.py). "
+            "When set, graphs are loaded from disk instead of generated. "
+            "Combine with --edge-targets for edge-count-based selection."
+        ),
+    )
+    p.add_argument(
+        "--edge-targets", default=None,
+        metavar="M1,M2,...",
+        help=(
+            "Comma-separated target edge counts for pre-generated graphs "
+            "(e.g. 1000000,10000000,50000000).  Requires --graphs-dir. "
+            "The benchmarker picks the closest matching .npz file per type."
+        ),
+    )
 
 
 def main() -> None:
