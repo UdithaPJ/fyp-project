@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 from pathlib import Path
 from typing import Callable, Dict, Optional, Tuple
 
@@ -23,6 +24,10 @@ from .modules import (
 class PreprocessingPipeline:
     """Coordinate the modular preprocessing steps."""
 
+    # MEMORY_FIX (Fix Cat. 7): lowered from 500 MB to 100 MB so that any
+    # delimited file over 100 MB streams through chunked preprocessing.
+    # That keeps peak RAM bounded by chunk_size rather than the full
+    # single-shot read which is the C-1 / C-2 OOM driver.
     CHUNK_MODE_FILE_SIZE_THRESHOLD_BYTES = 100 * 1024 * 1024
 
     def __init__(self) -> None:
@@ -93,14 +98,21 @@ class PreprocessingPipeline:
             mapped_dataframe,
             default_weight=default_weight,
         )
+        # MEMORY_FIX (D-4): mapped_dataframe is still needed by
+        # ValidationModule._count_missing_values (it counts pre-clean blanks);
+        # we pre-compute that here and drop mapped_dataframe immediately.
+        missing_values = self.validation_module._count_missing_values(
+            mapped_dataframe
+        )
+        del mapped_dataframe
         final_dataframe = self.duplicate_handler.handle(
             cleaned_dataframe,
             strategy=duplicate_strategy,
         )
         graph_data = self.graph_builder.build(final_dataframe)
-        report = self.validation_module.build_report(
-            raw_dataframe=raw_dataframe,
-            mapped_dataframe=mapped_dataframe,
+        report = self.validation_module.build_chunked_report(
+            number_of_rows=int(len(raw_dataframe)),
+            missing_values=missing_values,
             cleaned_dataframe=cleaned_dataframe,
             final_dataframe=final_dataframe,
             graph_data=graph_data,
@@ -109,6 +121,10 @@ class PreprocessingPipeline:
             duplicate_strategy=duplicate_strategy,
             cleaning_stats=cleaning_stats,
         )
+        # MEMORY_FIX (D-3/D-5): release every intermediate DataFrame as
+        # soon as the validation report is built.
+        del raw_dataframe, cleaned_dataframe, final_dataframe
+        gc.collect()
         return graph_data, report
 
     def run_with_chunks(
@@ -117,7 +133,10 @@ class PreprocessingPipeline:
         user_override: Optional[Dict[str, str]] = None,
         duplicate_strategy: str = "mean",
         default_weight: float = 1.0,
-        chunksize: int = 10000,
+        # MEMORY_FIX (Fix Cat. 7): default raised from 10 000 to 500 000
+        # rows.  Smaller chunks make pandas spend most of its time on
+        # per-chunk overhead; 500k rows still keeps memory bounded.
+        chunksize: int = 500_000,
     ) -> Tuple[GraphData, Dict[str, object]]:
         """Preprocess a delimited file by loading and cleaning it in chunks."""
 
@@ -260,9 +279,15 @@ class PreprocessingPipeline:
         graph_data = self.graph_builder.build(final_dataframe)
 
         self._notify_progress(progress_callback, "validation", 0.95)
-        report = self.validation_module.build_report(
-            raw_dataframe=raw_dataframe,
-            mapped_dataframe=mapped_dataframe,
+        # MEMORY_FIX (D-4): pre-compute missing counts so we can drop
+        # mapped_dataframe early — same approach as run_dataframe().
+        missing_values = self.validation_module._count_missing_values(
+            mapped_dataframe
+        )
+        del mapped_dataframe
+        report = self.validation_module.build_chunked_report(
+            number_of_rows=int(len(raw_dataframe)),
+            missing_values=missing_values,
             cleaned_dataframe=cleaned_dataframe,
             final_dataframe=final_dataframe,
             graph_data=graph_data,
@@ -271,6 +296,10 @@ class PreprocessingPipeline:
             duplicate_strategy=duplicate_strategy,
             cleaning_stats=cleaning_stats,
         )
+        # MEMORY_FIX (D-3/D-5): release every intermediate DataFrame once
+        # the validation report exists.
+        del raw_dataframe, cleaned_dataframe, final_dataframe
+        gc.collect()
         self._notify_progress(progress_callback, "completed", 1.0)
         return graph_data, report
 
@@ -280,7 +309,7 @@ class PreprocessingPipeline:
         user_override: Optional[Dict[str, str]] = None,
         duplicate_strategy: str = "mean",
         default_weight: float = 1.0,
-        chunksize: int = 10000,
+        chunksize: int = 500_000,
         chunk_mode_file_size_threshold_bytes: Optional[int] = None,
     ) -> Tuple[GraphData, Dict[str, object]]:
         """Automatically switch to chunk mode for large delimited files."""

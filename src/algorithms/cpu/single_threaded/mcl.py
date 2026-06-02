@@ -64,12 +64,25 @@ def _merge_params(user_params: dict | None) -> dict:
 
 def _inflate_serial(M: sp.csr_matrix, r: float) -> sp.csr_matrix:
     """Inflation step (serial): element-wise power r, then column-renormalise."""
-    M_csc = M.tocsc().astype(np.float64)
-    M_csc.data **= r
-    col_sums = np.asarray(M_csc.sum(axis=0)).flatten()
-    col_sums[col_sums == 0.0] = 1.0
-    inv = sp.diags(1.0 / col_sums, format="csr")
-    return (M_csc @ inv).tocsr()
+    # MEMORY_FIX (C-5/M-8): keep everything float32 and mutate in place.
+    # Old code: tocsc().astype(float64) → +120 MB transient per iter on a
+    # 15 M-edge graph.  Then the `M_csc @ inv` SpGEMM allocates another
+    # full output matrix that is only used to renormalise.  Both are
+    # avoidable: scale data column-by-column via indptr ranges.
+    M_csc = M.tocsc()
+    if M_csc.dtype != np.float32:
+        M_csc = M_csc.astype(np.float32)
+    np.power(M_csc.data, r, out=M_csc.data)
+    indptr = M_csc.indptr
+    data = M_csc.data
+    for j in range(M_csc.shape[1]):
+        s, e = int(indptr[j]), int(indptr[j + 1])
+        if s == e:
+            continue
+        col_sum = float(data[s:e].sum())
+        if col_sum > 0.0:
+            data[s:e] /= col_sum
+    return M_csc.tocsr()
 
 
 # ---------------------------------------------------------------------------

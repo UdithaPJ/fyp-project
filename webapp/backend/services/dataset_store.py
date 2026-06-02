@@ -33,7 +33,9 @@ class DatasetRecord:
 
     upload_id:      str
     filename:       str
-    dataframe:      pd.DataFrame
+    # MEMORY_FIX (C-2): dataframe is now Optional — preprocessing_service
+    # nulls it out after the CSR is built so it can be garbage-collected.
+    dataframe:      Optional[pd.DataFrame]   = None
     # Populated after /preprocess (or /preprocess/stream) completes.
     graph_data:     Optional[Any]            = None    # src.preprocessing.GraphData
     graph_csr:      Optional[Any]            = None    # scipy.sparse.csr_matrix

@@ -40,6 +40,7 @@ from src.algorithms.common.helpers import (
     _build_transition_matrix,
     _top_nodes,
     _top_tfs,
+    _worker_init_no_blas,
 )
 from src.algorithms.cpu.single_threaded.rwr import rwr_cpu_single
 
@@ -151,7 +152,10 @@ def rwr_cpu_multi(
         for seed_set in seeds
     ]
 
-    with ProcessPoolExecutor(max_workers=n_workers) as executor:
+    # MEMORY_FIX (H-3): worker BLAS pinned to 1 thread to avoid oversubscription.
+    with ProcessPoolExecutor(
+        max_workers=n_workers, initializer=_worker_init_no_blas
+    ) as executor:
         results = list(executor.map(_rwr_seed_set_worker, args_list))
 
     score_matrix = np.array([res[0] for res in results], dtype=np.float64)

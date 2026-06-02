@@ -19,6 +19,7 @@ get_graph_stats(graph_csr, node_index_map)
 
 from __future__ import annotations
 
+import gc
 from typing import Dict, Tuple
 
 import numpy as np
@@ -88,11 +89,15 @@ def graphdata_to_csr(
         empty = sp.csr_matrix((0, 0), dtype=np.float32)
         return empty, {}
 
-    # ---- Build COO triplets ----
-    rows: list[int] = []
-    cols: list[int] = []
-    vals: list[float] = []
+    # MEMORY_FIX (M-5): allocate numpy arrays up-front instead of growing
+    # Python lists; for 15 M edges this avoids ~1.25 GB of PyObject ints
+    # in the intermediate row/col/val lists.
+    m = len(graph_data.edges)
+    rows_arr = np.empty(m, dtype=np.int32)
+    cols_arr = np.empty(m, dtype=np.int32)
+    vals_arr = np.empty(m, dtype=np.float32)
 
+    write = 0
     for src, tgt, attrs in graph_data.edges:
         i = node_index_map.get(src)
         j = node_index_map.get(tgt)
@@ -100,22 +105,31 @@ def graphdata_to_csr(
             # Edge references a node not in the node map — skip silently.
             continue
         weight = float(attrs.get("weight", 1.0)) if attrs else 1.0
-        rows.append(i)
-        cols.append(j)
-        vals.append(weight)
+        rows_arr[write] = i
+        cols_arr[write] = j
+        vals_arr[write] = weight
+        write += 1
 
-    if not rows:
+    if write == 0:
         empty = sp.csr_matrix((n, n), dtype=np.float32)
         return empty, node_index_map
 
+    # Trim to actually-written length (skipped edges leave a gap).
+    rows_arr = rows_arr[:write]
+    cols_arr = cols_arr[:write]
+    vals_arr = vals_arr[:write]
+
     # scipy COO → CSR: duplicate (i, j) entries are summed automatically.
     coo = sp.coo_matrix(
-        (np.array(vals, dtype=np.float32),
-         (np.array(rows, dtype=np.int32),
-          np.array(cols, dtype=np.int32))),
+        (vals_arr, (rows_arr, cols_arr)),
         shape=(n, n),
     )
     csr = coo.tocsr()
+    # MEMORY_FIX (M-5/D-6): drop the COO + the row/col/val arrays as soon
+    # as the CSR exists; otherwise three int32/float32 arrays of length
+    # nnz stay alive alongside the CSR's own copies.
+    del coo, rows_arr, cols_arr, vals_arr
+    gc.collect()
     return csr, node_index_map
 
 
@@ -126,6 +140,7 @@ def graphdata_to_csr(
 def get_graph_stats(
     graph_csr: sp.csr_matrix,
     node_index_map: Dict[str, int],
+    compute_components: bool = False,
 ) -> dict:
     """
     Compute structural statistics from a CSR adjacency matrix.
@@ -181,18 +196,25 @@ def get_graph_stats(
         pass  # keep is_directed = True on any error
 
     # ---- Connected components (weakly, via undirected adjacency) ----
-    num_components = 1
-    try:
-        # Use undirected adjacency for component counting regardless of
-        # directed/undirected status (weakly connected components).
-        undirected = (graph_csr + graph_csr.T)
-        undirected.data[:] = 1          # binarize
-        n_comp, _ = sp.csgraph.connected_components(
-            undirected, directed=False, return_labels=True
-        )
-        num_components = int(n_comp)
-    except Exception:
-        pass  # keep num_components = 1 on any error
+    # MEMORY_FIX (H-6): allocating `graph_csr + graph_csr.T` for the
+    # symmetric view is ~250 MB transient at 15 M edges, and the result
+    # is rarely required for the Graph Summary preview.  Skip by default;
+    # callers that actually need the count can opt in.
+    num_components = 0
+    if compute_components:
+        try:
+            # Use undirected adjacency for component counting regardless of
+            # directed/undirected status (weakly connected components).
+            undirected = (graph_csr + graph_csr.T)
+            undirected.data[:] = 1          # binarize
+            n_comp, _ = sp.csgraph.connected_components(
+                undirected, directed=False, return_labels=True
+            )
+            num_components = int(n_comp)
+            del undirected
+            gc.collect()
+        except Exception:
+            pass  # keep num_components = 0 on any error
 
     return {
         "num_nodes":      n,

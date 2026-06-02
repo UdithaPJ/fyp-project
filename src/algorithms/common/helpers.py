@@ -22,11 +22,46 @@ Importers alias them back to the local name they expect, e.g.:
 
 from __future__ import annotations
 
+import os
 from typing import Callable
 
 import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.csgraph as csgraph
+
+
+# ===========================================================================
+# Worker-process initializer (used by every cpu_multi algorithm)
+# ===========================================================================
+
+def _worker_init_no_blas() -> None:
+    """Multiprocessing pool initializer — pin worker BLAS threads to 1.
+
+    MEMORY_FIX (H-3): without this, every worker process inherits the
+    parent's OMP_NUM_THREADS=physical_cores and each Pool with 4 workers
+    spawns 4 × physical_cores BLAS threads on the same CPU.  The
+    resulting oversubscription collapses throughput on biological graphs.
+
+    The env-var changes must happen BEFORE numpy/scipy import inside the
+    worker — `import` order is preserved by `spawn` start method as long
+    as we set the variables before any heavy import the worker may use.
+    """
+    for var in (
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "BLIS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+    ):
+        os.environ[var] = "1"
+    # Some BLAS libs expose runtime knobs via threadpoolctl; set them too
+    # when the module is already loaded.
+    try:
+        from threadpoolctl import threadpool_limits
+        threadpool_limits(1)
+    except Exception:                                              # noqa: BLE001
+        pass
 
 # ---------------------------------------------------------------------------
 # Module-level constants (used as default parameters in helper signatures)
@@ -68,11 +103,14 @@ def _build_transition_matrix(
     M            : (N, N) CSR, column-stochastic over non-dangling nodes
     dangling_mask: boolean array of length N, True for dangling nodes
     """
-    out_degrees   = np.asarray(graph_csr.sum(axis=1)).flatten()
+    # MEMORY_FIX (M-3): build the transition matrix in float32.  Score
+    # vectors converge under FP32 tolerance ≥ 1e-7; FP64 halves SIMD
+    # throughput and doubles RAM for no biological-precision benefit.
+    out_degrees   = np.asarray(graph_csr.sum(axis=1)).flatten().astype(np.float32)
     dangling_mask = out_degrees == 0
-    safe_degrees  = np.where(dangling_mask, 1.0, out_degrees)
-    D_inv         = sp.diags(1.0 / safe_degrees, format="csr")
-    M             = (D_inv @ graph_csr).T.tocsr().astype(np.float64)
+    safe_degrees  = np.where(dangling_mask, np.float32(1.0), out_degrees)
+    D_inv         = sp.diags(1.0 / safe_degrees, format="csr", dtype=np.float32)
+    M             = (D_inv @ graph_csr).T.tocsr().astype(np.float32)
     return M, dangling_mask
 
 
@@ -175,11 +213,12 @@ def hits_pack_result(
 
 def _make_p0(seed_nodes: list[int], N: int) -> np.ndarray:
     """Uniform distribution over seed nodes; falls back to 1/N if none valid."""
-    p0    = np.zeros(N, dtype=np.float64)
+    # MEMORY_FIX (M-3): FP32 — matches the FP32 transition matrix.
+    p0    = np.zeros(N, dtype=np.float32)
     valid = [s for s in seed_nodes if 0 <= s < N]
     if not valid:
-        return np.full(N, 1.0 / N, dtype=np.float64)
-    p0[valid] = 1.0 / len(valid)
+        return np.full(N, np.float32(1.0 / N), dtype=np.float32)
+    p0[valid] = np.float32(1.0 / len(valid))
     return p0
 
 
@@ -214,7 +253,9 @@ def _symmetrize(graph_csr: sp.csr_matrix) -> sp.csr_matrix:
     """
     A_sym = (graph_csr + graph_csr.T).tocsr()
     A_sym.sum_duplicates()
-    return A_sym.astype(np.float64)
+    # MEMORY_FIX (M-6): float32 keeps the symmetric view cheap; modularity
+    # under FP32 differs from FP64 only in the 7th significant digit.
+    return A_sym.astype(np.float32)
 
 
 def _compute_modularity(
@@ -412,6 +453,30 @@ def _extract_clusters(M: sp.csr_matrix) -> np.ndarray:
         )
         return labels.astype(np.int32)
 
-    M_att       = np.asarray(M_csr[:, attractors].todense())   # (n, K)
-    assignments = np.argmax(M_att, axis=1).flatten()
-    return assignments.astype(np.int32)
+    # MEMORY_FIX (C-4): the previous `np.asarray(M_csr[:, attractors].todense())`
+    # allocated an (n × K) dense FP64 matrix.  For n=500k, K=1000 that is
+    # 4 GB and reliably OOMs.  We now walk the CSR row-wise and pick the
+    # heaviest attractor for each node, allocating only an (n,) int32
+    # assignment vector and an int32 column→attractor-index lookup.
+    attractor_rank = np.full(n, -1, dtype=np.int32)
+    attractor_rank[attractors] = np.arange(len(attractors), dtype=np.int32)
+
+    assignments = np.zeros(n, dtype=np.int32)
+    indptr  = M_csr.indptr
+    indices = M_csr.indices
+    data    = M_csr.data
+    for i in range(n):
+        s, e = int(indptr[i]), int(indptr[i + 1])
+        if s == e:
+            continue
+        # Mask this row's columns down to those that are attractors.
+        cols = indices[s:e]
+        ranks = attractor_rank[cols]
+        keep = ranks >= 0
+        if not keep.any():
+            continue
+        vals = data[s:e][keep]
+        sub_ranks = ranks[keep]
+        # Index of max value within the kept subset → attractor index.
+        assignments[i] = int(sub_ranks[int(np.argmax(vals))])
+    return assignments

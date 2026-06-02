@@ -29,6 +29,7 @@ import scipy.sparse as sp
 from src.algorithms.common.helpers import (
     _build_transition_matrix,
     _split_top_nodes,
+    _worker_init_no_blas,
 )
 
 # ---------------------------------------------------------------------------
@@ -140,30 +141,36 @@ def pagerank_cpu_multi(
     PR        = np.full(N, 1.0 / N, dtype=np.float64)
     converged = False
 
-    for iteration in range(1, max_iter + 1):
-        PR_old = PR
+    # MEMORY_FIX (H-1/H-3): spin up the pool ONCE, with a BLAS-tamed
+    # initializer, and reuse it across every iteration's SpMV.  The old
+    # code recreated a ProcessPoolExecutor inside the loop — 100 iter ×
+    # n_workers spawns dominated benchmark time on Windows (spawn ≈ 1 s).
+    with ProcessPoolExecutor(
+        max_workers=n_workers, initializer=_worker_init_no_blas
+    ) as executor:
+        for iteration in range(1, max_iter + 1):
+            PR_old = PR
 
-        dangling_mass = d * float(PR_old[dangling_mask].sum())
-        dangling_contrib = np.zeros(N, dtype=np.float64)
-        if n_active > 0:
-            dangling_contrib[active_mask] = dangling_mass / n_active
-        else:
-            dangling_contrib[:] = dangling_mass / N
+            dangling_mass = d * float(PR_old[dangling_mask].sum())
+            dangling_contrib = np.zeros(N, dtype=np.float64)
+            if n_active > 0:
+                dangling_contrib[active_mask] = dangling_mass / n_active
+            else:
+                dangling_contrib[:] = dangling_mass / N
 
-        args_list = [
-            (spec[0], spec[1], spec[2], PR_old, spec[4])
-            for spec in chunk_specs
-        ]
+            args_list = [
+                (spec[0], spec[1], spec[2], PR_old, spec[4])
+                for spec in chunk_specs
+            ]
 
-        with ProcessPoolExecutor(max_workers=n_workers) as executor:
             partial_results = list(executor.map(_spmv_row_chunk, args_list))
 
-        spmv_result = np.concatenate(partial_results)
-        PR = d * spmv_result + dangling_contrib + teleport_per_node
+            spmv_result = np.concatenate(partial_results)
+            PR = d * spmv_result + dangling_contrib + teleport_per_node
 
-        if np.abs(PR - PR_old).sum() < tol:
-            converged = True
-            break
+            if np.abs(PR - PR_old).sum() < tol:
+                converged = True
+                break
 
     top_reg, top_tgt = _split_top_nodes(PR, out_degrees)
     return {

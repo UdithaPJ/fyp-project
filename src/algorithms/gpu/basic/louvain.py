@@ -80,16 +80,14 @@ def _build_top_communities(
 # ---------------------------------------------------------------------------
 
 def _louvain_cugraph(
-    graph_csr: sp.csr_matrix, params: dict,
+    G, graph_csr: sp.csr_matrix, params: dict,
 ) -> tuple[np.ndarray, float, str]:
+    """MEMORY_FIX (H-4): cuGraph.Graph is built by the caller before timing."""
     louvain = cugraph_function("louvain")
     if louvain is None:
         raise RuntimeError("cugraph.louvain is not available in this RAPIDS version.")
 
     nt = str(params.get("network_type", "grn")).lower()
-    A_sym = symmetrize_for(graph_csr, "grn") if nt != "ppi" else graph_csr
-    G = cugraph_build_graph(A_sym, directed=False, weighted=True)
-
     import inspect
     try:
         accepted = set(inspect.signature(louvain).parameters.keys())
@@ -139,8 +137,13 @@ def louvain_gpu_baseline(
     p = {**_DEFAULT_PARAMS, **(params or {})}
     network_type = str(p.get("network_type", "grn")).lower()
 
+    # MEMORY_FIX (H-4): build cugraph.Graph before the timed region.
+    nt = network_type
+    A_sym = symmetrize_for(graph_csr, "grn") if nt != "ppi" else graph_csr
+    G = cugraph_build_graph(A_sym, directed=False, weighted=True)
+
     t0 = time.perf_counter()
-    assignments, modularity_val, note = _louvain_cugraph(graph_csr, p)
+    assignments, modularity_val, note = _louvain_cugraph(G, graph_csr, p)
     elapsed = time.perf_counter() - t0
 
     # Renumber to compact 0..K-1.

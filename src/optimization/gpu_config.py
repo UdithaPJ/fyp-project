@@ -89,6 +89,12 @@ _CACHED_CONFIG: dict | None = None
 _HARDWARE_CONFIG: dict | None = None              # alias of _CACHED_CONFIG
 _GRAPH_PROFILE_CACHE: dict[str, dict] = {}
 _STRATEGY_CACHE: dict[tuple[str, str], dict] = {}
+# MEMORY_FIX (Fix Cat. 5): per-graph derived-artefact caches keyed by
+# GraphProfiler fingerprint.  Repeated benchmark runs against the same
+# graph reuse these rather than recomputing the transpose / degrees /
+# ELLPACK split every algorithm invocation.
+_TRANSPOSE_CACHE: dict[str, tuple] = {}   # {fp: (indptr, indices, data)}
+_DEGREE_CACHE:    dict[str, tuple] = {}   # {fp: (out_deg, in_deg)}
 
 _VALID_ALGORITHMS = ("pagerank", "louvain", "rwr", "hits", "bfs", "mcl")
 
@@ -100,6 +106,44 @@ def _reset_cache() -> None:
     _HARDWARE_CONFIG = None
     _GRAPH_PROFILE_CACHE.clear()
     _STRATEGY_CACHE.clear()
+    _TRANSPOSE_CACHE.clear()
+    _DEGREE_CACHE.clear()
+
+
+# ---------------------------------------------------------------------------
+# Per-graph derived-artefact caches (MEMORY_FIX, Fix Category 5)
+# ---------------------------------------------------------------------------
+
+def get_cached_transpose(graph_csr, fingerprint: str) -> tuple:
+    """Return ``(row_ptr_T, col_idx_T, values_T)`` as cached int32/float32
+    arrays of the transposed CSR.  Computed once per fingerprint."""
+    import numpy as _np
+    import gc as _gc
+    cached = _TRANSPOSE_CACHE.get(fingerprint)
+    if cached is not None:
+        return cached
+    A_T = graph_csr.T.tocsr()
+    arrays = (
+        _np.ascontiguousarray(A_T.indptr,  _np.int32),
+        _np.ascontiguousarray(A_T.indices, _np.int32),
+        _np.ascontiguousarray(A_T.data,    _np.float32),
+    )
+    _TRANSPOSE_CACHE[fingerprint] = arrays
+    del A_T
+    _gc.collect()
+    return arrays
+
+
+def get_cached_degrees(graph_csr, fingerprint: str) -> tuple:
+    """Return ``(out_degrees, in_degrees)`` as float32 arrays."""
+    import numpy as _np
+    cached = _DEGREE_CACHE.get(fingerprint)
+    if cached is not None:
+        return cached
+    out_deg = _np.asarray(graph_csr.sum(axis=1)).flatten().astype(_np.float32)
+    in_deg  = _np.asarray(graph_csr.sum(axis=0)).flatten().astype(_np.float32)
+    _DEGREE_CACHE[fingerprint] = (out_deg, in_deg)
+    return _DEGREE_CACHE[fingerprint]
 
 
 # ---------------------------------------------------------------------------

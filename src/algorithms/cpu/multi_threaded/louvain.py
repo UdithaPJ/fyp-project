@@ -44,6 +44,7 @@ from src.algorithms.common.helpers import (
     _build_result,
     _run_louvain,
     _symmetrize,
+    _worker_init_no_blas,
 )
 
 # ---------------------------------------------------------------------------
@@ -175,7 +176,10 @@ def louvain_cpu_multi(
     A_sym = _symmetrize(graph_csr)
     m     = float(A_sym.sum()) / 2.0
 
-    with ProcessPoolExecutor(max_workers=n_workers) as ex:
+    # MEMORY_FIX (H-3): pool initializer pins worker BLAS threads to 1.
+    with ProcessPoolExecutor(
+        max_workers=n_workers, initializer=_worker_init_no_blas
+    ) as ex:
 
         def _phase1_batch(
             adj_csr:     sp.csr_matrix,

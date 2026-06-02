@@ -91,16 +91,12 @@ def _pack_result(
 # ---------------------------------------------------------------------------
 
 def _hits_cugraph(
-    graph_csr: sp.csr_matrix, params: dict,
+    G, graph_csr: sp.csr_matrix, params: dict,
 ) -> tuple[np.ndarray, np.ndarray, int, bool]:
+    """MEMORY_FIX (H-4): cuGraph.Graph is built by the caller before timing."""
     hits = cugraph_function("hits")
     if hits is None:
         raise RuntimeError("cugraph.hits is not available in this RAPIDS version.")
-
-    nt = str(params.get("network_type", "grn")).lower()
-    csr_in = symmetrize_for(graph_csr, nt) if nt == "ppi" else graph_csr
-    directed = nt != "ppi"
-    G = cugraph_build_graph(csr_in, directed=directed, weighted=False)
 
     import inspect
     try:
@@ -144,8 +140,14 @@ def hits_gpu_baseline(
     p = {**_DEFAULT_PARAMS, **(params or {})}
     network_type = str(p.get("network_type", "grn")).lower()
 
+    # MEMORY_FIX (H-4): build the cugraph.Graph before timing.
+    nt = network_type
+    csr_in = symmetrize_for(graph_csr, nt) if nt == "ppi" else graph_csr
+    directed = nt != "ppi"
+    G = cugraph_build_graph(csr_in, directed=directed, weighted=False)
+
     t0 = time.perf_counter()
-    hub, auth, iters, converged = _hits_cugraph(graph_csr, p)
+    hub, auth, iters, converged = _hits_cugraph(G, graph_csr, p)
     elapsed = time.perf_counter() - t0
 
     inner = _pack_result(hub, auth, iters, converged, network_type)

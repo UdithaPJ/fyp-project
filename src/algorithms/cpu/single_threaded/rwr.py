@@ -92,9 +92,12 @@ def rwr_cpu_single(graph_csr: sp.csr_matrix, params: dict) -> dict:
     p0   = _make_p0(seeds, N)
     pr   = p0.copy()
 
+    # MEMORY_FIX (M-3): keep scalars in FP32 to match the FP32 pr / W.
+    one_minus_r = np.float32(1.0 - r)
+    r_fp32      = np.float32(r)
     for iteration in range(1, max_iter + 1):
         pr_old = pr
-        pr = (1.0 - r) * (W @ pr_old) + r * p0
+        pr = one_minus_r * (W @ pr_old) + r_fp32 * p0
         if np.abs(pr - pr_old).sum() < tol:
             break
 

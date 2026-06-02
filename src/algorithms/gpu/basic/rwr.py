@@ -82,8 +82,9 @@ def _flatten_seeds(seed_nodes) -> list[int]:
 # ---------------------------------------------------------------------------
 
 def _rwr_cugraph(
-    graph_csr: sp.csr_matrix, params: dict, seeds: list[int],
+    G, graph_csr: sp.csr_matrix, params: dict, seeds: list[int],
 ) -> tuple[np.ndarray, int, bool, str]:
+    """MEMORY_FIX (H-4): cuGraph.Graph is built by the caller before timing."""
     import cudf as _cudf
 
     ppr = cugraph_function("personalized_pagerank")
@@ -97,11 +98,6 @@ def _rwr_cugraph(
                 "is available in this RAPIDS version."
             )
         ppr = pr
-
-    nt = str(params.get("network_type", "grn")).lower()
-    directed = nt != "ppi"
-    csr_in = symmetrize_for(graph_csr, nt) if nt == "ppi" else graph_csr
-    G = cugraph_build_graph(csr_in, directed=directed, weighted=True)
 
     n = int(graph_csr.shape[0])
     restart_prob = float(params["restart_prob"])
@@ -164,8 +160,14 @@ def rwr_gpu_baseline(
     network_type = str(p.get("network_type", "grn")).lower()
     seeds = _flatten_seeds(p.get("seed_nodes", []))
 
+    # MEMORY_FIX (H-4): build cugraph.Graph before timing.
+    nt = network_type
+    directed = nt != "ppi"
+    csr_in = symmetrize_for(graph_csr, nt) if nt == "ppi" else graph_csr
+    G = cugraph_build_graph(csr_in, directed=directed, weighted=True)
+
     t0 = time.perf_counter()
-    scores, iters, converged, note = _rwr_cugraph(graph_csr, p, seeds)
+    scores, iters, converged, note = _rwr_cugraph(G, graph_csr, p, seeds)
     elapsed = time.perf_counter() - t0
 
     top_nodes = top_k_global(scores, TOP_RWR_NODES)

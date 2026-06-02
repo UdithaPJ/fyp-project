@@ -34,6 +34,7 @@ import scipy.sparse as sp
 from src.algorithms.common.helpers import (
     _l2_normalize,
     _top_k,
+    _worker_init_no_blas,
     hits_pack_result as _pack_result,
 )
 
@@ -99,12 +100,16 @@ def _build_chunks(M: sp.csr_matrix, n_workers: int) -> list[tuple]:
 def _parallel_spmv(
     chunks:    list[tuple],
     vec:       np.ndarray,
-    n_workers: int,
+    executor:  ProcessPoolExecutor,
 ) -> np.ndarray:
-    """Run a pre-chunked sparse matrix-vector product in parallel."""
+    """Run a pre-chunked sparse matrix-vector product in parallel.
+
+    MEMORY_FIX (H-1): the caller now owns the ProcessPoolExecutor and
+    reuses it across every iteration's two SpMVs.  Old code spun up a
+    new pool for each of the 2 × max_iter SpMVs.
+    """
     args_list = [(c[0], c[1], c[2], vec, c[4]) for c in chunks]
-    with ProcessPoolExecutor(max_workers=n_workers) as ex:
-        parts = list(ex.map(_spmv_hits_chunk, args_list))
+    parts = list(executor.map(_spmv_hits_chunk, args_list))
     return np.concatenate(parts)
 
 
@@ -142,28 +147,38 @@ def hits_cpu_multi(
     tol      = float(p["tolerance"])
 
     N   = graph_csr.shape[0]
-    A   = graph_csr.astype(np.float64)
+    # MEMORY_FIX (M-8): float32 throughout — HITS convergence check is
+    # L2-norm-based and not sensitive to FP64 precision; float32 halves
+    # the resident A + A^T footprint (≈240 MB saved on 15 M edges).
+    A   = graph_csr.astype(np.float32)
     A_T = A.T.tocsr()
 
     chunks_A_T = _build_chunks(A_T, n_workers)
     chunks_A   = _build_chunks(A,   n_workers)
+    # MEMORY_FIX (D-14): chunks now own the per-row slices; we can release
+    # the full A / A_T views.
+    del A, A_T
 
-    h         = np.ones(N, dtype=np.float64)
-    a         = np.ones(N, dtype=np.float64)
+    h         = np.ones(N, dtype=np.float32)
+    a         = np.ones(N, dtype=np.float32)
     converged = False
 
-    for iteration in range(1, max_iter + 1):
-        h_old, a_old = h, a
+    # MEMORY_FIX (H-1/H-3): one pool reused across all 2*max_iter SpMVs.
+    with ProcessPoolExecutor(
+        max_workers=n_workers, initializer=_worker_init_no_blas
+    ) as executor:
+        for iteration in range(1, max_iter + 1):
+            h_old, a_old = h, a
 
-        a_new = _l2_normalize(_parallel_spmv(chunks_A_T, h_old, n_workers))
-        h_new = _l2_normalize(_parallel_spmv(chunks_A,   a_new, n_workers))
+            a_new = _l2_normalize(_parallel_spmv(chunks_A_T, h_old, executor))
+            h_new = _l2_normalize(_parallel_spmv(chunks_A,   a_new, executor))
 
-        if np.linalg.norm(h_new - h_old) + np.linalg.norm(a_new - a_old) < tol:
-            converged = True
+            if np.linalg.norm(h_new - h_old) + np.linalg.norm(a_new - a_old) < tol:
+                converged = True
+                a, h = a_new, h_new
+                break
+
             a, h = a_new, h_new
-            break
-
-        a, h = a_new, h_new
 
     return _pack_result(h, a, iteration, converged)
 

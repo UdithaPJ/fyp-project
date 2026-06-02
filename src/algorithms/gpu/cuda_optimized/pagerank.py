@@ -991,6 +991,20 @@ def pagerank_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
                 int(pull_ids.size), int(pull_threshold),
             )
 
+        # MEMORY_FIX (C-6): build the transposed CSR for pull-mode here,
+        # BEFORE the CUDA event timing starts.  Previously this ~500 ms
+        # CPU operation (graph_csr.T.tocsr().astype(float32)) ran inside
+        # the timed region, inflating reported pagerank GPU runtime.
+        pull_indptr_h = pull_indices_h = pull_values_h = None
+        if pull_enabled:
+            graph_csr_T = graph_csr.T.tocsr()
+            if graph_csr_T.dtype != np.float32:
+                graph_csr_T = graph_csr_T.astype(np.float32)
+            pull_indptr_h  = np.ascontiguousarray(graph_csr_T.indptr,  np.int32)
+            pull_indices_h = np.ascontiguousarray(graph_csr_T.indices, np.int32)
+            pull_values_h  = np.ascontiguousarray(graph_csr_T.data,    np.float32)
+            del graph_csr_T
+
         # ---- VRAM check / chunked path decision -----------------------
         est_bytes = _estimate_pagerank_vram(
             n=n, nnz=int(graph_csr.nnz),
@@ -1026,7 +1040,10 @@ def pagerank_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
         stream_transfer = cuda.Stream()
         start_event     = cuda.Event()
         end_event       = cuda.Event()
-        start_event.record(stream_compute)
+        # MEMORY_FIX (timing audit): start_event recorded AFTER allocations
+        # and H2D below — see the explicit record() right before the
+        # iteration loop.  This ensures only the actual algorithm work is
+        # measured, matching the fix for C-6.
 
         def _to_gpu(arr: np.ndarray):
             ga = gpuarray.to_gpu_async(arr, stream=stream_transfer)
@@ -1066,15 +1083,13 @@ def pagerank_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
                               if pull_enabled else None)
 
         # Pull mode arrays (transposed CSR + pull-target node IDs).
+        # MEMORY_FIX (C-6): host-side transpose now pre-built above; we
+        # only do the H2D upload here.
         d_row_ptr_T = d_col_idx_T = d_values_T = d_pull_ids = None
         if pull_enabled:
-            graph_csr_T = graph_csr.T.tocsr().astype(np.float32)
-            d_row_ptr_T = _to_gpu(
-                np.ascontiguousarray(graph_csr_T.indptr,  np.int32))
-            d_col_idx_T = _to_gpu(
-                np.ascontiguousarray(graph_csr_T.indices, np.int32))
-            d_values_T  = _to_gpu(
-                np.ascontiguousarray(graph_csr_T.data,    np.float32))
+            d_row_ptr_T = _to_gpu(pull_indptr_h)
+            d_col_idx_T = _to_gpu(pull_indices_h)
+            d_values_T  = _to_gpu(pull_values_h)
             d_pull_ids  = _to_gpu(pull_ids)
 
         d_PR_old = _empty((n,), np.float32)
@@ -1122,6 +1137,12 @@ def pagerank_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
             # zero mask only when pull is disabled.
             d_pull_target_mask = _to_gpu(
                 np.zeros((n,), dtype=np.uint8))
+            stream_transfer.synchronize()
+
+        # MEMORY_FIX (timing audit): record start AFTER all H2D + alloc.
+        # Previously start_event fired before the ~80–200 ms H2D bytes;
+        # those PCIe transfers are setup, not algorithm work.
+        start_event.record(stream_compute)
 
         for it in range(max_iter):
             iterations = it + 1

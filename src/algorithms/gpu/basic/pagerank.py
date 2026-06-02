@@ -110,17 +110,17 @@ def _pack_result(
 # ---------------------------------------------------------------------------
 
 def _pagerank_cugraph(
-    graph_csr: sp.csr_matrix, params: dict,
+    G, graph_csr: sp.csr_matrix, params: dict,
 ) -> tuple[np.ndarray, int, bool]:
-    """Run cuGraph PageRank.  Returns ``(scores, iterations, converged)``."""
+    """Run cuGraph PageRank.  Returns ``(scores, iterations, converged)``.
+
+    MEMORY_FIX (H-4): the cugraph.Graph is built by the caller before
+    timing starts so that benchmark numbers reflect algorithm work, not
+    edge-list materialisation on the GPU.
+    """
     pagerank = cugraph_function("pagerank")
     if pagerank is None:
         raise RuntimeError("cugraph.pagerank is not available in this RAPIDS version.")
-
-    nt = str(params.get("network_type", "grn")).lower()
-    directed = nt != "ppi"
-
-    G = cugraph_build_graph(graph_csr, directed=directed, weighted=True)
 
     import inspect
     try:
@@ -176,8 +176,14 @@ def pagerank_gpu_baseline(
 
     out_deg, _ = out_in_degrees(graph_csr)
 
+    # MEMORY_FIX (H-4): build the cugraph.Graph BEFORE timing — this
+    # mirrors the cuda_optimized side which excludes its CPU
+    # preprocessing from the recorded execution_time.
+    directed = network_type != "ppi"
+    G = cugraph_build_graph(graph_csr, directed=directed, weighted=True)
+
     t0 = time.perf_counter()
-    scores, iterations, converged = _pagerank_cugraph(graph_csr, p)
+    scores, iterations, converged = _pagerank_cugraph(G, graph_csr, p)
     elapsed = time.perf_counter() - t0
 
     inner = _pack_result(

@@ -37,6 +37,7 @@ from src.algorithms.common.helpers import (
     _extract_clusters,
     _frobenius_diff,
     _prune,
+    _worker_init_no_blas,
 )
 
 # ---------------------------------------------------------------------------
@@ -93,10 +94,19 @@ def _inflate_col_chunk(args: tuple) -> np.ndarray:
 def _inflate_parallel(
     M:         sp.csr_matrix,
     r:         float,
+    pool,
     n_workers: int,
 ) -> sp.csr_matrix:
-    """Inflation step parallelised over column chunks via multiprocessing.Pool."""
-    M_csc      = M.tocsc().astype(np.float64)
+    """Inflation step parallelised over column chunks.
+
+    MEMORY_FIX (H-1): ``pool`` is now passed in from the caller; we no
+    longer create a Pool inside the timed iteration loop.
+    MEMORY_FIX (C-5): stay float32 and write the worker results back in
+    place — no second full-size CSC copy.
+    """
+    M_csc      = M.tocsc()
+    if M_csc.dtype != np.float32:
+        M_csc = M_csc.astype(np.float32)
     n          = M_csc.shape[1]
     chunk_size = max(1, (n + n_workers - 1) // n_workers)
 
@@ -111,18 +121,13 @@ def _inflate_parallel(
         args_list.append((M_csc.data[ptr_s:ptr_e].copy(), local_indptr, r))
         col_ranges.append((ptr_s, ptr_e))
 
-    with Pool(processes=n_workers) as pool:
-        results = pool.map(_inflate_col_chunk, args_list)
+    results = pool.map(_inflate_col_chunk, args_list)
 
-    new_data = M_csc.data.copy().astype(np.float64)
+    # Write each worker's inflated column block back over the existing
+    # data buffer — no second full-size allocation.
     for chunk_data, (ptr_s, ptr_e) in zip(results, col_ranges):
-        new_data[ptr_s:ptr_e] = chunk_data
-
-    M_new_csc = sp.csc_matrix(
-        (new_data, M_csc.indices.copy(), M_csc.indptr.copy()),
-        shape=M_csc.shape,
-    )
-    return M_new_csc.tocsr()
+        M_csc.data[ptr_s:ptr_e] = chunk_data.astype(np.float32, copy=False)
+    return M_csc.tocsr()
 
 
 # ---------------------------------------------------------------------------
@@ -166,19 +171,24 @@ def mcl_cpu_multi(
     graph_sym = graph_csr + graph_csr.T
     graph_sym.data = np.ones_like(graph_sym.data)
 
-    M = _add_self_loops(graph_sym.astype(np.float64))
+    # MEMORY_FIX (M-3/M-8): float32 throughout — modularity / convergence
+    # checks do not need FP64 and FP32 halves both RAM and IPC bytes.
+    M = _add_self_loops(graph_sym.astype(np.float32))
     M = _col_normalize(M)
 
     converged = False
-    for iteration in range(1, cap + 1):
-        M_old = M.copy()
-        M = _expand(M, e)
-        M = _inflate_parallel(M, r, n_workers)
-        M = _prune(M, thr)
+    # MEMORY_FIX (H-1): create the Pool once with a BLAS-tamed initializer
+    # and reuse it across every iteration's inflation step.
+    with Pool(processes=n_workers, initializer=_worker_init_no_blas) as pool:
+        for iteration in range(1, cap + 1):
+            M_old = M.copy()
+            M = _expand(M, e)
+            M = _inflate_parallel(M, r, pool, n_workers)
+            M = _prune(M, thr)
 
-        if _frobenius_diff(M, M_old) < tol:
-            converged = True
-            break
+            if _frobenius_diff(M, M_old) < tol:
+                converged = True
+                break
 
     labels = _extract_clusters(M)
     return {

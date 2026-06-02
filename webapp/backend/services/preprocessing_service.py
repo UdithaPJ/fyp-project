@@ -152,22 +152,29 @@ class PreprocessingService:
         )
 
     def _store_graph_artefacts(self, upload_id: str, graph_data) -> None:
-        """Attach ``graph_data``, ``graph_csr``, and ``node_index_map`` to
-        the dataset record.
+        """Attach ``graph_csr`` and ``node_index_map`` to the dataset record.
 
         The CSR matrix is computed here (once) instead of inside the
         algorithm service so that every algorithm run can reuse it.
         """
 
         graph_csr, node_index_map = graphdata_to_csr(graph_data)
+        # MEMORY_FIX (C-2): drop the raw DataFrame and the GraphData edge
+        # list once the CSR is built — algorithm runs only need the CSR
+        # plus node_index_map.  Holding all three pinned ~1.9 GB / upload
+        # on a 15 M-edge graph (see memory_audit_report.md C-2).
         dataset_store.update(
             upload_id,
             {
-                "graph_data":     graph_data,
+                "dataframe":      None,
+                "graph_data":     None,
                 "graph_csr":      graph_csr,
                 "node_index_map": node_index_map,
             },
         )
+        import gc  # local import keeps module-level imports unchanged
+        del graph_data
+        gc.collect()
 
     def _get_dataset(self, upload_id: str) -> DatasetRecord:
         """Resolve an uploaded dataset or raise a descriptive error."""

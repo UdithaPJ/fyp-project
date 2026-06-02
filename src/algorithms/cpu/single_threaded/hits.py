@@ -74,11 +74,14 @@ def hits_cpu_single(graph_csr: sp.csr_matrix, params: dict) -> dict:
     tol      = float(p["tolerance"])
 
     N   = graph_csr.shape[0]
-    A   = graph_csr.astype(np.float64)
+    # MEMORY_FIX (M-8): FP32 throughout.  HITS uses L2-norm convergence,
+    # which is well-behaved at FP32 for biological networks.  Saves
+    # ~240 MB on 15 M-edge graphs (A + A^T).
+    A   = graph_csr.astype(np.float32)
     A_T = A.T.tocsr()
 
-    h         = np.ones(N, dtype=np.float64)
-    a         = np.ones(N, dtype=np.float64)
+    h         = np.ones(N, dtype=np.float32)
+    a         = np.ones(N, dtype=np.float32)
     converged = False
 
     for iteration in range(1, max_iter + 1):

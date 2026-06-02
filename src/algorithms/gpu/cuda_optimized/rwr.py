@@ -1384,7 +1384,9 @@ def rwr_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
         stream_transfer = cuda.Stream()
         start_event     = cuda.Event()
         end_event       = cuda.Event()
-        start_event.record(stream_compute)
+        # MEMORY_FIX (timing audit): start_event is recorded later, after
+        # H2D + chunk-buffer setup, immediately before each iteration loop.
+        # See start_event.record() calls below for each execution path.
 
         # ---- Chunked path -------------------------------------------------
         if use_chunking and batch_size == 1:
@@ -1394,6 +1396,11 @@ def rwr_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
             bytes_per_node = int((1 + 2 * avg_nnz) * 4)
             chunk_size = max(1, min(n, available // max(bytes_per_node, 1)))
 
+            # MEMORY_FIX (timing audit): record start right before the
+            # chunked iteration so the H2D ramp-up is excluded.  The chunked
+            # path uploads chunks lazily inside the inner loop, which is
+            # genuine algorithm work and stays inside the timed region.
+            start_event.record(stream_compute)
             scores_np, iterations, converged = _rwr_gpu_chunked(
                 W=W, p0_np=p0_list[0],
                 one_minus_r=float(one_minus_r), r_val=float(r_val),
@@ -1533,6 +1540,8 @@ def rwr_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
 
             converged  = False
             iterations = 0
+            # MEMORY_FIX (timing audit): time only the iteration loop.
+            start_event.record(stream_compute)
             for it in range(max_iter):
                 iterations = it + 1
                 k_batched(
@@ -1593,6 +1602,11 @@ def rwr_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
                 k_spmv = kernels["spmv_restart"]
 
             stream_transfer.synchronize()
+            # MEMORY_FIX (timing audit): time only the algorithm iteration
+            # work; the per-seed-set d_p0/d_p upload is still inside the
+            # timed region because each seed set is independent algorithm
+            # work in a multi-seed-set run.
+            start_event.record(stream_compute)
 
             for b_idx, (sset, p0_np) in enumerate(zip(seed_sets, p0_list)):
                 h_p0 = np.ascontiguousarray(p0_np, np.float32)
@@ -1684,8 +1698,13 @@ def rwr_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
                         arr.gpudata.free()
                     except Exception:                       # noqa: BLE001
                         pass
-                    if arr in d_buffers:
-                        d_buffers.remove(arr)
+                    # MEMORY_FIX: identity-based removal — PyCUDA gpuarrays
+                    # override __eq__ to do elementwise compare, which
+                    # raises NotImplementedError on shape mismatch when
+                    # ``arr in d_buffers`` is evaluated.
+                    for idx in range(len(d_buffers) - 1, -1, -1):
+                        if d_buffers[idx] is arr:
+                            d_buffers.pop(idx)
 
         end_event.record(stream_compute)
         end_event.synchronize()

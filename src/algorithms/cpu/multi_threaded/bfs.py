@@ -29,7 +29,10 @@ from multiprocessing import Pool
 import numpy as np
 import scipy.sparse as sp
 
-from src.algorithms.common.helpers import bfs_pack_result as _pack_result
+from src.algorithms.common.helpers import (
+    _worker_init_no_blas,
+    bfs_pack_result as _pack_result,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -116,38 +119,53 @@ def bfs_cpu_multi(
     csr_indices = graph_csr.indices
     csr_indptr  = graph_csr.indptr
 
-    for depth in range(1, max_depth + 1):
-        if not frontier:
-            break
+    # MEMORY_FIX (H-1/H-3): create the pool once and reuse it across all
+    # depth levels; old code created/destroyed it per level.  We only
+    # actually enter the pooled branch when the frontier is wider than
+    # n_workers, but spinning the pool up here is still cheaper than per-
+    # level recreation because BFS often has multiple wide levels.
+    pool: Pool | None = None
+    try:
+        for depth in range(1, max_depth + 1):
+            if not frontier:
+                break
 
-        if len(frontier) < n_workers:
-            new_neighbors: set[int] = set()
-            for node in frontier:
-                s = int(csr_indptr[node])
-                e = int(csr_indptr[node + 1])
-                new_neighbors.update(int(x) for x in csr_indices[s:e])
-        else:
-            chunk_size = max(1, (len(frontier) + n_workers - 1) // n_workers)
-            chunks = [
-                frontier[i: i + chunk_size]
-                for i in range(0, len(frontier), chunk_size)
-            ]
-            args_list = [(csr_indices, csr_indptr, chunk) for chunk in chunks]
-            with Pool(processes=n_workers) as pool:
+            if len(frontier) < n_workers:
+                new_neighbors: set[int] = set()
+                for node in frontier:
+                    s = int(csr_indptr[node])
+                    e = int(csr_indptr[node + 1])
+                    new_neighbors.update(int(x) for x in csr_indices[s:e])
+            else:
+                if pool is None:
+                    pool = Pool(
+                        processes=n_workers,
+                        initializer=_worker_init_no_blas,
+                    )
+                chunk_size = max(1, (len(frontier) + n_workers - 1) // n_workers)
+                chunks = [
+                    frontier[i: i + chunk_size]
+                    for i in range(0, len(frontier), chunk_size)
+                ]
+                args_list = [(csr_indices, csr_indptr, chunk) for chunk in chunks]
                 partial = pool.map(_neighbors_chunk, args_list)
-            new_neighbors = set().union(*partial)
+                new_neighbors = set().union(*partial)
 
-        new_frontier: list[int] = []
-        for nb in new_neighbors:
-            if nb not in visited:
-                visited.add(nb)
-                distances[nb] = depth
-                visited_order.append(nb)
-                new_frontier.append(nb)
+            new_frontier: list[int] = []
+            for nb in new_neighbors:
+                if nb not in visited:
+                    visited.add(nb)
+                    distances[nb] = depth
+                    visited_order.append(nb)
+                    new_frontier.append(nb)
 
-        if new_frontier:
-            cascade[depth] = sorted(new_frontier)
-        frontier = new_frontier
+            if new_frontier:
+                cascade[depth] = sorted(new_frontier)
+            frontier = new_frontier
+    finally:
+        if pool is not None:
+            pool.close()
+            pool.join()
 
     return _pack_result(distances, visited_order, cascade)
 

@@ -61,6 +61,13 @@ import matplotlib.pyplot as plt   # noqa: E402
 import numpy as np
 import scipy.sparse as sp
 
+# MEMORY_FIX (Fix Cat. 6): emit RAM/VRAM samples around hot operations.
+try:
+    from src.utils.memory_logger import log_memory, force_gc
+except Exception:  # pragma: no cover
+    def log_memory(label: str, logger=None) -> None: return None
+    def force_gc(label: str = "", logger=None) -> float: return 0.0
+
 _LOG = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -360,6 +367,7 @@ class ScalabilityBenchmarker:
 
             for target_n in self.graph_sizes:
                 _LOG.info("generating %s n=%d…", graph_type, target_n)
+                log_memory(f"Before generating {graph_type} n={target_n}", _LOG)
                 try:
                     g = gen(target_n).tocsr()
                     g.sum_duplicates()
@@ -367,6 +375,7 @@ class ScalabilityBenchmarker:
                 except Exception as exc:
                     _LOG.error("graph generation failed: %s", exc)
                     continue
+                log_memory(f"After generating {graph_type} n={target_n}", _LOG)
 
                 actual_n = g.shape[0]
                 actual_m = g.nnz

@@ -86,9 +86,9 @@ def pagerank_cpu_single(graph_csr: sp.csr_matrix, params: dict) -> dict:
 
     N = graph_csr.shape[0]
     M, dangling_mask = _build_transition_matrix(graph_csr)
-    teleport_per_node = (1.0 - d) / N
+    teleport_per_node = np.float32((1.0 - d) / N)
 
-    out_degrees = np.asarray(graph_csr.sum(axis=1)).flatten()
+    out_degrees = np.asarray(graph_csr.sum(axis=1)).flatten().astype(np.float32)
     active_mask = out_degrees > 0
     n_active    = int(active_mask.sum())
     if n_active == 0:
@@ -98,20 +98,21 @@ def pagerank_cpu_single(graph_csr: sp.csr_matrix, params: dict) -> dict:
             stacklevel=2,
         )
 
-    PR        = np.full(N, 1.0 / N, dtype=np.float64)
+    # MEMORY_FIX (M-3): FP32 throughout — see _build_transition_matrix.
+    PR        = np.full(N, np.float32(1.0 / N), dtype=np.float32)
     converged = False
 
     for iteration in range(1, max_iter + 1):
         PR_old = PR
 
-        dangling_mass = d * float(PR_old[dangling_mask].sum())
-        dangling_contrib = np.zeros(N, dtype=np.float64)
+        dangling_mass = np.float32(d) * np.float32(PR_old[dangling_mask].sum())
+        dangling_contrib = np.zeros(N, dtype=np.float32)
         if n_active > 0:
             dangling_contrib[active_mask] = dangling_mass / n_active
         else:
             dangling_contrib[:] = dangling_mass / N
 
-        PR = d * (M @ PR_old) + dangling_contrib + teleport_per_node
+        PR = np.float32(d) * (M @ PR_old) + dangling_contrib + teleport_per_node
 
         if np.abs(PR - PR_old).sum() < tol:
             converged = True

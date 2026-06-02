@@ -89,16 +89,15 @@ def _build_cascade(distances: np.ndarray, max_depth: int) -> dict[int, list[int]
 # ---------------------------------------------------------------------------
 
 def _bfs_cugraph(
-    graph_csr: sp.csr_matrix, params: dict,
+    G, graph_csr: sp.csr_matrix, params: dict,
 ) -> tuple[np.ndarray, list[int], list[str]]:
-    """Run cuGraph BFS.  Returns ``(distances, visited_order, traversal_modes)``."""
+    """Run cuGraph BFS.  Returns ``(distances, visited_order, traversal_modes)``.
+
+    MEMORY_FIX (H-4): cuGraph.Graph is built by the caller before timing.
+    """
     bfs = cugraph_function("bfs")
     if bfs is None:
         raise RuntimeError("cugraph.bfs is not available in this RAPIDS version.")
-
-    nt = str(params.get("network_type", "grn")).lower()
-    directed = nt != "ppi"
-    G = cugraph_build_graph(graph_csr, directed=directed, weighted=False)
 
     import inspect
     try:
@@ -162,8 +161,12 @@ def bfs_gpu_baseline(
     network_type = str(p.get("network_type", "grn")).lower()
     max_depth    = int(p["max_depth"])
 
+    # MEMORY_FIX (H-4): build cugraph.Graph before the timed region.
+    directed = network_type != "ppi"
+    G = cugraph_build_graph(graph_csr, directed=directed, weighted=False)
+
     t0 = time.perf_counter()
-    distances, visited_order, traversal_modes = _bfs_cugraph(graph_csr, p)
+    distances, visited_order, traversal_modes = _bfs_cugraph(G, graph_csr, p)
     elapsed = time.perf_counter() - t0
 
     cascade = _build_cascade(distances, max_depth)

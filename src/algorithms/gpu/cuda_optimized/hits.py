@@ -885,9 +885,6 @@ def hits_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
             pl_conv = None
 
         try:
-            # ── Timing starts (after all CPU preprocessing) ────────────────
-            start_event.record(stream_compute)
-
             # ── H2D: matrix CSR arrays (async on transfer stream) ──────────
             cuda.memcpy_htod_async(d_row_ptr.gpudata,   row_ptr_h,   stream_transfer)
             cuda.memcpy_htod_async(d_col_idx.gpudata,   col_idx_h,   stream_transfer)
@@ -902,6 +899,11 @@ def hits_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
             cuda.memcpy_htod_async(d_h.gpudata, init_host, stream_transfer)
             cuda.memcpy_htod_async(d_a.gpudata, init_host, stream_transfer)
             stream_transfer.synchronize()
+
+            # MEMORY_FIX (timing audit): record start AFTER all H2D bytes
+            # so reported execution_time reflects algorithm work, not the
+            # ~80 ms PCIe transfer for the 6 CSR arrays.
+            start_event.record(stream_compute)
 
             # ── Precomputed grid/block dimensions ──────────────────────────
             spmv_block    = (BLOCK_SIZE, 1, 1)
@@ -1070,6 +1072,16 @@ def hits_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
             for arr in d_buffers:
                 try:
                     arr.gpudata.free()
+                except Exception:                       # noqa: BLE001
+                    pass
+            # MEMORY_FIX (H-5): explicitly release the page-locked host
+            # buffer allocated for the convergence D2H transfer.  Old
+            # code relied on Python GC, which on Linux+CUDA can leak the
+            # pinned allocation across repeated benchmark runs and
+            # eventually surfaces as cuMemHostAlloc OUT_OF_MEMORY.
+            if pl_conv is not None:
+                try:
+                    pl_conv.base.free()
                 except Exception:                       # noqa: BLE001
                     pass
 

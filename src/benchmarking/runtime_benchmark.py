@@ -55,6 +55,13 @@ import matplotlib.pyplot as plt   # noqa: E402
 import numpy as np
 import scipy.sparse as sp
 
+# MEMORY_FIX (Fix Cat. 6): diagnostic memory logging around each run.
+try:
+    from src.utils.memory_logger import log_memory, force_gc
+except Exception:  # pragma: no cover
+    def log_memory(label: str, logger=None) -> None: return None
+    def force_gc(label: str = "", logger=None) -> float: return 0.0
+
 _LOG = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -275,8 +282,12 @@ class RuntimeBenchmarker:
                             break
 
                     # timed runs
-                    for _ in range(self.n_runs):
+                    for run_idx in range(self.n_runs):
                         gc.collect()
+                        log_memory(
+                            f"Before {algorithm}/{dataset.name}/{mode}"
+                            f" run {run_idx + 1}/{self.n_runs}", _LOG,
+                        )
                         try:
                             t = _run_once(algorithm, mode, dataset.graph_csr,
                                           params, dataset.node_index_map)
@@ -286,6 +297,13 @@ class RuntimeBenchmarker:
                             _LOG.warning("benchmark: %s/%s/%s failed: %s",
                                          algorithm, dataset.name, mode, err)
                             break
+                        log_memory(
+                            f"After  {algorithm}/{dataset.name}/{mode}"
+                            f" run {run_idx + 1}/{self.n_runs}", _LOG,
+                        )
+                        force_gc(
+                            f"Post {algorithm}/{dataset.name}/{mode}", _LOG,
+                        )
 
                     self.records.append(TimingRecord(
                         algorithm=algorithm,

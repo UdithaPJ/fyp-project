@@ -142,6 +142,42 @@ def _make_adapter(name: str, module_path: str, description: str) -> type[Algorit
             "result":         result_data,
         }
 
+    # ---- CPU adapters (cpu_single / cpu_multi) ----
+    # MEMORY_FIX (Fix Cat. 3 verification): bind cpu_single / cpu_multi
+    # so that run_algorithm(..., mode="cpu_single") works.  The CPU
+    # functions live in src/algorithms/cpu/<single|multi>_threaded/{name}.py
+    # and return only the inner result; we wrap into the standard
+    # envelope here.
+    def _make_cpu_dispatch(cpu_mode: str):
+        def _cpu_staticmethod(graph_csr: sp.csr_matrix, params: dict) -> dict:
+            cpu_mod_path = (
+                f"src.algorithms.cpu."
+                f"{'single_threaded' if cpu_mode == 'cpu_single' else 'multi_threaded'}"
+                f".{name}"
+            )
+            cpu_mod = importlib.import_module(cpu_mod_path)
+            fn = getattr(cpu_mod, f"_{cpu_mode}", None)
+            if fn is None:
+                raise AttributeError(
+                    f"{cpu_mod_path} does not expose _{cpu_mode}(graph_csr, params)"
+                )
+            raw = fn(graph_csr, params)
+            result_data = raw["output"] if isinstance(raw, dict) and "output" in raw else raw
+            if _looks_like_standard_result(result_data):
+                return result_data
+            return {
+                "algorithm":      name,
+                "mode":           cpu_mode,
+                "execution_time": 0.0,
+                "num_nodes":      int(graph_csr.shape[0]),
+                "num_edges":      int(graph_csr.nnz),
+                "result":         result_data,
+            }
+        return _cpu_staticmethod
+
+    _cpu_single_static = _make_cpu_dispatch("cpu_single")
+    _cpu_multi_static  = _make_cpu_dispatch("cpu_multi")
+
     # ---- Baseline (gpu_baseline) adapter ----
     # Imported lazily so a missing cuGraph / CuPy install does not break
     # the registry at module-import time.  Only fails when the user
@@ -182,6 +218,8 @@ def _make_adapter(name: str, module_path: str, description: str) -> type[Algorit
             "__doc__":      description,
             "NAME":         name,
             "PARAM_SCHEMA": defaults,
+            "cpu_single":   staticmethod(_cpu_single_static),
+            "cpu_multi":    staticmethod(_cpu_multi_static),
             "gpu":          staticmethod(_gpu_staticmethod),
             "gpu_baseline": staticmethod(_gpu_baseline_staticmethod),
         },

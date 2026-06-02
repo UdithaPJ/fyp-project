@@ -29,6 +29,12 @@ class FileLoader:
 
     LARGE_DATASET_ROW_THRESHOLD = 1_000_000
     LARGE_DATASET_MEMORY_THRESHOLD_BYTES = 250 * 1024 * 1024
+    # MEMORY_FIX (Fix Cat. 7): callers can pass this threshold to
+    # ``PreprocessingPipeline.run_adaptive`` to force chunked loading on
+    # large files; default switches at 500 MB which keeps peak DataFrame
+    # memory bounded by the chunk-aggregated cleaned frame rather than a
+    # full single-shot read.
+    LARGE_FILE_SIZE_THRESHOLD_BYTES = 500 * 1024 * 1024
 
     def load(self, file_path: str | Path) -> pd.DataFrame:
         """Load a CSV, TSV, TXT, Excel, or JSON file."""
@@ -491,26 +497,17 @@ class DataCleaner:
 
         cleaned = dataframe.copy(deep=False)
 
-        # OPTIMIZED: trim string-like columns in a vectorized way.
-        string_columns = cleaned.select_dtypes(include=["object", "string"]).columns
-        if len(string_columns) > 0:
-            cleaned[string_columns] = cleaned[string_columns].apply(
-                lambda column: column.str.strip()
-            )
-
-        # OPTIMIZED: normalize node identifiers with vectorized string operations.
-        cleaned["source"] = (
-            cleaned["source"]
-            .astype("string")
-            .str.strip()
-            .str.upper()
-        )
-        cleaned["target"] = (
-            cleaned["target"]
-            .astype("string")
-            .str.strip()
-            .str.upper()
-        )
+        # MEMORY_FIX (C-3): normalise source/target via a single vectorized
+        # string pass then immediately convert to Categorical.  Pandas
+        # `astype("string")` stores Python str objects (~50 B/value); on
+        # 15 M rows × 2 endpoints this is ~1.5 GB of PyObject overhead.
+        # Categorical stores each unique label once + int32 codes.
+        for col in ("source", "target"):
+            s = cleaned[col].astype("string").str.strip().str.upper()
+            # NaN / empty rows are dropped a few lines below; keeping them
+            # as nullable string here keeps the .eq("") + .isna() check
+            # working before we collapse to Categorical.
+            cleaned[col] = s
         cleaned["weight"] = pd.to_numeric(
             cleaned["weight"], errors="coerce"
         ).fillna(default_weight)
@@ -521,7 +518,13 @@ class DataCleaner:
         dropped_rows = int(invalid_rows.sum())
         if invalid_rows.any():
             cleaned = cleaned.loc[~invalid_rows].reset_index(drop=True)
-        cleaned["weight"] = cleaned["weight"].astype(float)
+
+        # MEMORY_FIX (C-3): collapse to Categorical *after* row-dropping so
+        # the category index does not include orphans.  float32 weight is
+        # sufficient — biological edge weights rarely need FP64 precision.
+        cleaned["source"] = cleaned["source"].astype("category")
+        cleaned["target"] = cleaned["target"].astype("category")
+        cleaned["weight"] = cleaned["weight"].astype("float32")
 
         return cleaned, {"dropped_rows_missing_endpoints": dropped_rows}
 
