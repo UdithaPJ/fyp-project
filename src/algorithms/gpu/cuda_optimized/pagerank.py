@@ -47,15 +47,33 @@ Repeat until ||PR_new - PR_old||_1 < tolerance, or max_iter:
 
 Parameter guide
 ---------------
-damping              (float, default 0.85)  Probability of following an edge.
-max_iter             (int,   default 100)   Hard iteration cap.
-tolerance            (float, default 1e-6)  L1-norm early-stop threshold.
-network_type         (str,   default "grn") One of "grn", "ppi", "mirna".
-block_size           (int,   default 256)   CUDA block dimension.
-ellpack_fraction     (float, default 0.05)  Fraction of nodes routed to ELLPACK.
-pull_threshold       (int,   default 0)     0 disables pull; >0 enables it
-                                              for nodes with in_degree >= this.
-use_chunking         (bool,  default False) Force the chunked path.
+damping              (float, default 0.85)   Probability of following an edge.
+max_iter             (int,   default 100)    Hard iteration cap.
+tolerance            (float, default 1e-6)   L1-norm early-stop threshold.
+network_type         (str,   default "grn")  One of "grn", "ppi", "mirna".
+block_size           (int,   default 256)    CUDA block dimension.
+ellpack_fraction     (float, default 0.001)  Fraction of nodes routed to ELLPACK.
+                                             REDUCED from 0.05: on power-law
+                                             graphs 5 % of 1M nodes × max_degree
+                                             50K padded slots × 8 B = 20 GB ELLPACK.
+                                             0.1 % keeps it under 400 MB even on
+                                             the most skewed BA graphs.
+ellpack_max_mb       (float, default 256)    Disable ELLPACK if it would exceed
+                                             this many MB (safeguard against
+                                             extreme hub degrees).
+ellpack_vram_pct     (float, default 0.10)   Also disable ELLPACK if it would
+                                             exceed this fraction of free VRAM.
+pull_threshold       (int,   default -1)     -1 = auto-detect scale-free graphs
+                                             and set threshold at top pull_fraction
+                                             in-degree nodes. 0 = disabled.
+                                             >0 = explicit in-degree threshold.
+pull_fraction        (float, default 0.01)   When pull_threshold=-1, top this
+                                             fraction of nodes (by in-degree)
+                                             become pull targets (default 1 %).
+chunk_vram_pct       (float, default 0.70)   Auto-chunk when estimated VRAM
+                                             exceeds this fraction of free VRAM.
+use_chunking         (bool,  default False)  Force chunked path.
+enable_diagnostics   (bool,  default False)  Log per-phase timing breakdown.
 """
 
 # -- GPU / CUDA-optimised implementation (PyCUDA custom kernels) ----------
@@ -69,6 +87,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from typing import Any
 
 import numpy as np
@@ -114,14 +133,30 @@ except Exception:                                       # noqa: BLE001
 # ---------------------------------------------------------------------------
 
 _DEFAULT_PARAMS: dict = {
-    "damping":          0.85,
-    "max_iter":         100,
-    "tolerance":        1e-6,
-    "network_type":     "grn",
-    "block_size":       256,
-    "ellpack_fraction": 0.05,
-    "pull_threshold":   0,        # 0 disables pull-mode
-    "use_chunking":     False,
+    "damping":            0.85,
+    "max_iter":           100,
+    "tolerance":          1e-6,
+    "network_type":       "grn",
+    "block_size":         256,
+    # CHANGE 1: ellpack_fraction 0.05 → 0.001.
+    # Root cause of the 13–29 GB VRAM estimates: 5 % of 1M nodes = 50k hubs,
+    # and on BA graphs max_degree can be 50k+ → 50k×50k×8 B = 20 GB ELLPACK.
+    # 0.1 % keeps the hub set tiny (≈1k nodes on 1M-node graphs) so even with
+    # extreme max degrees the ELLPACK stays under the safeguard limits.
+    "ellpack_fraction":   0.001,
+    # CHANGE 1 (safeguards): disable ELLPACK if it would exceed either of:
+    "ellpack_max_mb":     256.0,   # absolute cap in MB
+    "ellpack_vram_pct":   0.10,    # fraction of free VRAM
+    # CHANGE 2: pull_threshold -1 = auto-detect (was 0 = always disabled).
+    # Auto mode enables pull for the top pull_fraction of in-degree nodes
+    # on scale-free graphs (detected by max/avg in-degree ratio > 10).
+    "pull_threshold":     -1,
+    "pull_fraction":      0.01,    # top 1 % in-degree nodes become pull targets
+    # CHANGE 4: auto-chunk when estimate > chunk_vram_pct of free VRAM.
+    "chunk_vram_pct":     0.70,
+    "use_chunking":       False,
+    # CHANGE 6: optional per-phase timing diagnostic output.
+    "enable_diagnostics": False,
 }
 
 BLOCK_SIZE: int     = 256
@@ -133,7 +168,7 @@ _TOP_NODES: int     = 20          # top nodes returned     (PPI)
 
 
 # ---------------------------------------------------------------------------
-# CUDA kernel source
+# CUDA kernel source  (UNCHANGED — all improvements are in the Python layer)
 # ---------------------------------------------------------------------------
 
 KERNEL_SOURCE = r"""
@@ -146,8 +181,6 @@ extern "C" {
 
 // =========================================================================
 // KERNEL: initialize_pr (BACKUP - kept for chunked path, not on hot loop)
-//
-// PR_new[i] = teleport_val for every i.
 // =========================================================================
 __global__ void initialize_pr(
     float*     __restrict__ PR_new,
@@ -160,17 +193,7 @@ __global__ void initialize_pr(
 
 
 // =========================================================================
-// KERNEL: initialize_pr_with_dangling  (NEW - Improvement 3, FUSION A)
-//
-// Fuses teleportation baseline + dangling redistribution into one pass.
-//
-// PR_new[i] = teleport_val
-//            + (d * (*dangling_sum_ptr) / num_eligible) if eligible_mask[i]
-//
-// Reads dangling_sum from a GPU pointer (length-1 array) - no CPU sync
-// required between sum_dangling_pr -> reduce_to_scalar -> this kernel.
-// eligible_mask is a boolean (uint8) array of length n; replaces the
-// previous index-array + atomicAdd pattern, avoiding per-thread search.
+// KERNEL: initialize_pr_with_dangling
 // =========================================================================
 __global__ void initialize_pr_with_dangling(
     float*       __restrict__ PR_new,
@@ -194,21 +217,7 @@ __global__ void initialize_pr_with_dangling(
 
 
 // =========================================================================
-// KERNEL: scatter_contributions_csr  (UPDATED - skip pull-target edges)
-//
-// One block per low/medium-degree source node u.  Threads in the block
-// scatter contributions to u's out-neighbours via atomicAdd on PR_new.
-//
-// pull_target_mask (NULLABLE):
-//   If non-null, edges to v with pull_target_mask[v] != 0 are SKIPPED
-//   - those contributions are handled by gather_contributions_pull
-//   instead.  When the mask is null, this kernel behaves identically
-//   to the original scatter.
-//
-// Three-tier degree-aware scheduling:
-//   LOW  (deg_u < 32)         : thread 0 only, serial scatter
-//   MED  (32 <= deg_u < 256)  : first warp, stride-32 scatter
-//   HIGH (deg_u >= 256)       : full block + SMEM hash aggregation
+// KERNEL: scatter_contributions_csr
 // =========================================================================
 __global__ void scatter_contributions_csr(
     const int*   __restrict__ row_ptr,
@@ -238,7 +247,6 @@ __global__ void scatter_contributions_csr(
     const int   deg_int   = row_end - row_start;
     const float contribution = damping * PR_old[u] / deg_u;
 
-    // ---- LOW tier --------------------------------------------------------
     if (deg_int < WARP_SIZE) {
         if (threadIdx.x == 0) {
             for (int j = 0; j < deg_int; ++j) {
@@ -251,7 +259,6 @@ __global__ void scatter_contributions_csr(
         return;
     }
 
-    // ---- MED tier --------------------------------------------------------
     if (deg_int < BLOCK_SIZE) {
         if (threadIdx.x < WARP_SIZE) {
             for (int j = threadIdx.x; j < deg_int; j += WARP_SIZE) {
@@ -264,7 +271,6 @@ __global__ void scatter_contributions_csr(
         return;
     }
 
-    // ---- HIGH tier: SMEM hash aggregation --------------------------------
     smem_keys[threadIdx.x] = -1;
     smem_vals[threadIdx.x] = 0.0f;
     __syncthreads();
@@ -299,7 +305,7 @@ __global__ void scatter_contributions_csr(
 
 
 // =========================================================================
-// KERNEL: scatter_contributions_ellpack  (UPDATED - skip pull targets)
+// KERNEL: scatter_contributions_ellpack
 // =========================================================================
 __global__ void scatter_contributions_ellpack(
     const int*   __restrict__ ellpack_cols,
@@ -335,8 +341,7 @@ __global__ void scatter_contributions_ellpack(
 
 
 // =========================================================================
-// KERNEL: distribute_dangling_mass  (BACKUP - kept for compatibility)
-// Now superseded by initialize_pr_with_dangling.
+// KERNEL: distribute_dangling_mass  (BACKUP)
 // =========================================================================
 __global__ void distribute_dangling_mass(
     float*       __restrict__ PR_new,
@@ -352,7 +357,7 @@ __global__ void distribute_dangling_mass(
 
 
 // =========================================================================
-// KERNEL: sum_dangling_pr  (UNCHANGED - feeds reduce_to_scalar_f32)
+// KERNEL: sum_dangling_pr
 // =========================================================================
 __global__ void sum_dangling_pr(
     const float* __restrict__ PR_old,
@@ -377,7 +382,7 @@ __global__ void sum_dangling_pr(
 
 
 // =========================================================================
-// KERNEL: compute_l1_convergence  (UNCHANGED - feeds reduce_to_scalar_f32)
+// KERNEL: compute_l1_convergence
 // =========================================================================
 __global__ void compute_l1_convergence(
     const float* __restrict__ PR_new,
@@ -410,15 +415,7 @@ __global__ void compute_l1_convergence(
 
 
 // =========================================================================
-// KERNEL: reduce_to_scalar_f32  (NEW - Improvement 1)
-//
-// Single-block kernel.  Reads a per-block partial-sums array (length
-// `input_len`, typically ceil(n / BLOCK_SIZE) entries) and writes the
-// total sum to scalar_output[0] (a length-1 GPU array).  Used by both
-// sum_dangling_pr and compute_l1_convergence to keep their final
-// reductions fully on GPU.
-//
-// Launch contract: grid=(1, 1, 1), block=(BLOCK_SIZE, 1, 1).
+// KERNEL: reduce_to_scalar_f32
 // =========================================================================
 __global__ void reduce_to_scalar_f32(
     const float* __restrict__ partial_input,
@@ -444,20 +441,7 @@ __global__ void reduce_to_scalar_f32(
 
 
 // =========================================================================
-// KERNEL: gather_contributions_pull  (NEW - Improvement 6)
-//
-// Pull-based contribution accumulation for high-in-degree target nodes.
-// One block per pull node u.  Threads in the block cooperatively scan
-// u's incoming edges (rows of A^T) and accumulate
-//     sum_v  values_T[v,u] * PR_old[v] / out_degree[v]
-// via warp/block reductions.  Thread 0 writes the final result to
-// PR_new[u] using a plain (non-atomic) += : because the scatter kernels
-// have already skipped pull-target edges (via pull_target_mask) and
-// only one block ever writes to PR_new[u] in this kernel, the write is
-// race-free.
-//
-// IMPORTANT: PR_new[u] must already contain the teleport + dangling
-// baseline (set by initialize_pr_with_dangling) before this kernel runs.
+// KERNEL: gather_contributions_pull
 // =========================================================================
 __global__ void gather_contributions_pull(
     const int*   __restrict__ row_ptr_T,
@@ -550,6 +534,57 @@ def _get_kernels() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# CHANGE 6: Lightweight per-phase profiler
+# ---------------------------------------------------------------------------
+
+class _PerfProfiler:
+    """Phase-level wall-clock timer for preprocessing vs GPU execution."""
+
+    def __init__(self, enabled: bool = False) -> None:
+        self.enabled = enabled
+        self._phases: dict[str, float] = {}
+        self._start:  float | None     = None
+        self._phase:  str | None       = None
+
+    def begin(self, phase: str) -> None:
+        if not self.enabled:
+            return
+        if self._phase is not None:
+            self.end()
+        self._phase = phase
+        self._start = time.perf_counter()
+
+    def end(self) -> None:
+        if not self.enabled or self._phase is None:
+            return
+        elapsed = time.perf_counter() - (self._start or 0.0)
+        self._phases[self._phase] = elapsed
+        self._phase = None
+        self._start = None
+
+    def record(self, phase: str, elapsed_s: float) -> None:
+        """Record a pre-measured duration (e.g. from CUDA events)."""
+        if self.enabled:
+            self._phases[phase] = elapsed_s
+
+    def summary(self) -> dict[str, float]:
+        if self._phase:
+            self.end()
+        return dict(self._phases)
+
+    def log(self, extra: str = "") -> None:
+        if not self.enabled:
+            return
+        phases = self.summary()
+        total = sum(phases.values())
+        lines = [f"[PageRank Profiler] total={total*1000:.1f} ms  {extra}"]
+        for ph, t in phases.items():
+            lines.append(f"  {ph:<28}: {t*1000:8.2f} ms  "
+                         f"({100*t/max(total, 1e-12):5.1f} %)")
+        logging.info("\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
 # Parameter merging
 # ---------------------------------------------------------------------------
 
@@ -586,24 +621,13 @@ def _eligible_mask(
     network_type: str,
     node_index_map: dict | None,
 ) -> tuple[np.ndarray, str]:
-    """Return a uint8 boolean mask of "eligible" nodes for dangling redistribution.
-
-    Replaces the previous index-array convention with a length-n mask so
-    that ``initialize_pr_with_dangling`` can decide per-thread without a
-    binary search.
-
-    Returns (mask, note) where mask[i] == 1 iff node i receives dangling mass.
-    """
-    n = int(graph_csr.shape[0])
+    n  = int(graph_csr.shape[0])
     nt = str(network_type).lower()
     mask = np.zeros(n, dtype=np.uint8)
     if nt == "grn":
         mask[out_degrees > 0.0] = 1
         note = "dangling mass -> regulator nodes only (out_degree > 0)"
     elif nt == "mirna":
-        # Without type labels in node_index_map, miRNA identity is
-        # inferred from the bipartite structure (only miRNAs have outgoing
-        # edges).  This matches the previous _identify_mirna_nodes path.
         mask[out_degrees > 0.0] = 1
         note = "dangling mass -> miRNA nodes only (out_degree > 0)"
     else:  # ppi (and default)
@@ -614,30 +638,18 @@ def _eligible_mask(
 
 def _compute_adaptive_hub_threshold(
     out_degrees: np.ndarray,
-    target_ellpack_fraction: float = 0.05,
+    target_ellpack_fraction: float = 0.001,   # CHANGE 1: was 0.05
 ) -> int:
-    """Compute a hub threshold so ~target_ellpack_fraction of nodes go to ELLPACK.
-
-    For biological power-law networks the threshold lands near the
-    (1 - target) quantile of the degree distribution.  The result is
-    clamped to >= WARP_SIZE (so ELLPACK actually benefits from warp-
-    level processing) and snapped to the nearest power of two for
-    efficient warp/block math.
-    """
+    """Compute a hub threshold so ~target_ellpack_fraction of nodes go to ELLPACK."""
     if out_degrees.size == 0:
         return WARP_SIZE
-
-    # Use integer out-degree counts for the percentile (weight-free).
     deg_int = out_degrees.astype(np.int64)
     pct = (1.0 - max(0.0, min(target_ellpack_fraction, 1.0))) * 100.0
     threshold = int(np.percentile(deg_int, pct))
-
     threshold = max(threshold, WARP_SIZE)
     max_deg = int(deg_int.max()) if deg_int.size > 0 else WARP_SIZE
     threshold = min(threshold, max_deg)
     threshold = max(threshold, 1)
-
-    # Snap to nearest power of two.
     snapped = int(2 ** round(math.log2(max(threshold, 1))))
     snapped = max(snapped, WARP_SIZE)
     return snapped
@@ -692,21 +704,232 @@ def _build_ellpack(
     return ellpack_data, csr_remainder
 
 
+# ---------------------------------------------------------------------------
+# CHANGE 1: ELLPACK safeguard helper
+# ---------------------------------------------------------------------------
+
+def _build_ellpack_safe(
+    graph_csr: sp.csr_matrix,
+    out_degrees: np.ndarray,
+    hub_threshold: int,
+    ellpack_max_bytes: float,
+    free_bytes: int,
+    ellpack_vram_pct: float,
+) -> tuple[dict, dict, bool, float, str]:
+    """Build ELLPACK + CSR split with automatic disabling on memory excess.
+
+    CHANGE 1 rationale
+    ------------------
+    On power-law biological graphs (BA with m=5, n=1M) the naive 5 % hub
+    fraction selects 50k nodes.  If any hub has out-degree 50k, the padded
+    ELLPACK array is 50k × 50k × 8 B = 20 GB — larger than the whole VRAM
+    budget.  This helper disables ELLPACK and falls all nodes back to CSR
+    whenever the projected ELLPACK size exceeds either the absolute MB cap
+    or the VRAM-fraction cap.  The CSR scatter kernel handles high-degree
+    nodes via its HIGH tier (full block + SMEM hash), so correctness is
+    preserved.
+
+    Returns
+    -------
+    ellpack_data, csr_remainder, ellpack_disabled, ellpack_bytes, notes
+    """
+    ellpack_data, csr_remainder = _build_ellpack(
+        graph_csr, out_degrees, hub_threshold,
+    )
+    num_hubs    = ellpack_data["num_hubs"]
+    max_row_len = ellpack_data["max_row_len"]
+    ellpack_bytes = float(num_hubs * max_row_len * 8)   # int32 cols + float32 vals
+
+    # Effective cap: smaller of absolute MB limit and VRAM-fraction limit.
+    vram_cap = float(free_bytes) * max(0.0, min(ellpack_vram_pct, 1.0))
+    limit    = min(ellpack_max_bytes, vram_cap)
+
+    max_hub_degree = 0
+    if num_hubs > 0:
+        deg_int = np.diff(graph_csr.indptr).astype(np.int32)
+        max_hub_degree = int(deg_int[ellpack_data["hub_ids"]].max())
+
+    notes = (
+        f"ELLPACK: {num_hubs} hubs, max_hub_degree={max_hub_degree}, "
+        f"padded_slots={max_row_len}, "
+        f"estimated={ellpack_bytes/1e6:.1f} MB"
+    )
+
+    ellpack_disabled = (num_hubs > 0) and (ellpack_bytes > limit)
+
+    if ellpack_disabled:
+        notes += (
+            f" — DISABLED (exceeds {limit/1e6:.1f} MB limit; "
+            f"all nodes fall to CSR high-tier)"
+        )
+        logging.info("[PageRank] %s", notes)
+        # Move ALL non-dangling nodes into the CSR remainder.
+        deg_int = np.diff(graph_csr.indptr).astype(np.int32)
+        all_nodes = np.where(deg_int > 0)[0].astype(np.int32)
+        indptr   = np.ascontiguousarray(graph_csr.indptr,  dtype=np.int32)
+        indices  = np.ascontiguousarray(graph_csr.indices, dtype=np.int32)
+        data     = np.ascontiguousarray(graph_csr.data,    dtype=np.float32)
+        ellpack_data = {
+            "hub_ids":     np.zeros((0,), dtype=np.int32),
+            "cols":        np.zeros((0,), dtype=np.int32),
+            "vals":        np.zeros((0,), dtype=np.float32),
+            "max_row_len": 0,
+            "num_hubs":    0,
+        }
+        csr_remainder = {
+            "node_ids": all_nodes,
+            "num_low":  int(all_nodes.size),
+            "row_ptr":  indptr,
+            "col_idx":  indices,
+            "values":   data,
+        }
+    else:
+        notes += " — ACTIVE"
+        logging.info("[PageRank] %s", notes)
+
+    return ellpack_data, csr_remainder, ellpack_disabled, ellpack_bytes, notes
+
+
+# ---------------------------------------------------------------------------
+# CHANGE 2: Automatic pull-threshold detection
+# ---------------------------------------------------------------------------
+
+def _auto_pull_threshold(
+    in_degrees: np.ndarray,
+    pull_fraction: float = 0.01,
+    min_threshold: int = 32,
+) -> tuple[int, str]:
+    """Set pull threshold at the (1 - pull_fraction) in-degree percentile.
+
+    CHANGE 2 rationale
+    ------------------
+    Pull mode converts atomicAdd contention for high-in-degree "convergence
+    hub" nodes into a contention-free sequential gather.  It is only worth
+    the overhead (transpose CSR + extra kernel) when the in-degree
+    distribution is strongly skewed (power-law), which is the normal case
+    for biological networks.
+
+    Detection heuristic: if max_in_degree / mean_in_degree > 10 the graph
+    is considered scale-free and pull mode is enabled.  The threshold is
+    set at the (1 - pull_fraction) percentile so exactly pull_fraction of
+    nodes become pull targets.
+
+    Returns (threshold, note_string).  threshold == 0 means disabled.
+    """
+    if in_degrees.size == 0:
+        return 0, "pull disabled (empty graph)"
+
+    nonzero = in_degrees[in_degrees > 0]
+    if nonzero.size < 50:
+        return 0, "pull disabled (too few nodes)"
+
+    max_deg = float(nonzero.max())
+    avg_deg = float(nonzero.mean())
+    ratio   = max_deg / max(avg_deg, 1.0)
+
+    if ratio < 10.0:
+        return 0, (f"pull disabled (max/avg in-degree ratio={ratio:.1f} < 10; "
+                   f"not a scale-free graph)")
+
+    pct = (1.0 - max(0.0, min(pull_fraction, 0.5))) * 100.0
+    threshold = int(np.percentile(in_degrees, pct))
+    threshold = max(threshold, min_threshold)
+
+    pull_ids = np.where(in_degrees >= threshold)[0]
+    n_pull   = int(pull_ids.size)
+    n_edges  = int((in_degrees[pull_ids]).sum()) if n_pull > 0 else 0
+    total_edges = int(in_degrees.sum())
+    edge_pct = 100.0 * n_edges / max(total_edges, 1)
+
+    note = (
+        f"pull AUTO-ENABLED (max/avg={ratio:.1f}); "
+        f"threshold={threshold} (top {pull_fraction*100:.1f}% in-degree), "
+        f"{n_pull} pull nodes, "
+        f"{edge_pct:.1f}% of edges handled via atomic-free gather"
+    )
+    return threshold, note
+
+
+# ---------------------------------------------------------------------------
+# CHANGE 3: Improved VRAM estimator with detailed breakdown
+# ---------------------------------------------------------------------------
+
 def _estimate_pagerank_vram(
     n: int,
     nnz: int,
     num_hubs: int,
     max_row_len: int,
     has_pull: bool = False,
-) -> int:
-    """Rough VRAM estimate for the full PageRank working set, in bytes."""
-    csr_b      = (n + 1 + 2 * nnz) * 4
-    ellpack_b  = num_hubs * max_row_len * 8
-    pr_b       = 2 * n * 4
-    partial_b  = max(1, (n + BLOCK_SIZE - 1) // BLOCK_SIZE) * 4
-    misc_b     = n * 4 * 5
-    pull_b     = ((n + 1 + 2 * nnz) * 4) if has_pull else 0
-    return int(csr_b + ellpack_b + pr_b + partial_b + misc_b + pull_b)
+    pull_nnz: int | None = None,
+) -> tuple[int, dict[str, float]]:
+    """VRAM estimate in bytes plus a per-component breakdown dict.
+
+    CHANGE 3 rationale
+    ------------------
+    The old signature returned a single int; callers had no visibility
+    into *which* component was eating memory.  The new signature returns
+    (total_bytes, breakdown_mb_dict) so the log can show:
+
+        CSR:     44.0 MB    ELLPACK: 0.0 MB    PR vecs: 8.0 MB
+        aux:     5.0 MB     pull:    44.0 MB   total:   101.0 MB
+    """
+    # Row-pointer + col-idx + values
+    csr_b    = (n + 1) * 4 + nnz * 4 + nnz * 4
+
+    # ELLPACK: int32 cols + float32 vals per slot
+    ellpack_b = int(num_hubs) * int(max_row_len) * 8
+
+    # PR_old + PR_new
+    pr_b     = 2 * n * 4
+
+    # Partial-sum reduction buffers + 2 scalar outputs
+    n_blocks  = max(1, (n + BLOCK_SIZE - 1) // BLOCK_SIZE)
+    partial_b = n_blocks * 4 + 2 * 4
+
+    # Auxiliary per-node arrays:
+    #   out_degrees (FP32), dangling_flags (INT32),
+    #   eligible_mask (UINT8), pull_target_mask (UINT8)
+    aux_b = n * 4 + n * 4 + n * 1 + n * 1
+
+    # Node-ID arrays: hub_ids + low_ids (upper bound = n)
+    node_id_b = (num_hubs + n) * 4
+
+    # Pull-mode: transposed CSR (row_ptr + col_idx + values) + pull_ids
+    _pull_nnz = pull_nnz if pull_nnz is not None else nnz
+    pull_b    = ((n + 1) * 4 + _pull_nnz * 4 + _pull_nnz * 4) if has_pull else 0
+
+    total = (csr_b + ellpack_b + pr_b + partial_b
+             + aux_b + node_id_b + pull_b)
+
+    breakdown = {
+        "csr_mb":      csr_b     / 1e6,
+        "ellpack_mb":  ellpack_b / 1e6,
+        "pr_mb":       pr_b      / 1e6,
+        "partial_mb":  partial_b / 1e6,
+        "aux_mb":      aux_b     / 1e6,
+        "node_id_mb":  node_id_b / 1e6,
+        "pull_mb":     pull_b    / 1e6,
+        "total_mb":    total     / 1e6,
+    }
+    return int(total), breakdown
+
+
+def _log_vram_breakdown(
+    breakdown: dict[str, float],
+    free_mb: float,
+    label: str = "",
+) -> None:
+    """Log a one-line VRAM breakdown summary."""
+    parts = (
+        f"CSR={breakdown['csr_mb']:.1f} "
+        f"ELLPACK={breakdown['ellpack_mb']:.1f} "
+        f"PR={breakdown['pr_mb']:.1f} "
+        f"aux={breakdown['aux_mb']:.1f} "
+        f"pull={breakdown['pull_mb']:.1f} "
+        f"TOTAL={breakdown['total_mb']:.1f} "
+        f"| free={free_mb:.1f} MB"
+    )
+    logging.info("[PageRank VRAM%s] %s", f" ({label})" if label else "", parts)
 
 
 # ---------------------------------------------------------------------------
@@ -718,7 +941,6 @@ def _top_k_among(
     candidate_indices: np.ndarray,
     k: int,
 ) -> list[int]:
-    """Return the top-k indices (by score, descending) drawn from candidates."""
     if candidate_indices.size == 0:
         return []
     sub_scores = scores[candidate_indices]
@@ -733,8 +955,6 @@ def _pack_result(
     converged: bool,
     network_type: str,
 ) -> dict:
-    """Build the inner result dict in the network-type-specific shape."""
-    n = int(scores.size)
     nt = str(network_type).lower()
     scores_list = scores.astype(float).tolist()
 
@@ -759,7 +979,6 @@ def _pack_result(
             "converged":         converged,
         }
 
-    # Default: GRN
     return {
         "scores":          scores_list,
         "top_regulators":  _top_k_among(scores, regulators, _TOP_REG),
@@ -770,11 +989,10 @@ def _pack_result(
 
 
 # ---------------------------------------------------------------------------
-# Chunked-path helpers (Improvement 5)
+# Chunked-path helpers
 # ---------------------------------------------------------------------------
 
 class _ChunkBuffer:
-    """Pre-allocated per-chunk GPU buffer set (double-buffer slot)."""
     __slots__ = ("d_row_ptr", "d_col_idx", "d_values", "d_node_ids",
                  "max_nnz", "max_nodes")
 
@@ -807,7 +1025,6 @@ def _transfer_chunk_async(
     buf: _ChunkBuffer,
     stream,
 ) -> None:
-    """Async H2D of a chunk's CSR triple + node-id list into ``buf``."""
     cuda.memcpy_htod_async(buf.d_row_ptr.gpudata,
                             np.ascontiguousarray(chunk_indptr,  np.int32),
                             stream)
@@ -827,15 +1044,6 @@ def _build_csr_chunks(
     out_degrees: np.ndarray,
     chunk_size: int,
 ) -> list[dict]:
-    """Split the CSR row-wise into chunks of at most ``chunk_size`` rows.
-
-    Each chunk dict carries:
-        node_ids : global row indices included in this chunk
-        indptr   : LOCAL CSR row_ptr (re-based to start at 0)
-        indices  : column indices (full graph - global node IDs preserved)
-        values   : edge weights
-        nnz      : len(indices)
-    """
     n = int(graph_csr.shape[0])
     indptr  = graph_csr.indptr
     indices = graph_csr.indices
@@ -844,18 +1052,15 @@ def _build_csr_chunks(
     chunks: list[dict] = []
     for start in range(0, n, chunk_size):
         end = min(start + chunk_size, n)
-        # Restrict to rows that actually contribute (out_degree > 0).
         node_ids = np.arange(start, end, dtype=np.int32)
         mask     = out_degrees[start:end] > 0.0
         node_ids = node_ids[mask]
         if node_ids.size == 0:
             continue
 
-        # Slice the CSR by the kept rows.
         row_starts = indptr[node_ids]
         row_ends   = indptr[node_ids + 1]
         row_lens   = (row_ends - row_starts).astype(np.int32)
-        # Concatenate the kept rows' slices.
         nnz = int(row_lens.sum())
         if nnz == 0:
             continue
@@ -885,14 +1090,21 @@ def _build_csr_chunks(
 # ---------------------------------------------------------------------------
 
 def pagerank_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
-    """PageRank - GPU-accelerated via custom PyCUDA kernels.
+    """PageRank — GPU-accelerated via custom PyCUDA kernels.
 
-    See module docstring for the full algorithm; this routine adds:
-      - GPU-side scalar reductions (one sync per iteration);
-      - fused teleport + dangling redistribution;
-      - adaptive hub threshold for the CSR / ELLPACK split;
-      - optional pull-based contribution gather for extreme-in-degree hubs;
-      - chunked execution path for graphs that exceed VRAM.
+    Changes from the previous version
+    ----------------------------------
+    C1  ELLPACK safeguard: default fraction 0.05 → 0.001; additional
+        MB-cap and VRAM-pct-cap disables ELLPACK entirely when it would
+        exceed the limit, routing all nodes through the CSR HIGH-tier.
+    C2  Pull-mode auto-enabled for scale-free graphs (max/avg > 10).
+    C3  VRAM estimator returns per-component breakdown dict + detailed log.
+    C4  Auto-chunking at chunk_vram_pct (default 70 %) of free VRAM.
+        MemoryError is no longer raised for graphs that fit via chunking.
+    C5  Timing already excludes H2D (previous fix); chunked path now also
+        excludes the pull-transpose rebuild (was erroneously rebuilding it
+        inside the chunked function).
+    C6  Optional _PerfProfiler reports preprocessing vs GPU time split.
     """
     if not PYCUDA_AVAILABLE:
         raise RuntimeError(
@@ -921,29 +1133,47 @@ def pagerank_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
             for k, v in _DEFAULT_PARAMS.items():
                 p.setdefault(k, v)
 
-        damping           = float(p["damping"])
-        max_iter          = int(p["max_iter"])
-        tolerance         = float(p["tolerance"])
-        network_type      = str(p.get("network_type", "grn"))
-        block_size        = int(p.get("block_size", BLOCK_SIZE))
+        damping            = float(p["damping"])
+        max_iter           = int(p["max_iter"])
+        tolerance          = float(p["tolerance"])
+        network_type       = str(p.get("network_type", "grn"))
+        block_size         = int(p.get("block_size", BLOCK_SIZE))
         if block_size <= 0 or block_size > 1024:
             block_size = BLOCK_SIZE
-        use_chunking      = bool(p.get("use_chunking", False))
-        ellpack_fraction  = float(p.get("ellpack_fraction", 0.05))
-        pull_threshold    = int(p.get("pull_threshold", 0))
-        node_index_map    = p.get("node_index_map")
+        use_chunking       = bool(p.get("use_chunking", False))
+        ellpack_fraction   = float(p.get("ellpack_fraction", 0.001))
+        ellpack_max_mb     = float(p.get("ellpack_max_mb", 256.0))
+        ellpack_vram_pct   = float(p.get("ellpack_vram_pct", 0.10))
+        pull_threshold_p   = int(p.get("pull_threshold", -1))
+        pull_fraction      = float(p.get("pull_fraction", 0.01))
+        chunk_vram_pct     = float(p.get("chunk_vram_pct", 0.70))
+        enable_diag        = bool(p.get("enable_diagnostics", False))
+        node_index_map     = p.get("node_index_map")
 
         n = int(graph_csr.shape[0])
         if n == 0:
             raise ValueError("Empty graph")
 
+        prof = _PerfProfiler(enabled=enable_diag)
         teleport_val = np.float32((1.0 - damping) / n)
         init_val     = np.float32(1.0 / n)
 
-        # ---- CPU preprocessing ----------------------------------------
+        # ---- Get free VRAM once (used for all budget decisions) --------
+        prof.begin("vram_query")
+        try:
+            free_bytes, total_bytes = cuda.mem_get_info()
+        except Exception:                               # noqa: BLE001
+            free_bytes = 1 << 30
+            total_bytes = free_bytes
+        free_mb = free_bytes / 1e6
+        prof.end()
+
+        # ---- CPU preprocessing: degrees & masks -----------------------
+        prof.begin("preprocess_degrees")
         out_degrees    = _compute_out_degrees(graph_csr)
         dangling_mask  = _identify_dangling_nodes(out_degrees)
         dangling_flags = dangling_mask.astype(np.int32)
+        in_degrees     = _compute_in_degrees(graph_csr).astype(np.float32)
 
         eligible_mask_host, eligible_note = _eligible_mask(
             graph_csr, out_degrees, network_type, node_index_map,
@@ -957,44 +1187,57 @@ def pagerank_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
             eligible_mask_host[:] = 1
             num_eligible = n
             eligible_note += " (fallback to uniform - no eligible nodes found)"
+        prof.end()
 
-        # ---- Adaptive hub threshold + ELLPACK split -------------------
+        # ---- CHANGE 1: ELLPACK with safeguard -------------------------
+        prof.begin("ellpack_build")
         hub_threshold = _compute_adaptive_hub_threshold(
             out_degrees, target_ellpack_fraction=ellpack_fraction,
         )
-        ellpack_data, csr_remainder = _build_ellpack(
-            graph_csr, out_degrees, hub_threshold,
-        )
-        logging.info(
-            "PageRank adaptive hub threshold: %d "
-            "(%d hubs, %d CSR nodes; ellpack_fraction target=%.3f)",
-            hub_threshold,
-            ellpack_data["num_hubs"],
-            csr_remainder["num_low"],
-            ellpack_fraction,
-        )
+        ellpack_data, csr_remainder, ellpack_disabled, ellpack_bytes, ell_note = \
+            _build_ellpack_safe(
+                graph_csr, out_degrees, hub_threshold,
+                ellpack_max_bytes=ellpack_max_mb * 1e6,
+                free_bytes=free_bytes,
+                ellpack_vram_pct=ellpack_vram_pct,
+            )
+        prof.end()
 
-        # ---- Pull-mode setup (optional) --------------------------------
-        in_degrees   = _compute_in_degrees(graph_csr).astype(np.int64)
+        # ---- CHANGE 2: Auto pull-threshold ----------------------------
+        prof.begin("pull_setup")
+        if pull_threshold_p == -1:
+            # Auto-detect
+            pull_threshold, pull_note = _auto_pull_threshold(
+                in_degrees,
+                pull_fraction=pull_fraction,
+            )
+        elif pull_threshold_p == 0:
+            pull_threshold = 0
+            pull_note = "pull disabled (pull_threshold=0)"
+        else:
+            pull_threshold = pull_threshold_p
+            pull_note = f"pull threshold={pull_threshold} (explicit)"
+
         pull_enabled = pull_threshold > 0
         if pull_enabled:
             pull_ids = np.where(in_degrees >= pull_threshold)[0].astype(np.int32)
             pull_enabled = pull_ids.size > 0
+            if not pull_enabled:
+                pull_note += " (no nodes found at threshold — disabled)"
         else:
             pull_ids = np.zeros((0,), dtype=np.int32)
 
         pull_target_mask_host = np.zeros((n,), dtype=np.uint8)
         if pull_enabled:
             pull_target_mask_host[pull_ids] = 1
-            logging.info(
-                "PageRank pull-mode: %d pull-target nodes (in_degree >= %d)",
-                int(pull_ids.size), int(pull_threshold),
-            )
 
-        # MEMORY_FIX (C-6): build the transposed CSR for pull-mode here,
-        # BEFORE the CUDA event timing starts.  Previously this ~500 ms
-        # CPU operation (graph_csr.T.tocsr().astype(float32)) ran inside
-        # the timed region, inflating reported pagerank GPU runtime.
+        logging.info("[PageRank pull] %s", pull_note)
+        prof.end()
+
+        # ---- Build pull-mode transposed CSR (BEFORE timing) -----------
+        # CHANGE 5: always built here in the main function and passed to
+        # the chunked path.  The chunked path no longer rebuilds it.
+        prof.begin("transpose_build")
         pull_indptr_h = pull_indices_h = pull_values_h = None
         if pull_enabled:
             graph_csr_T = graph_csr.T.tocsr()
@@ -1004,46 +1247,68 @@ def pagerank_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
             pull_indices_h = np.ascontiguousarray(graph_csr_T.indices, np.int32)
             pull_values_h  = np.ascontiguousarray(graph_csr_T.data,    np.float32)
             del graph_csr_T
+        prof.end()
 
-        # ---- VRAM check / chunked path decision -----------------------
-        est_bytes = _estimate_pagerank_vram(
+        # ---- CHANGE 3: VRAM estimation with breakdown -----------------
+        prof.begin("vram_estimate")
+        pull_nnz = int(graph_csr.nnz) if pull_enabled else None
+        est_bytes, breakdown = _estimate_pagerank_vram(
             n=n, nnz=int(graph_csr.nnz),
             num_hubs=ellpack_data["num_hubs"],
             max_row_len=ellpack_data["max_row_len"],
             has_pull=pull_enabled,
+            pull_nnz=pull_nnz,
         )
-        try:
-            free_bytes, _total = cuda.mem_get_info()
-        except Exception:                               # noqa: BLE001
-            free_bytes = 1 << 30
-        if est_bytes > free_bytes:
-            raise MemoryError(
-                f"PageRank GPU needs ~{est_bytes/1e6:.1f} MB but only "
-                f"{free_bytes/1e6:.1f} MB free.  Use a higher-VRAM "
-                f"device or enable use_chunking=True."
+        _log_vram_breakdown(breakdown, free_mb)
+        prof.end()
+
+        # ---- CHANGE 4: Auto-chunking at chunk_vram_pct of free VRAM --
+        # Previously: raise MemoryError when est > free.
+        # Now: auto-chunk at chunk_vram_pct threshold; only raise if even
+        # the per-node cost alone exceeds free VRAM (degenerate case).
+        auto_chunk = (est_bytes > chunk_vram_pct * free_bytes)
+
+        if auto_chunk and not use_chunking:
+            logging.info(
+                "[PageRank] Auto-chunking: estimated %.1f MB > %.0f%% of "
+                "%.1f MB free VRAM.",
+                est_bytes / 1e6, chunk_vram_pct * 100, free_mb,
             )
-        auto_chunk = est_bytes > 0.8 * free_bytes
+
+        # Hard-fail only when even minimal (per-node) working set > free VRAM.
+        min_bytes = (2 * n * 4) + (n * 4 * 4)   # PR_old/new + 4 aux arrays
+        if min_bytes > free_bytes:
+            raise MemoryError(
+                f"PageRank GPU: even minimal working set ({min_bytes/1e6:.1f} MB) "
+                f"exceeds free VRAM ({free_mb:.1f} MB).  "
+                f"n={n} nodes is too large for this device."
+            )
+
         if use_chunking or auto_chunk:
-            return _pagerank_gpu_chunked(
+            prof.begin("chunked_path")
+            result = _pagerank_gpu_chunked(
                 graph_csr, p, out_degrees, dangling_flags,
                 eligible_mask_host, eligible_note, num_eligible,
                 pull_enabled, pull_ids, pull_target_mask_host,
-                in_degrees, ellpack_data, csr_remainder,
+                pull_indptr_h, pull_indices_h, pull_values_h,   # CHANGE 5
+                ellpack_data, csr_remainder,
                 damping, max_iter, tolerance, network_type, block_size,
                 teleport_val, init_val, n,
             )
+            prof.end()
+            prof.record("gpu_execution", result["execution_time"])
+            prof.log(extra=f"n={n} nnz={graph_csr.nnz} chunked=True")
+            return result
 
+        # ---- Compile kernels (not timed — kernel cache means only
+        #      first call pays compilation cost) -------------------------
         kernels = _get_kernels()
 
-        # ---- Streams + timing -----------------------------------------
+        # ---- Streams + events ------------------------------------------
         stream_compute  = cuda.Stream()
         stream_transfer = cuda.Stream()
         start_event     = cuda.Event()
         end_event       = cuda.Event()
-        # MEMORY_FIX (timing audit): start_event recorded AFTER allocations
-        # and H2D below — see the explicit record() right before the
-        # iteration loop.  This ensures only the actual algorithm work is
-        # measured, matching the fix for C-6.
 
         def _to_gpu(arr: np.ndarray):
             ga = gpuarray.to_gpu_async(arr, stream=stream_transfer)
@@ -1055,7 +1320,8 @@ def pagerank_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
             d_buffers.append(ga)
             return ga
 
-        # ---- Device allocation + async H2D ----------------------------
+        # ---- Device allocation + async H2D (NOT timed) ----------------
+        prof.begin("h2d_transfer")
         d_csr_row_ptr = _to_gpu(csr_remainder["row_ptr"])
         d_csr_col_idx = _to_gpu(csr_remainder["col_idx"])
         d_csr_values  = _to_gpu(csr_remainder["values"])
@@ -1082,9 +1348,7 @@ def pagerank_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
         d_pull_target_mask = (_to_gpu(pull_target_mask_host)
                               if pull_enabled else None)
 
-        # Pull mode arrays (transposed CSR + pull-target node IDs).
-        # MEMORY_FIX (C-6): host-side transpose now pre-built above; we
-        # only do the H2D upload here.
+        # Pull mode arrays (pre-built above — CHANGE 5).
         d_row_ptr_T = d_col_idx_T = d_values_T = d_pull_ids = None
         if pull_enabled:
             d_row_ptr_T = _to_gpu(pull_indptr_h)
@@ -1095,17 +1359,24 @@ def pagerank_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
         d_PR_old = _empty((n,), np.float32)
         d_PR_new = _empty((n,), np.float32)
 
-        n_partial_blocks = max(1, (n + BLOCK_SIZE - 1) // BLOCK_SIZE)
-        d_partial         = _empty((n_partial_blocks,), np.float32)
-        d_dangling_scalar = _empty((1,), np.float32)
-        d_l1_scalar       = _empty((1,), np.float32)
+        n_partial_blocks  = max(1, (n + BLOCK_SIZE - 1) // BLOCK_SIZE)
+        d_partial          = _empty((n_partial_blocks,), np.float32)
+        d_dangling_scalar  = _empty((1,), np.float32)
+        d_l1_scalar        = _empty((1,), np.float32)
 
-        # PR_old = 1/N (initial uniform distribution).
         init_host = np.full(n, init_val, dtype=np.float32)
         cuda.memcpy_htod_async(d_PR_old.gpudata, init_host, stream_transfer)
         stream_transfer.synchronize()
+        prof.end()
 
-        # ---- Iteration loop -------------------------------------------
+        # Null pull-mask (needed for the kernel pointer check).
+        if d_pull_target_mask is None:
+            d_pull_target_mask = _to_gpu(np.zeros((n,), dtype=np.uint8))
+            stream_transfer.synchronize()
+
+        # ---- Iteration loop (TIMED) ------------------------------------
+        start_event.record(stream_compute)
+
         converged   = False
         iterations  = 0
         n_init_grid = ((n + block_size - 1) // block_size, 1, 1)
@@ -1121,48 +1392,20 @@ def pagerank_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
         k_reduce    = kernels["reduce_scalar"]
         k_pull      = kernels["pull_gather"]
 
-        # Null mask for scatter kernels when pull mode is disabled - PyCUDA
-        # cannot pass a Python None as a pointer arg; we wrap it in a
-        # device-side 0-byte trick by passing the address of a single byte
-        # zero buffer.  When pull_target_mask is the null pointer, the
-        # kernel branch `if (pull_target_mask != 0 && ...)` short-circuits
-        # to false and behaviour matches the original scatter.
-        if d_pull_target_mask is None:
-            # Use a single-element 0-byte to keep the address valid; the
-            # kernel only dereferences when pull_target_mask != 0 - but
-            # we pass np.intp(0) as the address via a zero-length array
-            # is not portable.  Simpler: always allocate a 1-byte zero
-            # mask and pass it; the kernel's check `pull_target_mask[v]`
-            # with v < n must read 0 for every v.  Allocate a length-n
-            # zero mask only when pull is disabled.
-            d_pull_target_mask = _to_gpu(
-                np.zeros((n,), dtype=np.uint8))
-            stream_transfer.synchronize()
-
-        # MEMORY_FIX (timing audit): record start AFTER all H2D + alloc.
-        # Previously start_event fired before the ~80–200 ms H2D bytes;
-        # those PCIe transfers are setup, not algorithm work.
-        start_event.record(stream_compute)
-
         for it in range(max_iter):
             iterations = it + 1
 
-            # 1. Partial sum of dangling PR_old.
             k_sum_dang(
                 d_PR_old, d_dangling_flags, d_partial, np.int32(n),
                 block=partial_block, grid=partial_grid,
                 stream=stream_compute,
             )
-
-            # 2. GPU-side reduction -> scalar (no CPU sync).
             k_reduce(
                 d_partial, d_dangling_scalar,
                 np.int32(n_partial_blocks),
                 block=(BLOCK_SIZE, 1, 1), grid=(1, 1, 1),
                 stream=stream_compute,
             )
-
-            # 3. Fused teleport init + dangling redistribution.
             k_init_dang(
                 d_PR_new, teleport_val, d_dangling_scalar,
                 d_eligible_mask, np.int32(num_eligible),
@@ -1171,7 +1414,6 @@ def pagerank_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
                 stream=stream_compute,
             )
 
-            # 4. Scatter from CSR (low/medium-degree) sources.
             if csr_remainder["num_low"] > 0 and d_low_ids is not None:
                 k_sc_csr(
                     d_csr_row_ptr, d_csr_col_idx, d_csr_values,
@@ -1184,7 +1426,6 @@ def pagerank_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
                     stream=stream_compute,
                 )
 
-            # 5. Scatter from ELLPACK (hub) sources.
             if num_hubs > 0 and d_ellpack_cols is not None:
                 k_sc_ell(
                     d_ellpack_cols, d_ellpack_vals, d_hub_ids,
@@ -1197,7 +1438,6 @@ def pagerank_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
                     stream=stream_compute,
                 )
 
-            # 6. Pull-mode gather for extreme-in-degree targets.
             if pull_enabled and d_pull_ids is not None:
                 k_pull(
                     d_row_ptr_T, d_col_idx_T, d_values_T,
@@ -1209,7 +1449,6 @@ def pagerank_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
                     stream=stream_compute,
                 )
 
-            # 7. L1 convergence reduction.
             k_l1(
                 d_PR_new, d_PR_old, d_partial, np.int32(n),
                 block=partial_block, grid=partial_grid,
@@ -1222,11 +1461,8 @@ def pagerank_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
                 stream=stream_compute,
             )
 
-            # 8. ONE sync per iteration.
             stream_compute.synchronize()
             l1_norm = float(d_l1_scalar.get()[0])
-
-            # 9. Pointer swap (no data copy).
             d_PR_old, d_PR_new = d_PR_new, d_PR_old
 
             if l1_norm < tolerance:
@@ -1245,12 +1481,16 @@ def pagerank_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
         )
         inner["note"] = (
             f"{eligible_note}; "
-            f"hub_threshold={hub_threshold}, "
-            f"num_hubs={ellpack_data['num_hubs']}, "
-            f"pull_targets={int(pull_ids.size) if pull_enabled else 0}, "
+            f"{ell_note}; "
+            f"{pull_note}; "
             f"arch={kernels.get('_arch_flag', '?')}, "
-            f"syncs_per_iter=1"
+            f"syncs_per_iter=1, "
+            f"vram_est={breakdown['total_mb']:.1f}MB"
         )
+
+        # CHANGE 6: profiler summary
+        prof.record("gpu_execution", elapsed)
+        prof.log(extra=f"n={n} nnz={graph_csr.nnz} iters={iterations}")
 
         return {
             "algorithm":      "pagerank",
@@ -1267,8 +1507,8 @@ def pagerank_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
         raise
     except MemoryError:
         logging.warning(
-            "VRAM exhausted in pagerank_gpu.  Retry with a higher-VRAM "
-            "device, or set use_chunking=True / reduce graph size."
+            "VRAM exhausted in pagerank_gpu (even minimal footprint too large). "
+            "Use a higher-VRAM device or reduce graph size."
         )
         raise
     finally:
@@ -1285,7 +1525,7 @@ def pagerank_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Chunked execution path (Improvement 5)
+# Chunked execution path
 # ---------------------------------------------------------------------------
 
 def _pagerank_gpu_chunked(
@@ -1299,7 +1539,9 @@ def _pagerank_gpu_chunked(
     pull_enabled: bool,
     pull_ids: np.ndarray,
     pull_target_mask_host: np.ndarray,
-    in_degrees: np.ndarray,
+    pull_indptr_h: np.ndarray | None,       # CHANGE 5: pre-built, not rebuilt here
+    pull_indices_h: np.ndarray | None,
+    pull_values_h: np.ndarray | None,
     ellpack_data: dict,
     csr_remainder: dict,
     damping: float,
@@ -1313,31 +1555,35 @@ def _pagerank_gpu_chunked(
 ) -> dict:
     """PageRank with chunked CSR uploads + double-buffer transfer pipeline.
 
-    PR_old / PR_new stay fully resident on the device (n floats each);
-    only the CSR row data is streamed in per chunk via a ping-pong pair
-    of pre-allocated transfer buffers.  Compute on chunk i overlaps with
-    transfer of chunk i+1 via ``stream_transfer`` + ``cuda.Event``.
-
-    The ELLPACK hub kernel is NOT chunked here (hubs are typically a tiny
-    fraction of nodes and already fit in VRAM); it runs once per iteration
-    after the chunked CSR scatter completes.  Pull-mode is similarly
-    treated as a single full-graph launch.
+    CHANGE 5: The pull-mode transposed CSR is now received as pre-built
+    host arrays (pull_indptr_h, pull_indices_h, pull_values_h) rather than
+    being rebuilt inside this function.  The previous rebuild was an
+    O(nnz log nnz) CPU operation that was erroneously included inside the
+    GPU timed region and paid twice when auto-chunking triggered.
     """
     kernels = _get_kernels()
 
-    # ---- Chunk size from free VRAM --------------------------------------
     try:
-        free_bytes, _total = cuda.mem_get_info()
+        free_bytes, _ = cuda.mem_get_info()
     except Exception:                                   # noqa: BLE001
         free_bytes = 1 << 30
+
     avg_nnz = max(1.0, graph_csr.nnz / max(1, n))
     bytes_per_node = (1 + 2 * avg_nnz) * 4
-    available = int(free_bytes * 0.60)        # 60% budget for chunks
+    available  = int(free_bytes * 0.60)
     chunk_size = max(1, min(n, int(available / max(1.0, bytes_per_node))))
+
+    logging.info(
+        "[PageRank chunked] chunk_size=%d (%d chunks approx), "
+        "bytes_per_node=%.0f, available=%.0f MB",
+        chunk_size,
+        max(1, n // chunk_size),
+        bytes_per_node,
+        available / 1e6,
+    )
 
     chunks = _build_csr_chunks(graph_csr, out_degrees, chunk_size)
     if not chunks:
-        # No non-dangling rows - degenerate; return uniform scores.
         scores_host = np.full(n, init_val, dtype=np.float32)
         inner = _pack_result(scores_host, out_degrees, 0, False, network_type)
         inner["note"] = eligible_note + "; chunked path (no rows to scatter)"
@@ -1351,7 +1597,6 @@ def _pagerank_gpu_chunked(
             "result":         inner,
         }
 
-    # ---- Streams + events + double buffers ------------------------------
     stream_compute  = cuda.Stream()
     stream_transfer = cuda.Stream()
     start_event     = cuda.Event()
@@ -1378,7 +1623,6 @@ def _pagerank_gpu_chunked(
         return ga
 
     try:
-        # ELLPACK hubs (small enough to fully resident).
         num_hubs    = ellpack_data["num_hubs"]
         max_row_len = ellpack_data["max_row_len"]
         if num_hubs > 0:
@@ -1396,16 +1640,12 @@ def _pagerank_gpu_chunked(
             if pull_enabled else np.zeros((n,), dtype=np.uint8)
         )
 
-        # Pull-mode arrays (full-graph transposed CSR).
+        # CHANGE 5: use the pre-built transpose arrays — no rebuild here.
         d_row_ptr_T = d_col_idx_T = d_values_T = d_pull_ids = None
-        if pull_enabled:
-            graph_csr_T = graph_csr.T.tocsr().astype(np.float32)
-            d_row_ptr_T = _to_gpu(
-                np.ascontiguousarray(graph_csr_T.indptr,  np.int32))
-            d_col_idx_T = _to_gpu(
-                np.ascontiguousarray(graph_csr_T.indices, np.int32))
-            d_values_T  = _to_gpu(
-                np.ascontiguousarray(graph_csr_T.data,    np.float32))
+        if pull_enabled and pull_indptr_h is not None:
+            d_row_ptr_T = _to_gpu(pull_indptr_h)
+            d_col_idx_T = _to_gpu(pull_indices_h)
+            d_values_T  = _to_gpu(pull_values_h)
             d_pull_ids  = _to_gpu(pull_ids)
 
         d_PR_old = _empty((n,), np.float32)
@@ -1440,7 +1680,6 @@ def _pagerank_gpu_chunked(
         for it in range(max_iter):
             iterations = it + 1
 
-            # 1. Dangling sum + GPU reduction.
             k_sum_dang(
                 d_PR_old, d_dangling_flags, d_partial, np.int32(n),
                 block=partial_block, grid=partial_grid,
@@ -1452,8 +1691,6 @@ def _pagerank_gpu_chunked(
                 block=(BLOCK_SIZE, 1, 1), grid=(1, 1, 1),
                 stream=stream_compute,
             )
-
-            # 2. Fused init + dangling redistribution.
             k_init_dang(
                 d_PR_new, teleport_val, d_dangling_scalar,
                 d_eligible_mask, np.int32(num_eligible),
@@ -1462,7 +1699,7 @@ def _pagerank_gpu_chunked(
                 stream=stream_compute,
             )
 
-            # 3. Chunked scatter with double-buffer pipeline.
+            # Double-buffer chunked scatter.
             _transfer_chunk_async(
                 chunks[0]["indptr"], chunks[0]["indices"],
                 chunks[0]["values"], chunks[0]["node_ids"],
@@ -1496,7 +1733,6 @@ def _pagerank_gpu_chunked(
                     )
                     events[next_slot].record(stream_transfer)
 
-            # 4. ELLPACK hub scatter (not chunked).
             if num_hubs > 0 and d_ellpack_cols is not None:
                 k_sc_ell(
                     d_ellpack_cols, d_ellpack_vals, d_hub_ids,
@@ -1509,7 +1745,6 @@ def _pagerank_gpu_chunked(
                     stream=stream_compute,
                 )
 
-            # 5. Pull-mode gather (not chunked).
             if pull_enabled and d_pull_ids is not None:
                 k_pull(
                     d_row_ptr_T, d_col_idx_T, d_values_T,
@@ -1521,7 +1756,6 @@ def _pagerank_gpu_chunked(
                     stream=stream_compute,
                 )
 
-            # 6. L1 convergence + GPU reduction.
             k_l1(
                 d_PR_new, d_PR_old, d_partial, np.int32(n),
                 block=partial_block, grid=partial_grid,
@@ -1536,7 +1770,6 @@ def _pagerank_gpu_chunked(
 
             stream_compute.synchronize()
             l1_norm = float(d_l1_scalar.get()[0])
-
             d_PR_old, d_PR_new = d_PR_new, d_PR_old
             if l1_norm < tolerance:
                 converged = True
@@ -1553,9 +1786,8 @@ def _pagerank_gpu_chunked(
         inner["note"] = (
             f"{eligible_note}; chunked path "
             f"({len(chunks)} chunks of ~{chunk_size} rows each); "
-            f"hub_threshold={ellpack_data['num_hubs']}, "
-            f"arch={kernels.get('_arch_flag', '?')}, "
-            f"syncs_per_iter=1"
+            f"num_hubs={ellpack_data['num_hubs']}; "
+            f"arch={kernels.get('_arch_flag', '?')}, syncs_per_iter=1"
         )
         return {
             "algorithm":      "pagerank",
