@@ -90,7 +90,7 @@ _MODE_COLOURS: dict[str, str] = {
 
 _DEFAULT_PARAMS: dict[str, dict[str, Any]] = {
     "pagerank": {"damping": 0.85, "max_iter": 100, "tolerance": 1e-6},
-    "bfs":      {"source": 0, "max_depth": 5},
+    "bfs":      {"source": 0, "max_depth": 999},  # full reachable component
     "rwr":      {"restart_prob": 0.3, "max_iter": 100,
                  "tolerance": 1e-6, "seed_nodes": [0]},
     "hits":     {"max_iter": 100, "tolerance": 1e-6},

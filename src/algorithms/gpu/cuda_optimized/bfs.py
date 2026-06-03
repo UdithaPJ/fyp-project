@@ -114,7 +114,7 @@ except Exception:                                       # noqa: BLE001
 
 _DEFAULT_PARAMS: dict = {
     "source":       0,
-    "max_depth":    5,
+    "max_depth":    999,    # benchmark default: traverse full reachable component
     "network_type": "grn",
     "block_size":   256,
 }
