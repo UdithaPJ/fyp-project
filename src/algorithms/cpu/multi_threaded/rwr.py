@@ -2,47 +2,38 @@
 src/algorithms/cpu/multi_threaded/rwr.py
 =========================================
 
-Random Walk with Restart (RWR) — multi-process CPU implementation only.
+Random Walk with Restart (RWR) — GraphBLAS-backed cpu_multi.
 
-If ``params["seed_nodes"]`` is a flat list (single seed set), falls back
-to ``rwr_cpu_single`` — there is nothing to parallelise.
+Power iteration with restart vector.  One SpMV per iteration via
+SuiteSparse:GraphBLAS ``plus_times``.  Multiple seed sets (list-of-lists
+input) are iterated sequentially and the per-node scores are averaged
+across seed sets — matching the documented multi-seed-set behaviour of
+the previous ProcessPoolExecutor implementation.
 
-If it is a list-of-lists, each inner list is treated as an independent
-seed set.  One RWR run is launched per seed set via ProcessPoolExecutor;
-the per-node scores are averaged across all runs to produce a consensus
-regulatory influence vector.
-
-Averaging across seed sets is biologically useful when multiple disease-
-associated TF panels (e.g. TP53 + BRCA1 vs. MYC + EGFR) are compared:
-the mean score highlights genes that are convergently regulated.
-
-Shared helpers imported from src.algorithms.common.helpers:
-    _build_transition_matrix, _top_tfs, _top_nodes
-
-Cross-file import:
-    rwr_cpu_single — fallback when seed_nodes is a flat list
-
-Exclusive to this file:
-    _rwr_seed_set_worker — per-seed-set RWR subprocess worker
-
-For the single-seed-set variant see:
-    src.algorithms.cpu.single_threaded.rwr
+For the single-seed-set variant see
+``src.algorithms.cpu.single_threaded.rwr``.
 """
 
 from __future__ import annotations
-
-from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 import scipy.sparse as sp
 
 from src.algorithms.common.helpers import (
     _build_transition_matrix,
+    _make_p0,
     _top_nodes,
     _top_tfs,
-    _worker_init_no_blas,
 )
-from src.algorithms.cpu.single_threaded.rwr import rwr_cpu_single
+from src.algorithms.cpu.multi_threaded._graphblas_utils import (
+    _configure_threads,
+    _from_scipy,
+    _require_graphblas,
+    _vec_from_np,
+    _vec_to_np,
+    gb,
+)
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -56,47 +47,8 @@ _DEFAULT_PARAMS: dict = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Private helpers
-# ---------------------------------------------------------------------------
-
 def _merge_params(user_params: dict | None) -> dict:
     return {**_DEFAULT_PARAMS, **(user_params or {})}
-
-
-# ---------------------------------------------------------------------------
-# Module-level worker — must be at module scope for ProcessPoolExecutor pickle
-# ---------------------------------------------------------------------------
-
-def _rwr_seed_set_worker(args: tuple) -> tuple[list[float], int]:
-    """
-    Run a single RWR from one seed set.
-
-    Receives the full transition matrix as raw CSR arrays (avoids pickling a
-    sparse object) plus the seed list and hyperparameters.  Returns the final
-    score vector as a list and the iteration count.
-    """
-    W_data, W_indices, W_indptr, W_shape, seed_nodes, restart_prob, max_iter, tol = args
-    W = sp.csr_matrix((W_data, W_indices, W_indptr), shape=W_shape)
-    N = W_shape[0]
-
-    p0 = np.zeros(N, dtype=np.float64)
-    valid = [s for s in seed_nodes if 0 <= s < N]
-    if valid:
-        p0[valid] = 1.0 / len(valid)
-    else:
-        p0[:] = 1.0 / N
-
-    r = float(restart_prob)
-    p = p0.copy()
-
-    for iteration in range(1, max_iter + 1):
-        p_old = p
-        p = (1.0 - r) * (W @ p_old) + r * p0
-        if np.abs(p - p_old).sum() < tol:
-            break
-
-    return p.tolist(), iteration
 
 
 # ---------------------------------------------------------------------------
@@ -106,72 +58,75 @@ def _rwr_seed_set_worker(args: tuple) -> tuple[list[float], int]:
 def rwr_cpu_multi(
     graph_csr: sp.csr_matrix,
     params:    dict,
-    n_workers: int = 4,
+    n_workers: int | None = None,
 ) -> dict:
+    """RWR using SuiteSparse:GraphBLAS for the SpMV step.
+
+    When ``params["seed_nodes"]`` is a flat list this runs one RWR;
+    when it is a list-of-lists, each inner list is treated as an
+    independent seed set and the per-node scores are averaged.
     """
-    RWR — multi-process CPU implementation for multiple seed sets.
+    _require_graphblas()
+    n_threads = _configure_threads(n_workers)
 
-    When ``params["seed_nodes"]`` is a flat list (single seed set), this
-    function delegates to ``rwr_cpu_single`` — there is nothing to
-    parallelise.
-
-    When it is a list-of-lists, each inner list is an independent seed set.
-    One RWR run is launched per seed set via ProcessPoolExecutor; the
-    per-node scores are then averaged to produce a consensus influence vector.
-
-    Parameters
-    ----------
-    graph_csr : scipy.sparse.csr_matrix
-    params    : dict
-        restart_prob (float, default 0.3)
-        max_iter     (int,   default 100)
-        tolerance    (float, default 1e-6)
-        seed_nodes   (list[list[int]]) — list of seed-TF index lists
-    n_workers : int
-
-    Returns
-    -------
-    dict with keys: scores, iterations, top_nodes, top_tfs
-    """
-    p     = _merge_params(params)
-    seeds = p["seed_nodes"]
-
-    # Single seed set — no parallelism available
-    if not seeds or not isinstance(seeds[0], list):
-        return rwr_cpu_single(graph_csr, params)
-
+    p        = _merge_params(params)
     r        = float(p["restart_prob"])
     max_iter = int(p["max_iter"])
     tol      = float(p["tolerance"])
+    seeds    = p["seed_nodes"]
 
-    N = graph_csr.shape[0]
-    W, _ = _build_transition_matrix(graph_csr)
+    n = int(graph_csr.shape[0])
+    if n == 0:
+        return {
+            "scores": [], "iterations": 0,
+            "top_nodes": [], "top_tfs": [],
+            "note": "graphblas SuiteSparse (empty graph)",
+        }
 
-    args_list = [
-        (W.data, W.indices, W.indptr, W.shape, seed_set, r, max_iter, tol)
-        for seed_set in seeds
-    ]
+    # Normalize seed input into a list of seed sets.
+    if seeds and isinstance(seeds[0], (list, tuple)):
+        seed_sets = [list(s) for s in seeds]
+    else:
+        seed_sets = [list(seeds) if seeds else [0]]
 
-    # MEMORY_FIX (H-3): worker BLAS pinned to 1 thread to avoid oversubscription.
-    with ProcessPoolExecutor(
-        max_workers=n_workers, initializer=_worker_init_no_blas
-    ) as executor:
-        results = list(executor.map(_rwr_seed_set_worker, args_list))
+    # Build column-stochastic transition matrix W once.
+    W_scipy, _ = _build_transition_matrix(graph_csr)
+    W_gb = _from_scipy(W_scipy.astype(np.float32, copy=False), dtype=np.float32)
 
-    score_matrix = np.array([res[0] for res in results], dtype=np.float64)
-    avg_scores   = score_matrix.mean(axis=0)
-    max_iter_out = max(res[1] for res in results)
+    one_minus_r = np.float32(1.0 - r)
+    r_fp32      = np.float32(r)
 
+    score_list: list[np.ndarray] = []
+    max_iter_used = 0
+
+    for sset in seed_sets:
+        p0 = _make_p0(sset, n).astype(np.float32)
+        pr = p0.copy()
+        iteration = 0
+        for iteration in range(1, max_iter + 1):
+            pr_old = pr
+            pr_gb = _vec_from_np(pr_old, dtype=gb.dtypes.FP32)
+            result_gb = W_gb.mxv(pr_gb, gb.semiring.plus_times).new()
+            result = _vec_to_np(result_gb, n, dtype=np.float32, fill=0.0)
+            pr = one_minus_r * result + r_fp32 * p0
+            if float(np.abs(pr - pr_old).sum()) < tol:
+                break
+        score_list.append(pr)
+        max_iter_used = max(max_iter_used, iteration)
+
+    avg_scores = np.mean(np.stack(score_list, axis=0), axis=0).astype(np.float32)
     all_seeds: list[int] = []
-    for seed_set in seeds:
-        all_seeds.extend(seed_set)
+    for sset in seed_sets:
+        all_seeds.extend(int(s) for s in sset)
     all_seeds = list(dict.fromkeys(all_seeds))
 
     return {
         "scores":     avg_scores.tolist(),
-        "iterations": max_iter_out,
+        "iterations": max_iter_used,
         "top_nodes":  _top_nodes(avg_scores),
         "top_tfs":    _top_tfs(avg_scores, all_seeds),
+        "note":       f"graphblas SuiteSparse nthreads={n_threads}"
+                      f" seed_sets={len(seed_sets)}",
     }
 
 
@@ -182,12 +137,12 @@ def rwr_cpu_multi(
 def _cpu_multi(
     graph_csr: sp.csr_matrix,
     params:    dict | None = None,
-    n_workers: int = 4,
+    n_workers: int | None = None,
     **_,
 ) -> dict:
-    """Benchmark runner entry-point for cpu_multi mode."""
+    """Benchmark runner entry-point for cpu_multi mode (now GraphBLAS-backed)."""
     p = _merge_params(params)
     return {
         "output":       rwr_cpu_multi(graph_csr, p, n_workers=n_workers),
-        "extra_params": {**p, "n_workers": n_workers},
+        "extra_params": {**p, "backend": "graphblas"},
     }

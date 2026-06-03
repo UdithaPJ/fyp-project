@@ -92,7 +92,7 @@ MODES: tuple[str, ...] = ("cpu_single", "cpu_multi", "gpu_baseline", "gpu")
 
 _MODE_LABELS: dict[str, str] = {
     "cpu_single":   "CPU Single",
-    "cpu_multi":    "CPU Multi",
+    "cpu_multi":    "CPU GraphBLAS",     # was multiprocessing; now SuiteSparse
     "gpu_baseline": "GPU Baseline",
     "gpu":          "GPU Optimised",
 }
