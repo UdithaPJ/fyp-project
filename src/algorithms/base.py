@@ -49,7 +49,18 @@ REQUIRED_RESULT_KEYS = (
     "result",
 )
 
-VALID_MODES = ("cpu_single", "cpu_multi", "gpu", "gpu_baseline")
+VALID_MODES = (
+    "cpu_single",
+    "cpu_multi",
+    "gpu",
+    "gpu_baseline",
+    # The baseline algorithms return more specific mode strings that
+    # encode which backend was used (cuGraph vs CuPy).  Both are valid
+    # results for a "gpu_baseline" run — the runner preserves them rather
+    # than overwriting with the generic "gpu_baseline" string.
+    "gpu_baseline_cugraph",   # pagerank, bfs, hits, louvain, rwr baselines
+    "gpu_baseline_cupy",      # mcl baseline (cuGraph has no MCL equivalent)
+)
 
 
 # ---------------------------------------------------------------------------
