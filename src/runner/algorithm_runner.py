@@ -79,22 +79,37 @@ if not _CUDA_AVAILABLE:
 
 
 def _needs_pycuda_context(algorithm_name: str, mode: str) -> bool:
-    """Return True if this run should ensure a PyCUDA context is current."""
+    """Return True when a PyCUDA context must be held for the whole call.
+
+    All GPU modes now return True because every algorithm uses
+    ``retain_primary_context().push()/pop()`` internally, and
+    ``BenchmarkTimer`` creates CUDA events in ``__enter__`` that must
+    remain valid through ``__exit__`` (after the algorithm's own pop).
+    Holding a parent push here keeps the context alive through the
+    BenchmarkTimer boundary.
+    """
     if mode not in ("gpu", "gpu_baseline"):
         return False
-    # BFS is implemented with raw PyCUDA kernels (optimized mode only).
-    if mode == "gpu" and algorithm_name == "bfs":
-        return True
-    # If the timer backend is PyCUDA, we also need a current context.
-    return _GPU_TIMER_BACKEND == "pycuda"
+    # All GPU modes need the context held for the BenchmarkTimer boundary.
+    return True
 
 
 @contextmanager
 def _cuda_context_guard(algorithm_name: str, mode: str):
-    """Ensure the executing thread has a current CUDA context when needed."""
+    """Ensure the executing thread has a current CUDA context when needed.
+
+    For all GPU modes we push the PyCUDA primary context here and pop it
+    AFTER ``BenchmarkTimer.__exit__`` has recorded its end event.  The
+    algorithm's own ``retain_primary_context().push()/pop()`` calls are
+    nested inside and are safe because ``retain_primary_context`` is
+    ref-counted — the context only becomes non-current when ALL pushes
+    have been matched by pops.  Without this outer push, the algorithm's
+    pop would make the context non-current while ``BenchmarkTimer.__exit__``
+    still needs to call ``cuEventRecord``.
+    """
     pushed = False
 
-    # Ensure a PyCUDA context is current for PyCUDA-based algorithms/timers.
+    # Ensure a PyCUDA context is current for all GPU runs.
     if _needs_pycuda_context(algorithm_name, mode):
         global _PYCUDA_PRIMARY_CONTEXT
         try:
@@ -104,7 +119,7 @@ def _cuda_context_guard(algorithm_name: str, mode: str):
             if _PYCUDA_PRIMARY_CONTEXT is None:
                 if cuda.Device.count() <= 0:
                     raise RuntimeError("no CUDA devices detected")
-                # Use the PRIMARY context so it can coexist with CuPy.
+                # Use the PRIMARY context so it coexists with CuPy.
                 _PYCUDA_PRIMARY_CONTEXT = cuda.Device(0).retain_primary_context()
 
             try:
@@ -116,19 +131,17 @@ def _cuda_context_guard(algorithm_name: str, mode: str):
                 _PYCUDA_PRIMARY_CONTEXT.push()
                 pushed = True
         except Exception:
-            # No PyCUDA context available in this thread. Let downstream code
-            # raise a clear error or fall back.
+            # No PyCUDA context available.  Let downstream code surface the
+            # error or fall back.
             pushed = False
 
-    # Ensure CuPy's primary context is current in this thread (no-op if already).
-    # Do this AFTER any PyCUDA primary-context push so CuPy events/streams
-    # are guaranteed to bind to the same primary context.
+    # Ensure CuPy's primary context is current in this thread (no-op if
+    # already set).  Done AFTER the PyCUDA push so both APIs bind to the
+    # same underlying primary context.
     if mode in ("gpu", "gpu_baseline") and _cp is not None:
         try:
             _cp.cuda.Device(0).use()
         except Exception:
-            # If CuPy is present but no device/context is usable, defer to
-            # the algorithm's internal fallback logic.
             pass
 
     try:
