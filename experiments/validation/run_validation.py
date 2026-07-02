@@ -157,6 +157,21 @@ def _parse_args() -> argparse.Namespace:
         "--holdout-fraction", type=float, default=0.2,
         help="Fraction of edges held out for the hold-out validator.",
     )
+    # ── Label remapping (Ensembl protein id → gene symbol) ──
+    p.add_argument(
+        "--string-info-path", type=Path, default=None,
+        help="Path to STRING's 9606.protein.info.v*.txt (columns: "
+             "string_protein_id, preferred_name, ...).  When provided (or "
+             "auto-discovered under data/raw/), the graph's node labels are "
+             "translated from Ensembl protein ids to gene symbols before "
+             "biological / orthogonal / GO validation.  Not needed for "
+             "hold-out.",
+    )
+    p.add_argument(
+        "--no-remap", action="store_true",
+        help="Disable automatic Ensembl→symbol remapping even if a STRING "
+             "info file is present.",
+    )
     p.add_argument("--verbose", action="store_true")
     return p.parse_args()
 
@@ -242,6 +257,24 @@ def main() -> None:
             "weight": args.weight_col,
         },
     )
+
+    # ── Ensembl protein id → gene symbol remapping ──
+    #
+    # Every biological / orthogonal / GO reference matches on HGNC gene
+    # symbols; if the graph carries raw STRING ids (9606.ENSP...) the
+    # overlap will silently be zero.  Auto-load STRING's protein-info file
+    # from data/raw/ (or --string-info-path) and remap ``node_index_map``
+    # in place.
+    if not args.no_remap:
+        from src.validation import load_string_id_map, remap_node_index_map
+        id_map = load_string_id_map(args.string_info_path)
+        if id_map:
+            node_index_map, stats = remap_node_index_map(node_index_map, id_map)
+            print(
+                f"[validate] STRING id remap: mapped={stats['mapped']:,} "
+                f"unchanged={stats['unchanged']:,} "
+                f"collisions={stats['collisions']:,}"
+            )
 
     ds_name = args.dataset_name or args.raw_path.stem
 

@@ -86,10 +86,11 @@ def test_load_gene_set_disease(tmp_path: Path):
     assert len(ref.genes) == 20
 
 
-def test_load_gene_set_missing_returns_none(tmp_path: Path):
-    from src.validation.reference_loader import load_gene_set
-    assert load_gene_set("disease", tmp_path / "nope.tsv") is None
-    assert load_gene_set("unknown_kind") is None
+def test_load_gene_set_missing_returns_none(monkeypatch, tmp_path: Path):
+    from src.validation import reference_loader as rl
+    monkeypatch.setattr(rl, "_find_file", lambda *a, **kw: None)
+    assert rl.load_gene_set("disease", tmp_path / "nope.tsv") is None
+    assert rl.load_gene_set("unknown_kind") is None
 
 
 def test_load_go_annotations(tmp_path: Path):
@@ -124,6 +125,70 @@ def test_load_go_aspect_filter(tmp_path: Path):
     assert go is not None
     assert "GENE0" in go.genes
     assert "GENE1" not in go.genes   # aspect C filtered out
+
+
+# ===========================================================================
+# STRING id → gene-symbol remap
+# ===========================================================================
+
+def test_load_string_id_map(tmp_path: Path):
+    from src.validation.reference_loader import load_string_id_map
+    f = tmp_path / "9606.protein.info.v12.0.txt"
+    f.write_text(
+        "#string_protein_id\tpreferred_name\tprotein_size\tannotation\n"
+        "9606.ENSP00000000233\tARF5\t180\tADP-ribosylation factor 5\n"
+        "9606.ENSP00000000412\tM6PR\t277\tMannose-6-phosphate receptor\n"
+    )
+    m = load_string_id_map(f)
+    assert m["9606.ENSP00000000233"] == "ARF5"
+    assert m["9606.ENSP00000000412"] == "M6PR"
+    # symbols upper-cased
+    assert all(v == v.upper() for v in m.values())
+
+
+def test_load_string_id_map_missing(monkeypatch, tmp_path: Path):
+    """When the loader cannot locate any info file, returns ``{}``."""
+    from src.validation import reference_loader as rl
+    # Force `_find_file` to return None to simulate a machine without the
+    # real 9606.protein.info.v*.txt (which is checked into data/raw/).
+    monkeypatch.setattr(rl, "_find_file", lambda *a, **kw: None)
+    assert rl.load_string_id_map(tmp_path / "absent.txt") == {}
+
+
+def test_remap_node_index_map_translates_and_keeps_unmapped():
+    from src.validation.reference_loader import remap_node_index_map
+    nim = {"9606.ENSP00000000233": 0, "9606.ENSP99999999999": 1, "keep": 2}
+    id_map = {"9606.ENSP00000000233": "ARF5"}
+    out, stats = remap_node_index_map(nim, id_map)
+    assert out["ARF5"] == 0            # mapped
+    assert out["9606.ENSP99999999999"] == 1  # unchanged (not in id_map)
+    assert out["keep"] == 2            # unchanged
+    assert stats["mapped"] == 1
+    assert stats["unchanged"] == 2
+    assert stats["collisions"] == 0
+
+
+def test_remap_node_index_map_handles_collisions():
+    """Two source labels mapping to the same symbol (isoform collision):
+    first wins under the symbol; loser stays under its original label so
+    its index is still reachable."""
+    from src.validation.reference_loader import remap_node_index_map
+    nim = {"ENSP_A": 0, "ENSP_B": 1}
+    id_map = {"ENSP_A": "TP53", "ENSP_B": "TP53"}
+    out, stats = remap_node_index_map(nim, id_map)
+    assert out["TP53"] == 0                 # first wins
+    assert out["ENSP_B"] == 1               # loser kept under raw label
+    assert stats["collisions"] == 1
+    assert len(out) == 2                    # no index lost
+
+
+def test_remap_empty_id_map_is_passthrough():
+    from src.validation.reference_loader import remap_node_index_map
+    nim = {"a": 0, "b": 1}
+    out, stats = remap_node_index_map(nim, {})
+    assert out == nim
+    assert stats["mapped"] == 0
+    assert stats["unchanged"] == 2
 
 
 # ===========================================================================
@@ -171,8 +236,10 @@ def test_orthogonal_community_nmi(tmp_path: Path):
     assert rec.nmi > 0.5                    # community matches disease partition
 
 
-def test_orthogonal_missing_reference_skips(tmp_path: Path):
+def test_orthogonal_missing_reference_skips(monkeypatch, tmp_path: Path):
     from src.validation import OrthogonalValidator
+    from src.validation import reference_loader as rl
+    monkeypatch.setattr(rl, "_find_file", lambda *a, **kw: None)
     csr = _block_graph()
     results = {"pagerank": _pagerank_result(list(range(10)), 60)}
     ov = OrthogonalValidator(kinds=("disease",), output_dir=tmp_path,
@@ -280,8 +347,10 @@ def test_go_enrichment_significant(tmp_path: Path):
     assert rec.n_groups_significant == 1
 
 
-def test_go_missing_file_skips(tmp_path: Path):
+def test_go_missing_file_skips(monkeypatch, tmp_path: Path):
     from src.validation import GOEnrichmentValidator
+    from src.validation import reference_loader as rl
+    monkeypatch.setattr(rl, "_find_file", lambda *a, **kw: None)
     csr = _block_graph()
     results = {"pagerank": _pagerank_result(list(range(10)), 60)}
     gv = GOEnrichmentValidator(output_dir=tmp_path,

@@ -49,11 +49,32 @@ The loaders match on **gene symbols** (e.g. `TP53`, `MYC`). If your input
 graph uses opaque IDs (Ensembl `ENSP…`, UniProt, integer indices), every
 overlap will be zero and validation will silently report `status=skipped`.
 
+### STRING is auto-remapped
+
 The bundled STRING file (`9606.protein.links.v12.0.txt`) uses Ensembl protein
-IDs, so it must be mapped to gene symbols (via STRING's
-`9606.protein.info.v12.0.txt` `preferred_name` column) **before** the
-`node_index_map` is built, or use the hold-out validator (which is ID-agnostic
-— it works on the graph's own edge structure).
+IDs (`9606.ENSP00000000233`), which won't match any gene-symbol reference on
+their own.
+
+Drop STRING's info file next to it in `data/raw/`:
+
+```
+data/raw/9606.protein.info.v12.0.txt
+```
+
+and `run_validation.py` **auto-loads** it, translates every graph label from
+Ensembl ID → gene symbol (`preferred_name` column) BEFORE running any
+biological / orthogonal / GO validator, and prints a one-line summary:
+
+```
+[validate] STRING id remap: mapped=4,168 unchanged=0 collisions=0
+```
+
+Override with `--string-info-path /path/to/other.info.txt`, or disable with
+`--no-remap`. Filename must contain `protein.info` / `protein_info` /
+`string.info`.
+
+Hold-out validation ignores labels entirely (it uses only edge structure),
+so it works either way.
 
 ---
 

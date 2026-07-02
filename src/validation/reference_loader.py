@@ -88,6 +88,8 @@ _PATTERNS: dict[str, tuple[str, ...]] = {
                    "all_target_polypeptide"),
     # Gene Ontology annotations (GAF 2.x)
     "go":         ("goa_human", "goa", "gene_association", ".gaf"),
+    # STRING protein-info map (Ensembl protein id → gene symbol)
+    "string_info": ("protein.info", "protein_info", "string.info"),
 }
 
 
@@ -545,6 +547,114 @@ _GENE_SET_LOADERS = {
     "essential":   load_deg,
     "drug_target": load_drugbank,
 }
+
+
+# ---------------------------------------------------------------------------
+# STRING protein-id → gene-symbol map + node_index_map remap helper
+# ---------------------------------------------------------------------------
+#
+# The bundled STRING file (``9606.protein.links.v12.0.txt``) uses Ensembl
+# protein ids (``9606.ENSP00000000233``).  Every biological reference
+# (TRRUST / BioGRID / miRTarBase / DisGeNET / DEG / DrugBank / GO) uses
+# HGNC gene symbols (``TP53``).  Without a translation step every overlap
+# is zero and validation silently reports ``status=skipped``.
+#
+# STRING publishes the mapping in ``9606.protein.info.v12.0.txt``:
+#
+#     #string_protein_id  preferred_name  protein_size  annotation
+#     9606.ENSP00000000233  ARF5           180           ADP-ribosylation…
+#
+# ``load_string_id_map`` returns ``{ensembl_id: gene_symbol}``.
+# ``remap_node_index_map`` produces a new ``{gene_symbol: index}`` dict for
+# the downstream validators; labels not present in the map are kept
+# unchanged so partial mappings still work.
+
+def load_string_id_map(path: Optional[Path] = None) -> dict[str, str]:
+    """Load a STRING ``protein.info`` file into ``{protein_id → gene_symbol}``.
+
+    Auto-discovers via the ``string_info`` pattern (``protein.info`` /
+    ``string.info``) when ``path`` is not provided.  Returns ``{}`` when the
+    file is missing or unreadable — never raises.
+    """
+    p = _find_file("string_info", path)
+    if p is None:
+        _LOG.info(
+            "STRING protein-info file not found — Ensembl→symbol mapping "
+            "unavailable; validators will only match on the raw labels.",
+        )
+        return {}
+
+    out: dict[str, str] = {}
+    try:
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if not line or line.startswith("#"):
+                    continue
+                cols = line.rstrip("\n\r").split("\t")
+                if len(cols) < 2:
+                    continue
+                pid = cols[0].strip()
+                sym = cols[1].strip()
+                if pid and sym:
+                    out[pid] = sym.upper()
+    except Exception as exc:
+        _LOG.warning("Failed to read STRING info %s: %s", p, exc)
+        return {}
+    _LOG.info("STRING id map loaded: %d entries from %s", len(out), p)
+    return out
+
+
+def remap_node_index_map(
+    node_index_map: dict[str, int],
+    id_map: dict[str, str],
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Translate ``node_index_map`` labels through an id → symbol dict.
+
+    Parameters
+    ----------
+    node_index_map : dict[str, int]
+        Original ``{label: node_index}`` produced by ``graphdata_to_csr``.
+    id_map : dict[str, str]
+        Mapping from raw label (e.g. ``9606.ENSP00000000233``) to gene
+        symbol (e.g. ``ARF5``).
+
+    Returns
+    -------
+    (remapped, stats)
+        ``remapped`` is a new ``{symbol_or_original_label: index}`` dict.
+        Labels not present in ``id_map`` are kept unchanged so the returned
+        map still covers every original node.  When two source labels
+        translate to the same symbol only the first wins (isoform
+        collisions); the loser stays under its original label so its index
+        can still be reached.  ``stats`` reports ``{"mapped", "unchanged",
+        "collisions"}`` counts for logging / driver output.
+    """
+    if not id_map:
+        return dict(node_index_map), {"mapped": 0, "unchanged": len(node_index_map),
+                                       "collisions": 0}
+
+    remapped: dict[str, int] = {}
+    mapped = unchanged = collisions = 0
+    for label, idx in node_index_map.items():
+        new_label = id_map.get(label)
+        if new_label is None:
+            new_label = label
+            unchanged += 1
+        else:
+            mapped += 1
+        if new_label in remapped:
+            collisions += 1
+            # keep the loser reachable under its original label
+            if label not in remapped:
+                remapped[label] = idx
+        else:
+            remapped[new_label] = idx
+    _LOG.info(
+        "remap_node_index_map: mapped=%d unchanged=%d collisions=%d",
+        mapped, unchanged, collisions,
+    )
+    return remapped, {"mapped": mapped, "unchanged": unchanged,
+                      "collisions": collisions}
 
 
 def load_gene_set(kind: str,

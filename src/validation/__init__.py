@@ -56,6 +56,8 @@ from src.validation.reference_loader import (
     load_deg,
     load_drugbank,
     load_go_annotations,
+    load_string_id_map,
+    remap_node_index_map,
 )
 from src.validation.overlap import (
     compute_overlap,
@@ -115,6 +117,8 @@ __all__ = [
     "load_deg",
     "load_drugbank",
     "load_go_annotations",
+    "load_string_id_map",
+    "remap_node_index_map",
     "compute_overlap",
     "OverlapResult",
     "fisher_exact_p",
