@@ -537,28 +537,36 @@ def _estimate_mcl_peak_ram_bytes(
     expansion: int = 2,
     dtype_bytes: int = 4,
     index_bytes: int = 4,
-    safety_factor: float = 3.0,
+    safety_factor: float = 5.0,
 ) -> int:
     """Estimate the peak RAM footprint of a scipy MCL iteration.
 
     Peak is dominated by ``M @ M`` (expansion) which materialises an
-    intermediate whose nnz ~ ``nnz(M) * avg_row_len``.  Each CSR entry
-    costs ``index_bytes + dtype_bytes`` (indices + data) plus the
-    ``indptr`` overhead (small).  ``safety_factor`` accounts for scipy's
-    transient buffers during ``M @ M`` and the ``M_old`` snapshot kept
-    for the Frobenius diff.
+    intermediate whose nnz ~ ``nnz(M) * avg_row_len``.  Sizing is done
+    against the POST-SYMMETRIZATION matrix that actually enters the
+    iteration loop (``2 * nnz + n`` — the symmetrize adds the transpose,
+    self-loops add n more) because raw-input sizing under-predicts by
+    ~2× for typical biological networks.
+
+    ``safety_factor`` (default 5.0) covers:
+      - scipy's transient buffers during CSR ``@`` (~2× output).
+      - the ``M_old = M.copy()`` snapshot kept for the Frobenius diff.
+      - M growing denser across iterations before the prune stabilises.
+      - allocator fragmentation on repeated iteration allocations.
 
     Returns an integer number of bytes; callers should compare against
     a fraction of available RAM.  Returns 0 for an empty graph.
     """
-    n   = int(graph_csr.shape[0])
-    nnz = int(graph_csr.nnz)
-    if n == 0 or nnz == 0:
+    n       = int(graph_csr.shape[0])
+    raw_nnz = int(graph_csr.nnz)
+    if n == 0 or raw_nnz == 0:
         return 0
-    avg_row = max(1.0, float(nnz) / max(1, n))
-    # Expansion output nnz estimate (upper-bounded by n*n).
-    est_out_nnz = min(int(nnz * avg_row * safety_factor), n * n)
-    # Bytes per CSR entry (indices + data); indptr is O(n), small.
+    # After symmetrize + self-loops M has ~2 * raw_nnz + n entries.
+    effective_nnz = 2 * raw_nnz + n
+    avg_row = max(1.0, float(effective_nnz) / max(1, n))
+    est_out_nnz = min(
+        int(effective_nnz * avg_row * safety_factor), n * n
+    )
     entry_bytes = dtype_bytes + index_bytes
     peak = est_out_nnz * entry_bytes
     # Chained expansion (e > 2) squares repeatedly; each square inflates
@@ -613,3 +621,38 @@ def _check_memory_or_raise(
     if extra_hint:
         msg = f"{msg} {extra_hint}"
     raise MemoryError(msg)
+
+
+# Below this floor we assume the OS is about to start killing processes.
+# 500 MB free is not a lot of headroom for scipy transient buffers.
+_RUNTIME_RAM_FLOOR_BYTES: int = 500 * 1024 * 1024
+
+
+def _check_runtime_ram_or_raise(
+    *,
+    backend: str,
+    iteration: int,
+    current_nnz: int,
+    floor_bytes: int = _RUNTIME_RAM_FLOOR_BYTES,
+) -> None:
+    """Per-iteration RAM watchdog for CPU MCL.
+
+    Called at the top of each MCL iteration BEFORE the next ``M @ M``.
+    If free RAM has collapsed to less than ``floor_bytes``, raises
+    ``MemoryError`` so the loop bails out cleanly instead of letting the
+    next allocation trigger the OS OOM killer (which would kill the
+    Python process — and any IDE hosting it — without giving us a chance
+    to raise).
+
+    ``available == 0`` (probe failed) disables the check; the pre-run
+    guard is the only safety net in that case.
+    """
+    available = _available_ram_bytes()
+    if available <= 0 or available >= floor_bytes:
+        return
+    raise MemoryError(
+        f"MCL {backend}: aborting at iteration {iteration} "
+        f"(M.nnz={current_nnz}, only {available/(1024*1024):.0f} MB "
+        f"free — below {floor_bytes/(1024*1024):.0f} MB floor). "
+        f"Use mode=gpu (cuda_optimized) which scales to larger graphs."
+    )

@@ -36,9 +36,15 @@ import scipy.sparse as sp
 from src.algorithms.common.helpers import (
     _available_ram_bytes,
     _check_memory_or_raise,
+    _check_runtime_ram_or_raise,
     _estimate_mcl_peak_ram_bytes,
     _extract_clusters,
 )
+
+# GraphBLAS FP32 is roughly 2× more memory-efficient than the float64
+# CPU path, but scaling still tapers past a couple of million edges on
+# typical workstations.  This hard cap keeps benchmarks predictable.
+_CPU_MULTI_NNZ_HARD_CAP: int = 2_000_000
 from src.algorithms.cpu.multi_threaded._graphblas_utils import (
     _configure_threads,
     _from_scipy,
@@ -100,10 +106,16 @@ def mcl_cpu_multi(
             "note": "graphblas SuiteSparse (empty graph)",
         }
 
-    # Memory guard: SuiteSparse SpGEMM is more memory-efficient than
-    # scipy, but M@M still requires the full output matrix in RAM.  Use
-    # float32 sizing (GraphBLAS backend runs FP32).  Raises early so the
-    # runner surfaces a clean failure.
+    # ---- Layer 1: hard nnz cap ----
+    if int(graph_csr.nnz) > _CPU_MULTI_NNZ_HARD_CAP:
+        raise MemoryError(
+            f"MCL cpu_multi: refusing to run — input has "
+            f"{graph_csr.nnz} edges, above the {_CPU_MULTI_NNZ_HARD_CAP} "
+            f"hard cap for the GraphBLAS CPU path.  "
+            f"Use mode=gpu (cuda_optimized) which scales to larger graphs."
+        )
+
+    # ---- Layer 2: RAM-vs-estimate check with post-symmetrize sizing ----
     _check_memory_or_raise(
         _estimate_mcl_peak_ram_bytes(
             graph_csr, expansion=e, dtype_bytes=4, index_bytes=4,
@@ -135,6 +147,13 @@ def mcl_cpu_multi(
         # Save scipy snapshot for cheap Frobenius diff (also serves as
         # the previous-iter matrix should we early-exit).
         M_old_sp = _to_scipy(M_gb, "csr")
+
+        # ---- Layer 3: per-iteration runtime watchdog ----
+        _check_runtime_ram_or_raise(
+            backend="cpu_multi",
+            iteration=iteration,
+            current_nnz=int(M_old_sp.nnz),
+        )
 
         # ---- Expansion: M = M^e via SuiteSparse SpGEMM ------------------
         try:

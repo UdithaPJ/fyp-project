@@ -32,6 +32,7 @@ from src.algorithms.common.helpers import (
     _add_self_loops,
     _available_ram_bytes,
     _check_memory_or_raise,
+    _check_runtime_ram_or_raise,
     _col_normalize,
     _estimate_mcl_peak_ram_bytes,
     _expand,
@@ -39,6 +40,12 @@ from src.algorithms.common.helpers import (
     _frobenius_diff,
     _prune,
 )
+
+# Hard cap: cpu_single runs float64 (12 B/entry).  Anything above this
+# will OOM even the pre-run estimator's most conservative assumption on
+# a typical 8–16 GB workstation.  Refusing at the boundary keeps the
+# benchmark from being killed by the OS OOM killer mid-run.
+_CPU_SINGLE_NNZ_HARD_CAP: int = 500_000
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -121,10 +128,17 @@ def mcl_cpu_single(graph_csr: sp.csr_matrix, params: dict) -> dict:
     cap = int(p["max_iter"])
     tol = float(p["convergence_tol"])
 
-    # Memory guard: refuse to run when the projected M@M peak would blow
-    # RAM.  Uses float64 sizing (8 B data + 4 B index per entry) because
-    # _add_self_loops upcasts to float64 below.  Raises MemoryError early
-    # so the runner surfaces a clean failure instead of crashing.
+    # ---- Layer 1: hard nnz cap (float64 path is infeasible above this) ----
+    if int(graph_csr.nnz) > _CPU_SINGLE_NNZ_HARD_CAP:
+        raise MemoryError(
+            f"MCL cpu_single: refusing to run — input has "
+            f"{graph_csr.nnz} edges, above the {_CPU_SINGLE_NNZ_HARD_CAP} "
+            f"hard cap for the float64 CPU path.  "
+            f"Use mode=gpu (cuda_optimized) which scales to larger graphs, "
+            f"or use cpu_multi (GraphBLAS FP32) for a smaller-memory CPU run."
+        )
+
+    # ---- Layer 2: RAM-vs-estimate check with post-symmetrize sizing ----
     _check_memory_or_raise(
         _estimate_mcl_peak_ram_bytes(
             graph_csr, expansion=e, dtype_bytes=8, index_bytes=4,
@@ -145,6 +159,16 @@ def mcl_cpu_single(graph_csr: sp.csr_matrix, params: dict) -> dict:
 
     converged = False
     for iteration in range(1, cap + 1):
+        # ---- Layer 3: per-iteration runtime watchdog ----
+        # Bail out before the next M @ M when free RAM has collapsed —
+        # letting the next allocation run risks the OS OOM killer taking
+        # the process (and the IDE hosting it) down.
+        _check_runtime_ram_or_raise(
+            backend="cpu_single",
+            iteration=iteration,
+            current_nnz=int(M.nnz),
+        )
+
         M_old = M.copy()
         try:
             M = _expand(M, e)

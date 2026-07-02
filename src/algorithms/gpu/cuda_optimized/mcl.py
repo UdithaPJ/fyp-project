@@ -1660,7 +1660,14 @@ def _frobenius_diff_gpu(
 # ---------------------------------------------------------------------------
 
 def _extract_clusters(M: sp.csr_matrix) -> np.ndarray:
-    """Extract cluster labels from a converged MCL matrix."""
+    """Extract cluster labels from a converged MCL matrix.
+
+    Attractor method: each node j is assigned to the attractor row i
+    (i.e. `M[i,i] > 0`) whose `M[i, j]` value is largest.  Iterates the
+    CSC representation column-by-column so we never densify — the old
+    ``todense()`` path allocated `n_attractors × n` floats which OOM'd
+    on graphs with >10k attractors.
+    """
     n = M.shape[0]
     M_csr = M.tocsr()
     diag = np.asarray(M_csr.diagonal()).flatten()
@@ -1672,12 +1679,38 @@ def _extract_clusters(M: sp.csr_matrix) -> np.ndarray:
         )
         return labels.astype(np.int32)
 
-    M_att_rows = M_csr[attractors, :].tocsc()
-    dense_att = np.asarray(M_att_rows.todense())
-    if dense_att.size == 0:
-        return np.zeros(n, dtype=np.int32)
-    best_local = np.argmax(dense_att, axis=0).flatten()
-    return attractors[best_local].astype(np.int32)
+    # Sparse per-column argmax over the attractor rows only.
+    # `attr_rank[i] = k` iff row i is the k-th attractor; other rows -1.
+    attr_rank = np.full(n, -1, dtype=np.int64)
+    attr_rank[attractors] = np.arange(attractors.size, dtype=np.int64)
+
+    M_csc  = M_csr.tocsc()
+    indptr = M_csc.indptr
+    idx    = M_csc.indices
+    data   = M_csc.data
+
+    labels = np.empty(n, dtype=np.int32)
+    for j in range(n):
+        s, e = int(indptr[j]), int(indptr[j + 1])
+        if e == s:
+            # No incoming flow — fall back to nearest attractor by index.
+            labels[j] = int(attractors[0])
+            continue
+        col_rows = idx[s:e]
+        col_vals = data[s:e]
+        # Restrict to entries whose row is an attractor.
+        rank = attr_rank[col_rows]
+        keep = rank >= 0
+        if keep.any():
+            kept_vals = col_vals[keep]
+            kept_rows = col_rows[keep]
+            labels[j] = int(kept_rows[int(np.argmax(kept_vals))])
+        else:
+            # No attractor row hit this column; assign the overall
+            # column-maximum row and rely on the cluster renumbering
+            # to fold it in.
+            labels[j] = int(col_rows[int(np.argmax(col_vals))])
+    return labels
 
 
 def _renumber_clusters(labels: np.ndarray) -> np.ndarray:
