@@ -47,8 +47,13 @@ import scipy.sparse as sp
 DEFAULT_SIZES = [100_000, 1_000_000]
 GRAPH_TYPES = ["barabasi_albert", "erdos_renyi", "watts_strogatz"]
 NETWORK_TYPE = "ppi"
+# NB: include use_chunking=True to REPLICATE what the runner's apply_config
+# injects into params before pagerank_gpu sees them.  Calling pagerank_gpu
+# directly with clean params previously hid a bug where this injected flag
+# forced the (catastrophic) re-streaming chunked path on graphs that fit.
+# With use_chunking=True here, chunked MUST stay False for fitting graphs.
 PARAMS = {"damping": 0.85, "max_iter": 100, "tolerance": 1e-6,
-          "network_type": NETWORK_TYPE}
+          "network_type": NETWORK_TYPE, "use_chunking": True}
 
 
 def _gen_graph(graph_type: str, n: int) -> sp.csr_matrix:

@@ -1169,9 +1169,6 @@ def pagerank_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
 
     try:
         # ---- Parameter merging ----------------------------------------
-        # Capture whether the USER explicitly forced chunking, before
-        # apply_config can inject use_chunking=True from a coarse estimate.
-        user_forced_chunking = bool((params or {}).get("use_chunking", False))
         p = _merge_params(params)
         if _GPU_CONFIG_AVAILABLE:
             p = apply_config("pagerank", graph_csr, p) or p
@@ -1360,25 +1357,28 @@ def pagerank_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
         _log_vram_breakdown(breakdown, free_mb)
         prof.end()
 
-        auto_chunk = est_bytes > chunk_vram_pct * free_bytes
-
+        # Chunk ONLY when the graph genuinely does not fit in VRAM.
+        #
         # The chunked path re-streams the ENTIRE CSR host→device every
-        # iteration (see _transfer_chunk_async inside the iteration loop).
-        # That is only worthwhile when the graph genuinely does not fit in
-        # VRAM; for a graph that fits it is catastrophic (e.g. 100x re-upload
-        # of the full CSR).  apply_config's MemoryManager can inject
-        # use_chunking=True from a coarse estimate even when the working set
-        # fits comfortably, so pagerank's OWN precise estimate (auto_chunk) is
-        # authoritative.  A user who *explicitly* passes use_chunking=True can
-        # still force the path (e.g. to trade speed for lower peak memory).
-        needs_chunk = auto_chunk or user_forced_chunking
-        if use_chunking and not user_forced_chunking and not auto_chunk:
+        # iteration (see _transfer_chunk_async inside the iteration loop) —
+        # catastrophic (e.g. 100x re-upload of the full CSR) for a graph that
+        # actually fits.  pagerank's own precise estimate (est_bytes) is the
+        # sole authority here.
+        #
+        # We deliberately do NOT honour a use_chunking=True flag from params:
+        # apply_config's MemoryManager injects it from a coarse estimate, and
+        # by the time this function runs (the runner calls apply_config first)
+        # that injected flag is indistinguishable from a user-supplied one.
+        # Since re-streaming a fitting graph is never beneficial, the flag has
+        # no legitimate effect — auto_chunk covers every genuine case.
+        needs_chunk = auto_chunk
+        if use_chunking and not auto_chunk:
             logging.info(
-                "[PageRank] apply_config use_chunking ignored — working set "
-                "%.1f MB fits in %.1f MB free (chunking would re-stream the "
-                "CSR every iteration).", est_bytes / 1e6, free_mb,
+                "[PageRank] use_chunking ignored — working set %.1f MB fits in "
+                "%.1f MB free (chunking would re-stream the CSR every "
+                "iteration).", est_bytes / 1e6, free_mb,
             )
-        if auto_chunk and not user_forced_chunking:
+        if auto_chunk:
             logging.info(
                 "[PageRank] Auto-chunking: %.1f MB > %.0f%% of %.1f MB free.",
                 est_bytes / 1e6, chunk_vram_pct * 100, free_mb,
