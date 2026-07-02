@@ -80,6 +80,14 @@ _PATTERNS: dict[str, tuple[str, ...]] = {
     "trrust":     ("trrust", "trrust_rawdata", "trrust.human"),
     "biogrid":    ("biogrid", "biogrid-all", "biogrid_human"),
     "mirtarbase": ("mirtarbase", "mirtar", "hsa_mti"),
+    # Orthogonal gene-set references (evidence unrelated to network topology)
+    "disgenet":   ("disgenet", "gene_disease", "curated_gene_disease",
+                   "all_gene_disease"),
+    "deg":        ("deg", "ogee", "essential"),
+    "drugbank":   ("drugbank", "drug_target", "drug-target",
+                   "all_target_polypeptide"),
+    # Gene Ontology annotations (GAF 2.x)
+    "go":         ("goa_human", "goa", "gene_association", ".gaf"),
 }
 
 
@@ -348,6 +356,179 @@ def load_mirtarbase(path: Optional[Path] = None) -> Optional[ReferenceSet]:
     return rs if rs.n_records > 0 else None
 
 
+# ===========================================================================
+# Orthogonal gene-set references (disease / essential / drug-target / GO)
+# ===========================================================================
+#
+# Unlike TRRUST / BioGRID / miRTarBase (which are *interaction* databases and
+# therefore share evidence type with the input network), these references
+# carry evidence that is INDEPENDENT of network topology:
+#
+#     disease genes   – clinical / genetic association  (DisGeNET)
+#     essential genes – experimental gene-knockout       (DEG / OGEE)
+#     drug targets    – pharmacological evidence          (DrugBank)
+#     GO terms        – functional annotation             (Gene Ontology)
+#
+# A gene-set reference is a flat ``set[str]`` of gene symbols — no edges,
+# no source/target split — because "importance" here is defined outside the
+# graph.  GO additionally carries a gene → {term} mapping for enrichment.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class GeneSetReference:
+    """A flat gene-set reference, normalised to upper-case symbols.
+
+    ``genes`` is the membership set (e.g. all disease-associated genes).
+    ``gene_terms`` / ``term_genes`` are only populated for GO annotations
+    and hold the gene ↔ GO-term bipartite mapping used by GO enrichment.
+    """
+
+    name:        str
+    kind:        str                          # "disease"|"essential"|"drug_target"|"go"
+    genes:       set[str] = field(default_factory=set)
+    gene_terms:  dict[str, set[str]] = field(default_factory=dict)
+    term_genes:  dict[str, set[str]] = field(default_factory=dict)
+    n_records:   int = 0
+    source_path: Optional[Path] = None
+
+    def is_empty(self) -> bool:
+        return not self.genes
+
+
+# Candidate gene-symbol column names per gene-set kind.  First present
+# column wins; positional fallback uses the first alphabetic column.
+_GENE_SET_COLUMNS: dict[str, tuple[str, ...]] = {
+    "disgenet": ("geneSymbol", "gene_symbol", "genesymbol", "symbol",
+                 "gene", "gene_name"),
+    "deg":      ("gene_symbol", "symbol", "gene", "gene_name", "locus",
+                 "genename"),
+    "drugbank": ("Gene Name", "gene_name", "gene", "genename", "symbol",
+                 "HGNC", "hgnc_symbol"),
+}
+
+
+def _first_alpha_value(row: dict) -> Optional[str]:
+    """First value that contains a letter (a plausible gene symbol)."""
+    for v in row.values():
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s and any(c.isalpha() for c in s):
+            return s
+    return None
+
+
+def _load_gene_set(kind: str, name: str,
+                   path: Optional[Path] = None) -> Optional[GeneSetReference]:
+    """Generic loader for a single-column-ish gene-set file.
+
+    Extracts one gene symbol per row using the candidate columns for
+    ``kind`` (positional fallback: first alphabetic cell).  Never raises;
+    returns ``None`` when the file is missing or yields no symbols.
+    """
+    p = _find_file(kind, path)
+    if p is None:
+        _LOG.info("%s reference not found — orthogonal %s validation skipped.",
+                  name, kind)
+        return None
+
+    rs = GeneSetReference(name=name, kind={
+        "disgenet": "disease",
+        "deg":      "essential",
+        "drugbank": "drug_target",
+    }.get(kind, kind), source_path=p)
+
+    candidates = _GENE_SET_COLUMNS.get(kind, ("gene", "symbol"))
+    for row in _iter_table(p):
+        if not row:
+            continue
+        gene = None
+        for col in candidates:
+            if col in row and row[col] is not None and str(row[col]).strip():
+                gene = str(row[col]).strip()
+                break
+        if gene is None:
+            gene = _first_alpha_value(row)
+        if not gene:
+            continue
+        g = _norm(gene)
+        # Skip obvious header echoes
+        if g in {c.upper() for c in candidates} or g in {"GENE", "SYMBOL"}:
+            continue
+        if g:
+            rs.genes.add(g)
+            rs.n_records += 1
+
+    _LOG.info("%s loaded: %d rows, %d unique genes",
+              name, rs.n_records, len(rs.genes))
+    return rs if rs.genes else None
+
+
+def load_disgenet(path: Optional[Path] = None) -> Optional[GeneSetReference]:
+    """Load DisGeNET disease-associated gene symbols."""
+    return _load_gene_set("disgenet", "DisGeNET", path)
+
+
+def load_deg(path: Optional[Path] = None) -> Optional[GeneSetReference]:
+    """Load essential-gene symbols (DEG / OGEE)."""
+    return _load_gene_set("deg", "DEG/OGEE", path)
+
+
+def load_drugbank(path: Optional[Path] = None) -> Optional[GeneSetReference]:
+    """Load DrugBank drug-target gene symbols."""
+    return _load_gene_set("drugbank", "DrugBank", path)
+
+
+def load_go_annotations(
+    path: Optional[Path] = None,
+    aspects: Optional[set[str]] = None,
+) -> Optional[GeneSetReference]:
+    """Load a GO annotation file (GAF 2.x) into a gene ↔ term mapping.
+
+    GAF columns (1-indexed, tab-separated):
+        3  DB Object Symbol   → gene symbol
+        5  GO ID              → term (e.g. GO:0008150)
+        9  Aspect             → P (process) | F (function) | C (component)
+
+    ``aspects`` filters by the single-letter aspect code; ``None`` keeps
+    all three.  Comment lines (starting with ``!``) are skipped.  Never
+    raises; returns ``None`` when the file is missing or empty.
+    """
+    p = _find_file("go", path)
+    if p is None:
+        _LOG.info("GO annotation file not found — GO enrichment skipped.")
+        return None
+
+    rs = GeneSetReference(name="GeneOntology", kind="go", source_path=p)
+    try:
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if not line or line.startswith("!"):
+                    continue
+                cols = line.rstrip("\n\r").split("\t")
+                if len(cols) < 9:
+                    continue
+                symbol = _norm(cols[2])
+                term   = cols[4].strip()
+                aspect = cols[8].strip().upper() if len(cols) > 8 else ""
+                if not symbol or not term:
+                    continue
+                if aspects and aspect not in aspects:
+                    continue
+                rs.genes.add(symbol)
+                rs.gene_terms.setdefault(symbol, set()).add(term)
+                rs.term_genes.setdefault(term, set()).add(symbol)
+                rs.n_records += 1
+    except Exception as exc:
+        _LOG.warning("Failed to read GO annotations %s: %s", p, exc)
+        return None
+
+    _LOG.info("GO loaded: %d annotations, %d genes, %d terms",
+              rs.n_records, len(rs.genes), len(rs.term_genes))
+    return rs if rs.genes else None
+
+
 # ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
@@ -357,6 +538,31 @@ _LOADERS = {
     "ppi":   load_biogrid,
     "mirna": load_mirtarbase,
 }
+
+# Orthogonal gene-set loaders, keyed by evidence kind (network-type agnostic).
+_GENE_SET_LOADERS = {
+    "disease":     load_disgenet,
+    "essential":   load_deg,
+    "drug_target": load_drugbank,
+}
+
+
+def load_gene_set(kind: str,
+                  path: Optional[Path] = None) -> Optional[GeneSetReference]:
+    """Load an orthogonal gene-set reference by evidence kind.
+
+    ``kind`` ∈ {"disease", "essential", "drug_target"}.  Returns ``None``
+    for unknown kinds or missing files (never raises).
+    """
+    fn = _GENE_SET_LOADERS.get(kind)
+    if fn is None:
+        _LOG.warning("No gene-set loader for kind=%r", kind)
+        return None
+    try:
+        return fn(path)
+    except Exception as exc:
+        _LOG.warning("Gene-set loader for %s raised %s — skipping.", kind, exc)
+        return None
 
 
 def load_reference(network_type: str,

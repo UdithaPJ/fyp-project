@@ -47,6 +47,9 @@ from src.validation import (                                    # noqa: E402
     ALGORITHMS,
     BiologicalValidator,
     CrossImplementationValidator,
+    OrthogonalValidator,
+    HoldoutValidator,
+    GOEnrichmentValidator,
 )
 
 
@@ -125,6 +128,34 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--mirtarbase-path", type=Path, default=None,
         help="Override path to miRTarBase reference file.",
+    )
+    # ── Independent (circularity-immune) validation methods ──
+    p.add_argument(
+        "--orthogonal", action="store_true",
+        help="Run OrthogonalValidator against disease/essential/drug gene "
+             "sets (DisGeNET / DEG-OGEE / DrugBank).",
+    )
+    p.add_argument(
+        "--holdout", action="store_true",
+        help="Run HoldoutValidator (edge hold-out link prediction / "
+             "community recovery).  Needs no external files.",
+    )
+    p.add_argument(
+        "--go", action="store_true",
+        help="Run GOEnrichmentValidator against a local GO annotation "
+             "(GAF) file.",
+    )
+    p.add_argument("--disgenet-path", type=Path, default=None)
+    p.add_argument("--deg-path",      type=Path, default=None)
+    p.add_argument("--drugbank-path", type=Path, default=None)
+    p.add_argument("--go-path",       type=Path, default=None)
+    p.add_argument(
+        "--go-aspects", type=str, default=None,
+        help="Comma-separated GO aspects to keep: P,F,C (default: all).",
+    )
+    p.add_argument(
+        "--holdout-fraction", type=float, default=0.2,
+        help="Fraction of edges held out for the hold-out validator.",
     )
     p.add_argument("--verbose", action="store_true")
     return p.parse_args()
@@ -298,6 +329,98 @@ def main() -> None:
                      "computational_and_biological_validation.csv"
         _merge_bio_into_comp(comp_csv, bio_csv, merged_csv)
         print(f"MERGE: {merged_csv}")
+
+    # Results shared by the orthogonal / GO validators (same shape as bio).
+    ranking_cluster = [a for a in algos
+                       if a in ("pagerank", "hits", "rwr", "louvain", "mcl")]
+
+    # ── 3. Orthogonal (topology-independent) validation ──
+    if args.orthogonal:
+        ref_paths = {}
+        if args.disgenet_path: ref_paths["disease"]     = args.disgenet_path
+        if args.deg_path:      ref_paths["essential"]   = args.deg_path
+        if args.drugbank_path: ref_paths["drug_target"] = args.drugbank_path
+
+        ortho = OrthogonalValidator(
+            output_dir=args.output_dir,
+            reference_paths=ref_paths or None,
+        )
+        ortho.add_dataset(
+            name=ds_name, graph_csr=graph_csr,
+            network_type=args.network_type, node_index_map=node_index_map,
+            results=_select_results_for_bio(
+                validator, ds_name, args.bio_reference_mode),
+        )
+        ortho.run(algorithms=tuple(ranking_cluster))
+        ortho_csv   = ortho.write_csv()
+        ortho_plots = ortho.write_plots()
+        print()
+        print("=" * 70)
+        print("ORTHOGONAL VALIDATION (disease / essential / drug-target)")
+        print(f"CSV  : {ortho_csv}")
+        for k, v in ortho_plots.items():
+            print(f"PLOT : {k:<22} {v}")
+        ok = sum(1 for r in ortho.records if r.status == "ok")
+        sk = sum(1 for r in ortho.records if r.status == "skipped")
+        print(f"ORTH : {ok} ok | {sk} skipped")
+
+    # ── 4. Hold-out (self-contained) validation ──
+    if args.holdout:
+        hold = HoldoutValidator(
+            output_dir=args.output_dir,
+            test_fraction=args.holdout_fraction,
+        )
+        hold.add_dataset(
+            name=ds_name, graph_csr=graph_csr,
+            network_type=args.network_type,
+            params_override=params_override,
+        )
+        hold.run(algorithms=tuple(ranking_cluster))
+        hold_csv   = hold.write_csv()
+        hold_plots = hold.write_plots()
+        print()
+        print("=" * 70)
+        print(f"HOLD-OUT VALIDATION (test_fraction={args.holdout_fraction})")
+        print(f"CSV  : {hold_csv}")
+        for k, v in hold_plots.items():
+            print(f"PLOT : {k:<22} {v}")
+        for r in hold.records:
+            if r.status == "ok":
+                metric = (f"auroc={r.auroc:.3f}"
+                          if r.auroc == r.auroc else f"lift={r.lift:.3f}")
+                print(f"       {r.algorithm:<9} {metric}")
+
+    # ── 5. GO term enrichment ──
+    if args.go:
+        aspects = None
+        if args.go_aspects:
+            aspects = {a.strip().upper() for a in args.go_aspects.split(",")
+                       if a.strip()}
+        go = GOEnrichmentValidator(
+            output_dir=args.output_dir,
+            reference_path=args.go_path,
+            aspects=aspects,
+        )
+        go.add_dataset(
+            name=ds_name, graph_csr=graph_csr,
+            network_type=args.network_type, node_index_map=node_index_map,
+            results=_select_results_for_bio(
+                validator, ds_name, args.bio_reference_mode),
+        )
+        go.run(algorithms=tuple(ranking_cluster))
+        go_csv   = go.write_csv()
+        go_plots = go.write_plots()
+        print()
+        print("=" * 70)
+        print("GO TERM ENRICHMENT")
+        print(f"CSV  : {go_csv}")
+        for k, v in go_plots.items():
+            print(f"PLOT : {k:<22} {v}")
+        for r in go.records:
+            if r.status == "ok":
+                print(f"       {r.algorithm:<9} best={r.best_term} "
+                      f"p={r.best_term_p:.2e} "
+                      f"sig={r.n_groups_significant}/{r.n_groups_tested}")
 
 
 if __name__ == "__main__":

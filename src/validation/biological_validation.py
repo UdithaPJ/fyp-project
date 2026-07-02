@@ -43,13 +43,26 @@ Outputs
         enrichment_heatmap.png    – precision/recall/jaccard heatmap
         community_validation.png  – NMI / ARI per (algorithm, dataset)
 
+Circularity guard
+-----------------
+These three references are *interaction* databases, so validating a graph
+that was itself built from one of them is circular.  Each record now carries
+a ``circularity_risk`` field = the fraction of graph nodes already present in
+the reference; when it exceeds 0.90 a warning is logged and appended to the
+record ``note``.  For truly independent evidence use the sibling validators:
+
+    * :mod:`src.validation.orthogonal_validation` — DisGeNET / DEG / DrugBank
+    * :mod:`src.validation.holdout_validation`    — edge hold-out (no files)
+    * :mod:`src.validation.go_enrichment`         — Gene Ontology terms
+
 Rules
 -----
 * NEVER raises — all failures are recorded with ``status='error'`` and
   ``note=<error string>``.
 * Skips gracefully when the reference database is not available.
-* Uses ONLY the three project-aligned databases (TRRUST / BioGRID /
-  miRTarBase).  No KEGG, no GO, no external network calls.
+* This module uses ONLY the interaction databases (TRRUST / BioGRID /
+  miRTarBase) and makes no external network calls; GO / disease / drug
+  references live in the sibling validators above.
 """
 
 from __future__ import annotations
@@ -122,6 +135,7 @@ class BioValidationRecord:
     p_value:        float          = float("nan")
     nmi:            float          = float("nan")
     ari:            float          = float("nan")
+    circularity_risk: float        = float("nan")  # frac graph nodes in ref
     note:           str            = ""
     status:         str            = "ok"   # ok | skipped | error
 
@@ -234,6 +248,28 @@ def _extract_communities(
     return out
 
 
+_CIRCULARITY_THRESHOLD = 0.90   # >90% of graph nodes in ref → likely circular
+
+
+def _circularity_fraction(node_index_map: dict,
+                          ref: ReferenceSet) -> float:
+    """Fraction of graph node labels that also appear in the reference.
+
+    When this is near 1.0 the input graph and the reference almost certainly
+    derive from the SAME database, so the overlap p-value is circular (the
+    algorithm is being scored against the very data it was built from).
+    Returns NaN when the fraction cannot be computed.
+    """
+    if not node_index_map or ref is None or ref.is_empty():
+        return float("nan")
+    ref_nodes = ref.all_nodes
+    labels = [str(l).strip().upper() for l in node_index_map]
+    if not labels:
+        return float("nan")
+    in_ref = sum(1 for l in labels if l in ref_nodes)
+    return in_ref / len(labels)
+
+
 def _reference_partition(node_index_map: dict,
                          ref: ReferenceSet) -> Optional[list[int]]:
     """
@@ -343,6 +379,14 @@ class BiologicalValidator:
             ref = self._get_reference(ds.network_type)
             ref_name = _REFERENCE_BY_NETWORK.get(ds.network_type, "?")
             background_size = ds.graph_csr.shape[0]
+            circ = _circularity_fraction(ds.node_index_map, ref)
+            if math.isfinite(circ) and circ >= _CIRCULARITY_THRESHOLD:
+                _LOG.warning(
+                    "CIRCULARITY: %.0f%% of %s nodes are already in %s — "
+                    "overlap p-values against %s are not independent evidence. "
+                    "Prefer orthogonal / hold-out / GO validation.",
+                    100 * circ, ds.name, ref_name, ref_name,
+                )
 
             for algo in algos:
                 if algo not in ds.result_by_algo:
@@ -380,6 +424,12 @@ class BiologicalValidator:
                         note         = str(exc)[:200],
                         status       = "error",
                     )
+                rec.circularity_risk = circ
+                if (math.isfinite(circ) and circ >= _CIRCULARITY_THRESHOLD
+                        and rec.status == "ok"):
+                    warn = (f"CIRCULAR: {circ:.0%} of graph nodes are in "
+                            f"{ref_name} — not independent evidence")
+                    rec.note = f"{rec.note}; {warn}" if rec.note else warn
                 self.records.append(rec)
 
     # ------------------------------------------------------------------
@@ -556,7 +606,7 @@ class BiologicalValidator:
             "algorithm", "dataset", "network_type", "reference",
             "overlap_count", "predicted_size", "reference_size",
             "precision", "recall", "jaccard", "p_value",
-            "nmi", "ari", "note", "status",
+            "nmi", "ari", "circularity_risk", "note", "status",
         ]
         with open(path, "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=fields)
@@ -576,6 +626,7 @@ class BiologicalValidator:
                     "p_value":        _fmt(r.p_value),
                     "nmi":            _fmt(r.nmi),
                     "ari":            _fmt(r.ari),
+                    "circularity_risk": _fmt(r.circularity_risk),
                     "note":           r.note,
                     "status":         r.status,
                 })

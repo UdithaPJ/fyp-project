@@ -50,6 +50,12 @@ from src.validation.reference_loader import (
     load_trrust,
     load_biogrid,
     load_mirtarbase,
+    GeneSetReference,
+    load_gene_set,
+    load_disgenet,
+    load_deg,
+    load_drugbank,
+    load_go_annotations,
 )
 from src.validation.overlap import (
     compute_overlap,
@@ -63,6 +69,20 @@ from src.validation.enrichment import (
 from src.validation.biological_validation import (
     BiologicalValidator,
     BioValidationRecord,
+)
+from src.validation.orthogonal_validation import (
+    OrthogonalValidator,
+    OrthogonalRecord,
+    DEFAULT_KINDS,
+)
+from src.validation.holdout_validation import (
+    HoldoutValidator,
+    HoldoutRecord,
+)
+from src.validation.go_enrichment import (
+    GOEnrichmentValidator,
+    GORecord,
+    GOEnrichmentResult,
 )
 
 __all__ = [
@@ -89,6 +109,12 @@ __all__ = [
     "load_trrust",
     "load_biogrid",
     "load_mirtarbase",
+    "GeneSetReference",
+    "load_gene_set",
+    "load_disgenet",
+    "load_deg",
+    "load_drugbank",
+    "load_go_annotations",
     "compute_overlap",
     "OverlapResult",
     "fisher_exact_p",
@@ -96,4 +122,13 @@ __all__ = [
     "CommunityEnrichment",
     "BiologicalValidator",
     "BioValidationRecord",
+    # orthogonal / hold-out / GO validators
+    "OrthogonalValidator",
+    "OrthogonalRecord",
+    "DEFAULT_KINDS",
+    "HoldoutValidator",
+    "HoldoutRecord",
+    "GOEnrichmentValidator",
+    "GORecord",
+    "GOEnrichmentResult",
 ]
