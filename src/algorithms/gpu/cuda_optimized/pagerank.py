@@ -297,6 +297,54 @@ __global__ void scatter_contributions_csr(
 
 
 // =========================================================================
+// KERNEL: scatter_contributions_csr_low  (thread-per-node)
+//
+// The block-per-node scatter_contributions_csr above dedicates a whole
+// 256-thread block to ONE node and, for low-degree nodes (deg < WARP_SIZE),
+// lets only threadIdx.x == 0 do the work — 0.4% thread utilisation.  On
+// uniform-degree graphs (Erdős–Rényi, Watts–Strogatz; avg degree ~6 → every
+// node is low-degree) that cripples the whole iteration.
+//
+// This kernel assigns ONE THREAD per node, so a 256-thread block scatters
+// 256 different nodes concurrently (100% utilisation).  Each thread walks
+// its node's full (short) neighbour list with direct global atomicAdd.
+// The host routes only low-degree nodes here; medium/high-degree nodes stay
+// on the block-per-node kernel (where the warp/block tiers + SMEM hash pay
+// off).  Grid: ceil(num_nodes / BLOCK_SIZE) blocks.
+// =========================================================================
+__global__ void scatter_contributions_csr_low(
+    const int*   __restrict__ row_ptr,
+    const int*   __restrict__ col_idx,
+    const float* __restrict__ edge_weights,
+    const float* __restrict__ PR_old,
+    float*       __restrict__ PR_new,
+    const float* __restrict__ out_degree,
+    const int*   __restrict__ node_ids,
+    const unsigned char* __restrict__ pull_target_mask,
+    const int                  num_nodes,
+    const float                damping,
+    const int                  n)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_nodes) return;
+
+    const int   u     = node_ids[idx];
+    const float deg_u = out_degree[u];
+    if (deg_u <= 0.0f) return;
+
+    const int   row_start    = row_ptr[u];
+    const int   row_end      = row_ptr[u + 1];
+    const float contribution = damping * PR_old[u] / deg_u;
+
+    for (int j = row_start; j < row_end; ++j) {
+        const int v = col_idx[j];
+        if (pull_target_mask != 0 && pull_target_mask[v]) continue;
+        atomicAdd(&PR_new[v], contribution * edge_weights[j]);
+    }
+}
+
+
+// =========================================================================
 // KERNEL: scatter_contributions_ellpack
 // =========================================================================
 __global__ void scatter_contributions_ellpack(
@@ -503,6 +551,7 @@ def _get_kernels() -> dict[str, Any]:
             "init":          mod.get_function("initialize_pr"),
             "init_dangling": mod.get_function("initialize_pr_with_dangling"),
             "scatter_csr":   mod.get_function("scatter_contributions_csr"),
+            "scatter_csr_low": mod.get_function("scatter_contributions_csr_low"),
             "scatter_ell":   mod.get_function("scatter_contributions_ellpack"),
             "dangling":      mod.get_function("distribute_dangling_mass"),
             "sum_dangling":  mod.get_function("sum_dangling_pr"),
@@ -1274,15 +1323,28 @@ def pagerank_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
             d_buffers.append(ga)
             return ga
 
+        # ---- Split remainder nodes by degree for scatter dispatch ------
+        # Low-degree nodes (deg < WARP_SIZE) go to the thread-per-node
+        # scatter kernel (100% thread utilisation); the rest stay on the
+        # block-per-node kernel whose warp/block tiers + SMEM hash pay off
+        # only for higher-degree rows.  csr_remainder["row_ptr"] is the full
+        # graph indptr, so degree is diff(indptr) indexed by global node id.
+        _rem_ids  = csr_remainder["node_ids"]
+        _full_deg = np.diff(csr_remainder["row_ptr"]).astype(np.int64)
+        _rem_deg  = _full_deg[_rem_ids] if _rem_ids.size > 0 else _rem_ids
+        _lowdeg_mask   = _rem_deg < WARP_SIZE
+        lowdeg_ids     = np.ascontiguousarray(_rem_ids[_lowdeg_mask],  dtype=np.int32)
+        highdeg_ids    = np.ascontiguousarray(_rem_ids[~_lowdeg_mask], dtype=np.int32)
+        num_lowdeg     = int(lowdeg_ids.size)
+        num_highdeg    = int(highdeg_ids.size)
+
         # ---- H2D transfers (not timed) --------------------------------
         prof.begin("h2d_transfer")
         d_csr_row_ptr = _to_gpu(csr_remainder["row_ptr"])
         d_csr_col_idx = _to_gpu(csr_remainder["col_idx"])
         d_csr_values  = _to_gpu(csr_remainder["values"])
-        d_low_ids     = (
-            _to_gpu(csr_remainder["node_ids"])
-            if csr_remainder["num_low"] > 0 else None
-        )
+        d_lowdeg_ids  = _to_gpu(lowdeg_ids)  if num_lowdeg  > 0 else None
+        d_highdeg_ids = _to_gpu(highdeg_ids) if num_highdeg > 0 else None
 
         num_hubs    = ellpack_data["num_hubs"]
         max_row_len = ellpack_data["max_row_len"]
@@ -1339,12 +1401,14 @@ def pagerank_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
         n_block_dim    = (block_size, 1, 1)
         partial_grid   = (n_partial_blocks, 1, 1)
         partial_block  = (BLOCK_SIZE, 1, 1)
-        num_low        = csr_remainder["num_low"]
         n_pull_nodes   = int(pull_ids.size) if pull_enabled else 0
+        # Grid for the thread-per-node low-degree scatter kernel.
+        lowdeg_grid    = (((num_lowdeg + block_size - 1) // block_size), 1, 1)
 
-        k_init_dang = kernels["init_dangling"]
-        k_sc_csr    = kernels["scatter_csr"]
-        k_sc_ell    = kernels["scatter_ell"]
+        k_init_dang  = kernels["init_dangling"]
+        k_sc_csr     = kernels["scatter_csr"]
+        k_sc_csr_low = kernels["scatter_csr_low"]
+        k_sc_ell     = kernels["scatter_ell"]
         k_sum_dang  = kernels["sum_dangling"]
         k_l1        = kernels["l1_conv"]
         k_reduce    = kernels["reduce_scalar"]
@@ -1389,14 +1453,29 @@ def pagerank_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
                 stream=stream_compute,
             )
 
-            if num_low > 0 and d_low_ids is not None:
+            # Low-degree nodes: thread-per-node kernel (one thread per node,
+            # 256 nodes per block) — 100% utilisation on uniform-degree graphs.
+            if num_lowdeg > 0 and d_lowdeg_ids is not None:
+                k_sc_csr_low(
+                    d_csr_row_ptr, d_csr_col_idx, d_csr_values,
+                    d_PR_old, d_PR_new, d_out_degree, d_lowdeg_ids,
+                    d_pull_target_mask, np.int32(num_lowdeg),
+                    np.float32(damping), np.int32(n),
+                    block=(block_size, 1, 1),
+                    grid=lowdeg_grid,
+                    stream=stream_compute,
+                )
+
+            # Higher-degree nodes: block-per-node kernel (warp/block tiers +
+            # SMEM hash) — few nodes, so one block per node is fine here.
+            if num_highdeg > 0 and d_highdeg_ids is not None:
                 k_sc_csr(
                     d_csr_row_ptr, d_csr_col_idx, d_csr_values,
-                    d_PR_old, d_PR_new, d_out_degree, d_low_ids,
-                    d_pull_target_mask, np.int32(num_low),
+                    d_PR_old, d_PR_new, d_out_degree, d_highdeg_ids,
+                    d_pull_target_mask, np.int32(num_highdeg),
                     np.float32(damping), np.int32(n),
                     block=(BLOCK_SIZE, 1, 1),
-                    grid=(num_low, 1, 1),
+                    grid=(num_highdeg, 1, 1),
                     stream=stream_compute,
                 )
 
