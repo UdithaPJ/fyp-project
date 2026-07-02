@@ -153,12 +153,16 @@ class _BioDataset:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _safe_labels(items: Any) -> list[str]:
+def _safe_labels(items: Any,
+                 idx_to_label: Optional[dict[int, str]] = None) -> list[str]:
     """
     Convert a result list (either ``[idx, idx, ...]`` or
     ``[{"index": int, "label": str}, ...]``) into a list of label strings.
 
-    Falls back to ``"node_<idx>"`` when no label is attached.
+    When ``idx_to_label`` is supplied, plain integers and label-less dicts
+    are looked up in it (the reverse of ``node_index_map``); otherwise the
+    fallback is ``"NODE_<idx>"``, which will never match any biological
+    reference.
     """
     out: list[str] = []
     if not items:
@@ -166,13 +170,21 @@ def _safe_labels(items: Any) -> list[str]:
     for it in items:
         if isinstance(it, dict):
             lbl = it.get("label")
+            if lbl is None and "index" in it and idx_to_label is not None:
+                lbl = idx_to_label.get(int(it["index"]))
             if lbl is None and "index" in it:
-                lbl = f"node_{it['index']}"
+                lbl = f"NODE_{it['index']}"
             if lbl is not None:
                 out.append(str(lbl).strip().upper())
         else:
-            # Plain integer index — no label info available
-            out.append(f"NODE_{it}")
+            try:
+                idx = int(it)
+            except (TypeError, ValueError):
+                continue
+            if idx_to_label is not None and idx in idx_to_label:
+                out.append(str(idx_to_label[idx]).strip().upper())
+            else:
+                out.append(f"NODE_{idx}")
     return out
 
 
@@ -186,13 +198,33 @@ def _inner(result: Any) -> dict:
     return result
 
 
-def _extract_predicted(algorithm: str, result: dict) -> list[str]:
-    """Return labels for the predicted set of the given algorithm."""
+def _reverse_index_map(
+    node_index_map: Optional[dict],
+) -> Optional[dict[int, str]]:
+    """Build ``{int_index: label}`` from a ``{label: int_index}`` map."""
+    if not node_index_map:
+        return None
+    return {int(v): str(k) for k, v in node_index_map.items()}
+
+
+def _extract_predicted(
+    algorithm: str,
+    result: dict,
+    node_index_map: Optional[dict] = None,
+) -> list[str]:
+    """Return labels for the predicted set of the given algorithm.
+
+    ``node_index_map`` (``{label: int_index}``) is used to translate plain
+    integer top-node lists into gene-symbol labels — without it, cpu_single
+    / cpu_multi results (whose ``top_nodes`` are ``list[int]``) collapse to
+    synthetic ``NODE_<idx>`` strings that match no biological reference.
+    """
     inner = _inner(result)
+    idx_to_label = _reverse_index_map(node_index_map)
     fields = _PREDICTED_FIELDS.get(algorithm, ())
     for f in fields:
         if f in inner and isinstance(inner[f], list) and inner[f]:
-            return _safe_labels(inner[f])
+            return _safe_labels(inner[f], idx_to_label)
     return []
 
 
@@ -452,7 +484,7 @@ class BiologicalValidator:
             )
 
         # ── Ranking algorithms (pagerank/hits/rwr) ──
-        predicted = _extract_predicted(algo, result)
+        predicted = _extract_predicted(algo, result, ds.node_index_map)
         if not predicted:
             return BioValidationRecord(
                 algorithm    = algo,

@@ -192,6 +192,71 @@ def test_remap_empty_id_map_is_passthrough():
 
 
 # ===========================================================================
+# Regression: cpu_single top_nodes are plain int lists, must still map to
+# real gene symbols via node_index_map (otherwise all overlaps are zero).
+# ===========================================================================
+
+def _pagerank_result_plain_ints(top_indices: list[int], n: int) -> dict:
+    """Mirror the CLAUDE.md ``cpu_single`` schema: top_nodes is list[int]."""
+    return {"result": {"scores": [0.0] * n, "top_nodes": list(top_indices)}}
+
+
+def test_extract_predicted_uses_node_index_map():
+    """Plain-int top_nodes must resolve to real labels via node_index_map."""
+    from src.validation.biological_validation import _extract_predicted
+    nim = {"TP53": 3, "MYC": 7, "EGFR": 12}
+    result = {"result": {"scores": [0.0] * 20, "top_nodes": [3, 7, 12]}}
+    assert _extract_predicted("pagerank", result, nim) == ["TP53", "MYC", "EGFR"]
+
+
+def test_extract_predicted_without_map_synthesises_labels():
+    """Without a map, plain ints collapse to synthetic NODE_<i> tokens."""
+    from src.validation.biological_validation import _extract_predicted
+    result = {"result": {"scores": [0.0] * 20, "top_nodes": [3, 7]}}
+    got = _extract_predicted("pagerank", result, None)
+    assert got == ["NODE_3", "NODE_7"]
+
+
+def test_orthogonal_ranking_with_plain_int_top_nodes(tmp_path: Path):
+    """Regression: cpu_single-style result was previously producing zero
+    overlap because ``top_nodes: list[int]`` never resolved to gene symbols.
+    """
+    from src.validation import OrthogonalValidator
+    n = 60
+    csr = _block_graph()
+    nim = _labels(n)
+    dis = tmp_path / "disgenet.tsv"
+    dis.write_text("geneSymbol\n" + "\n".join(f"GENE{i}" for i in range(20)))
+    results = {"pagerank": _pagerank_result_plain_ints(list(range(10)), n)}
+    ov = OrthogonalValidator(kinds=("disease",), output_dir=tmp_path,
+                             reference_paths={"disease": dis})
+    ov.add_dataset("synth", csr, "ppi", nim, results)
+    ov.run(algorithms=("pagerank",))
+    rec = ov.records[0]
+    assert rec.status == "ok"
+    assert rec.overlap_count == 10       # ← would have been 0 before the fix
+    assert rec.p_value < 0.01
+
+
+def test_go_ranking_with_plain_int_top_nodes(tmp_path: Path):
+    """Same regression for GO enrichment (the CSV symptom the user hit)."""
+    from src.validation import GOEnrichmentValidator
+    n = 60
+    csr = _block_graph()
+    nim = _labels(n)
+    gaf = tmp_path / "goa_human.gaf"
+    _write_gaf(gaf, generic_n=60, specific_n=15)
+    results = {"pagerank": _pagerank_result_plain_ints(list(range(10)), n)}
+    gv = GOEnrichmentValidator(output_dir=tmp_path, reference_path=gaf)
+    gv.add_dataset("synth", csr, "ppi", nim, results)
+    gv.run(algorithms=("pagerank",))
+    rec = gv.records[0]
+    assert rec.status == "ok"           # ← was "skipped" before the fix
+    assert rec.best_term == "GO:0042276"
+    assert rec.best_term_p < 0.05
+
+
+# ===========================================================================
 # OrthogonalValidator
 # ===========================================================================
 

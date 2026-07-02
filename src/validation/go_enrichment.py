@@ -250,7 +250,7 @@ class GOEnrichmentValidator:
             groups = [set(v) for v in communities.values() if v]
             note = f"GO enrichment over {len(groups)} communities"
         else:
-            predicted = _extract_predicted(algo, result)
+            predicted = _extract_predicted(algo, result, ds.node_index_map)
             groups = [set(predicted)] if predicted else []
             note = "GO enrichment of top-node set"
 

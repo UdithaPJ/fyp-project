@@ -246,7 +246,7 @@ class OrthogonalValidator:
                 algo, ds, ref, kind, ref_name, background, result,
             )
 
-        predicted = _extract_predicted(algo, result)
+        predicted = _extract_predicted(algo, result, ds.node_index_map)
         if not predicted:
             return OrthogonalRecord(
                 algorithm=algo, dataset=ds.name,
