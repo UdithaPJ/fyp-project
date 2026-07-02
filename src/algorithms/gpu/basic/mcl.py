@@ -60,14 +60,6 @@ except ImportError as _e:
 
 _BASELINE_MODE_CUPY: str = "gpu_baseline_cupy"
 
-# CuPy sparse SpGEMM materializes the intermediate M @ M in a single
-# allocation with no incremental fallback.  On mid-range GPUs (4–8 GB
-# VRAM) this OOMs well below the 1M-edge mark for MCL because the
-# matrix densifies across iterations before the prune stabilises —
-# same failure mode as cpu_multi.  Kept in line with cpu_multi so
-# benchmark reports are apples-to-apples.
-_GPU_BASELINE_NNZ_HARD_CAP: int = 500_000
-
 
 def _free_vram_bytes() -> int:
     """Live free-VRAM query via CuPy runtime; returns 0 on failure.
@@ -199,17 +191,7 @@ def _mcl_cupy(
     convergence_tol = float(params["convergence_tol"])
     nt              = str(params.get("network_type", "grn")).lower()
 
-    # ---- Layer 1: hard nnz cap for the CuPy sparse baseline ----
-    if int(graph_csr.nnz) > _GPU_BASELINE_NNZ_HARD_CAP:
-        raise MemoryError(
-            f"MCL gpu_baseline: refusing to run — input has "
-            f"{graph_csr.nnz} edges, above the "
-            f"{_GPU_BASELINE_NNZ_HARD_CAP} hard cap for the CuPy baseline. "
-            f"Use mode=gpu (cuda_optimized) which fuses threshold pruning "
-            f"into SpGEMM and scales to larger graphs."
-        )
-
-    # ---- Layer 2: VRAM-vs-estimate check with post-symmetrize sizing ----
+    # ---- Layer 1: VRAM-vs-estimate check with post-symmetrize sizing ----
     _check_memory_or_raise(
         _estimate_mcl_peak_ram_bytes(
             graph_csr, expansion=expansion, dtype_bytes=4, index_bytes=4,

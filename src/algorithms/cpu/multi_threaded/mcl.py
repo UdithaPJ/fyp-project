@@ -41,12 +41,6 @@ from src.algorithms.common.helpers import (
     _extract_clusters,
 )
 
-# Observed on a 16 GB Linux workstation running the benchmark suite:
-# BA(n=100k, m=~10) at 993k edges took cpu_multi's RAM to 16.6 GB used
-# and 5.1 GB swap, killing the IDE hosting the process.  Cap tightened
-# well below that threshold so ANY 1M+-edge benchmark refuses cpu_multi
-# and directs the user to mode=gpu (cuda_optimized).
-_CPU_MULTI_NNZ_HARD_CAP: int = 500_000
 from src.algorithms.cpu.multi_threaded._graphblas_utils import (
     _configure_threads,
     _from_scipy,
@@ -90,17 +84,6 @@ def mcl_cpu_multi(
     SuiteSparse; only the cheap Frobenius-norm convergence check and the
     final attractor cluster extraction run on scipy.
     """
-    # ---- Layer 1: hard nnz cap (evaluated BEFORE the graphblas import
-    # check so oversized inputs refuse deterministically even when the
-    # dep is missing) ----
-    if int(graph_csr.nnz) > _CPU_MULTI_NNZ_HARD_CAP:
-        raise MemoryError(
-            f"MCL cpu_multi: refusing to run — input has "
-            f"{graph_csr.nnz} edges, above the {_CPU_MULTI_NNZ_HARD_CAP} "
-            f"hard cap for the GraphBLAS CPU path.  "
-            f"Use mode=gpu (cuda_optimized) which scales to larger graphs."
-        )
-
     _require_graphblas()
     n_threads = _configure_threads(n_workers)
 
@@ -119,7 +102,7 @@ def mcl_cpu_multi(
             "note": "graphblas SuiteSparse (empty graph)",
         }
 
-    # ---- Layer 2: RAM-vs-estimate check with post-symmetrize sizing ----
+    # ---- Layer 1: RAM-vs-estimate check with post-symmetrize sizing ----
     _check_memory_or_raise(
         _estimate_mcl_peak_ram_bytes(
             graph_csr, expansion=e, dtype_bytes=4, index_bytes=4,
@@ -152,7 +135,7 @@ def mcl_cpu_multi(
         # the previous-iter matrix should we early-exit).
         M_old_sp = _to_scipy(M_gb, "csr")
 
-        # ---- Layer 3: per-iteration runtime watchdog ----
+        # ---- Layer 2: per-iteration runtime watchdog ----
         _check_runtime_ram_or_raise(
             backend="cpu_multi",
             iteration=iteration,
