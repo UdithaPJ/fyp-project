@@ -31,7 +31,7 @@ from src.algorithms.common.helpers import bfs_pack_result as _pack_result
 
 _DEFAULT_PARAMS: dict = {
     "source":    0,
-    "max_depth": 5,
+    "max_depth": 999,   # benchmark default: traverse full reachable component
 }
 
 

@@ -76,7 +76,7 @@ MODES: tuple[str, ...] = ("cpu_single", "cpu_multi", "gpu_baseline", "gpu")
 
 _MODE_LABELS: dict[str, str] = {
     "cpu_single":   "CPU Single",
-    "cpu_multi":    "CPU Multi",
+    "cpu_multi":    "CPU GraphBLAS",     # was multiprocessing; now SuiteSparse
     "gpu_baseline": "GPU Baseline",
     "gpu":          "GPU Optimised",
 }
@@ -90,7 +90,7 @@ _MODE_COLOURS: dict[str, str] = {
 
 _DEFAULT_PARAMS: dict[str, dict[str, Any]] = {
     "pagerank": {"damping": 0.85, "max_iter": 100, "tolerance": 1e-6},
-    "bfs":      {"source": 0, "max_depth": 5},
+    "bfs":      {"source": 0, "max_depth": 999},  # full reachable component
     "rwr":      {"restart_prob": 0.3, "max_iter": 100,
                  "tolerance": 1e-6, "seed_nodes": [0]},
     "hits":     {"max_iter": 100, "tolerance": 1e-6},
@@ -125,14 +125,15 @@ class BenchmarkDataset:
 
 @dataclass
 class TimingRecord:
-    algorithm:  str
-    dataset:    str
-    mode:       str
-    n_nodes:    int
-    n_edges:    int
-    times_s:    list[float]
-    success:    bool
-    error:      Optional[str] = None
+    algorithm:     str
+    dataset:       str
+    mode:          str
+    n_nodes:       int
+    n_edges:       int
+    times_s:       list[float]
+    success:       bool
+    error:         Optional[str] = None
+    strategy_note: str = ""    # last non-empty note from result["note"]
 
     @property
     def mean_s(self) -> float:
@@ -164,13 +165,20 @@ def _cpu_fn(algorithm: str, mode: str) -> Callable[[sp.csr_matrix, dict], dict]:
 
 
 def _run_once(algorithm: str, mode: str, graph_csr: sp.csr_matrix,
-              params: dict, node_index_map: dict) -> float:
-    """Execute one run and return elapsed seconds.  Raises on error."""
+              params: dict, node_index_map: dict) -> tuple[float, str]:
+    """Execute one run and return (elapsed_seconds, strategy_note).
+
+    strategy_note is at most 100 chars from result["note"] so CSV stays
+    readable.  CPU modes capture the note from the algorithm return dict.
+    """
     if mode in ("cpu_single", "cpu_multi"):
         fn = _cpu_fn(algorithm, mode)
         t0 = time.perf_counter()
-        fn(graph_csr, params)
-        return time.perf_counter() - t0
+        raw = fn(graph_csr, params)
+        elapsed = time.perf_counter() - t0
+        inner = raw.get("output", raw) if isinstance(raw, dict) else {}
+        note = str(inner.get("note", ""))[:100] if isinstance(inner, dict) else ""
+        return elapsed, note
 
     # GPU modes via the runner so we inherit CUDA-event timing + context guard
     from src.runner.algorithm_runner import run_algorithm
@@ -181,7 +189,8 @@ def _run_once(algorithm: str, mode: str, graph_csr: sp.csr_matrix,
         mode=mode,
         params=params,
     )
-    return float(envelope.get("execution_time", 0.0))
+    note = str(envelope.get("result", {}).get("note", ""))[:100]
+    return float(envelope.get("execution_time", 0.0)), note
 
 
 # ---------------------------------------------------------------------------
@@ -271,27 +280,42 @@ class RuntimeBenchmarker:
                               done, total, algorithm, dataset.name, mode)
 
                     times: list[float] = []
+                    last_note: str = ""
                     err: Optional[str] = None
 
-                    # warmup
+                    # warmup — discard results; log so we can confirm
+                    # kernel compile / JIT cost is paid before timing.
                     for _ in range(self.warmup_runs):
+                        _LOG.info(
+                            "Warmup %s/%s at n=%d",
+                            algorithm, mode,
+                            int(dataset.graph_csr.shape[0]),
+                        )
                         try:
                             _run_once(algorithm, mode, dataset.graph_csr,
                                       params, dataset.node_index_map)
                         except Exception:
-                            break
+                            break  # warmup failure is non-fatal
 
                     # timed runs
                     for run_idx in range(self.n_runs):
-                        gc.collect()
+                        # gc.collect() helps CPU-mode memory tracking; for GPU
+                        # modes it can cause 'cuEventRecord: invalid resource
+                        # handle' by collecting PyCUDA wrapper objects while
+                        # retain_primary_context() is active between calls.
+                        if mode in ("cpu_single", "cpu_multi"):
+                            gc.collect()
                         log_memory(
                             f"Before {algorithm}/{dataset.name}/{mode}"
                             f" run {run_idx + 1}/{self.n_runs}", _LOG,
                         )
                         try:
-                            t = _run_once(algorithm, mode, dataset.graph_csr,
-                                          params, dataset.node_index_map)
+                            t, note = _run_once(algorithm, mode,
+                                                dataset.graph_csr,
+                                                params, dataset.node_index_map)
                             times.append(t)
+                            if note:
+                                last_note = note
                         except Exception as exc:
                             err = f"{type(exc).__name__}: {exc}"
                             _LOG.warning("benchmark: %s/%s/%s failed: %s",
@@ -314,6 +338,7 @@ class RuntimeBenchmarker:
                         times_s=times,
                         success=bool(times),
                         error=err,
+                        strategy_note=last_note,
                     ))
 
     # ---- speedup computation ----
@@ -342,7 +367,7 @@ class RuntimeBenchmarker:
             "algorithm", "dataset", "mode", "n_nodes", "n_edges",
             "mean_s", "std_s", "min_s", "max_s",
             "speedup_vs_cpu_single", "speedup_vs_cpu_multi",
-            "speedup_vs_gpu_baseline",
+            "speedup_vs_gpu_baseline", "strategy_note",
         ]
         with out.open("w", encoding="utf-8", newline="") as f:
             w = csv.DictWriter(f, fieldnames=fieldnames)
@@ -364,6 +389,7 @@ class RuntimeBenchmarker:
                     "speedup_vs_cpu_single":   f"{self._speedup(ref_single, rec.mean_s):.4f}",
                     "speedup_vs_cpu_multi":    f"{self._speedup(ref_multi,  rec.mean_s):.4f}",
                     "speedup_vs_gpu_baseline": f"{self._speedup(ref_baseline, rec.mean_s):.4f}",
+                    "strategy_note": rec.strategy_note,
                 })
         _LOG.info("RuntimeBenchmarker: wrote %d rows to %s", len(self.records), out)
         return out

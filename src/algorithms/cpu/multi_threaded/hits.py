@@ -2,41 +2,31 @@
 src/algorithms/cpu/multi_threaded/hits.py
 =========================================
 
-HITS — multi-process CPU implementation only.
+HITS — GraphBLAS-backed cpu_multi implementation.
 
-Both the A^T·h (authority) and A·a (hub) matrix-vector products are
-parallelised using ProcessPoolExecutor with row-range partitioning.
-Row chunks for both matrices are built once before the iteration loop
-(only the score vectors change each iteration).
+Two SpMVs per iteration (``A^T @ h`` and ``A @ a``) executed through
+SuiteSparse:GraphBLAS's parallel ``plus_times`` SpMV.  L2 normalisation
+remains in numpy because it is a trivial O(N) operation.
 
-The L2 normalisation is applied after gathering partial results on the
-main process — it is a trivial O(N) serial step.
-
-Shared helpers imported from src.algorithms.common.helpers:
-    _l2_normalize, _top_k, hits_pack_result  (imported as _pack_result)
-
-Exclusive to this file:
-    _spmv_hits_chunk — row-chunk SpMV worker
-    _build_chunks    — pre-builds chunk argument tuples
-    _parallel_spmv   — runs a pre-chunked SpMV via ProcessPoolExecutor
-
-For the single-threaded variant see:
-    src.algorithms.cpu.single_threaded.hits
+For the deterministic single-thread variant see
+``src.algorithms.cpu.single_threaded.hits``.
 """
 
 from __future__ import annotations
 
-from concurrent.futures import ProcessPoolExecutor
-
 import numpy as np
 import scipy.sparse as sp
 
-from src.algorithms.common.helpers import (
-    _l2_normalize,
-    _top_k,
-    _worker_init_no_blas,
-    hits_pack_result as _pack_result,
+from src.algorithms.common.helpers import hits_pack_result as _pack_result
+from src.algorithms.cpu.multi_threaded._graphblas_utils import (
+    _configure_threads,
+    _from_scipy,
+    _require_graphblas,
+    _vec_from_np,
+    _vec_to_np,
+    gb,
 )
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -48,69 +38,8 @@ _DEFAULT_PARAMS: dict = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Private helpers
-# ---------------------------------------------------------------------------
-
 def _merge_params(user_params: dict | None) -> dict:
     return {**_DEFAULT_PARAMS, **(user_params or {})}
-
-
-# ---------------------------------------------------------------------------
-# Module-level SpMV worker — must be at module scope for ProcessPoolExecutor
-# ---------------------------------------------------------------------------
-
-def _spmv_hits_chunk(args: tuple) -> np.ndarray:
-    """
-    ProcessPoolExecutor worker: SpMV for a contiguous block of rows.
-
-    Receives (data, indices, local_indptr, vec, n_cols) where local_indptr
-    is re-zeroed to this chunk's start.  Returns the partial result vector.
-    """
-    data, indices, local_indptr, vec, n_cols = args
-    n_rows_chunk = len(local_indptr) - 1
-    M_chunk = sp.csr_matrix(
-        (data, indices, local_indptr),
-        shape=(n_rows_chunk, n_cols),
-    )
-    return (M_chunk @ vec).astype(np.float64)
-
-
-def _build_chunks(M: sp.csr_matrix, n_workers: int) -> list[tuple]:
-    """Pre-build row-chunk argument tuples for ProcessPoolExecutor."""
-    N      = M.shape[0]
-    n_cols = M.shape[1]
-    chunk_size = max(1, (N + n_workers - 1) // n_workers)
-    chunks = []
-    for start in range(0, N, chunk_size):
-        end   = min(start + chunk_size, N)
-        ptr_s = int(M.indptr[start])
-        ptr_e = int(M.indptr[end])
-        local_indptr = (M.indptr[start:end + 1] - M.indptr[start]).copy()
-        chunks.append((
-            M.data[ptr_s:ptr_e].copy(),
-            M.indices[ptr_s:ptr_e].copy(),
-            local_indptr,
-            None,     # placeholder — vector injected per-iteration
-            n_cols,
-        ))
-    return chunks
-
-
-def _parallel_spmv(
-    chunks:    list[tuple],
-    vec:       np.ndarray,
-    executor:  ProcessPoolExecutor,
-) -> np.ndarray:
-    """Run a pre-chunked sparse matrix-vector product in parallel.
-
-    MEMORY_FIX (H-1): the caller now owns the ProcessPoolExecutor and
-    reuses it across every iteration's two SpMVs.  Old code spun up a
-    new pool for each of the 2 × max_iter SpMVs.
-    """
-    args_list = [(c[0], c[1], c[2], vec, c[4]) for c in chunks]
-    parts = list(executor.map(_spmv_hits_chunk, args_list))
-    return np.concatenate(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -120,67 +49,59 @@ def _parallel_spmv(
 def hits_cpu_multi(
     graph_csr: sp.csr_matrix,
     params:    dict,
-    n_workers: int = 4,
+    n_workers: int | None = None,
 ) -> dict:
-    """
-    HITS — multi-process CPU implementation.
+    """HITS using SuiteSparse:GraphBLAS for both SpMVs per iteration."""
+    _require_graphblas()
+    n_threads = _configure_threads(n_workers)
 
-    Both the A^T·h and A·a products are parallelised via row-range
-    partitioning.  Row chunks for both matrices are built once before
-    the iteration loop; only the score vectors change per iteration.
-
-    Parameters
-    ----------
-    graph_csr : scipy.sparse.csr_matrix — directed GRN adjacency.
-    params    : dict
-        max_iter  (int,   default 100)
-        tolerance (float, default 1e-6)
-    n_workers : int
-
-    Returns
-    -------
-    dict with keys: hub_scores, authority_scores, iterations, converged,
-                    top_hubs, top_authorities, hub_authority_overlap
-    """
     p        = _merge_params(params)
     max_iter = int(p["max_iter"])
     tol      = float(p["tolerance"])
 
-    N   = graph_csr.shape[0]
-    # MEMORY_FIX (M-8): float32 throughout — HITS convergence check is
-    # L2-norm-based and not sensitive to FP64 precision; float32 halves
-    # the resident A + A^T footprint (≈240 MB saved on 15 M edges).
-    A   = graph_csr.astype(np.float32)
-    A_T = A.T.tocsr()
+    n = int(graph_csr.shape[0])
+    if n == 0:
+        return _pack_result(np.zeros(0, dtype=np.float32),
+                            np.zeros(0, dtype=np.float32), 0, True)
 
-    chunks_A_T = _build_chunks(A_T, n_workers)
-    chunks_A   = _build_chunks(A,   n_workers)
-    # MEMORY_FIX (D-14): chunks now own the per-row slices; we can release
-    # the full A / A_T views.
-    del A, A_T
+    A_gb  = _from_scipy(graph_csr, dtype=np.float32)
+    A_T_gb = A_gb.T.new()
 
-    h         = np.ones(N, dtype=np.float32)
-    a         = np.ones(N, dtype=np.float32)
+    h = np.ones(n, dtype=np.float32)
+    a = np.ones(n, dtype=np.float32)
     converged = False
+    iteration = 0
 
-    # MEMORY_FIX (H-1/H-3): one pool reused across all 2*max_iter SpMVs.
-    with ProcessPoolExecutor(
-        max_workers=n_workers, initializer=_worker_init_no_blas
-    ) as executor:
-        for iteration in range(1, max_iter + 1):
-            h_old, a_old = h, a
+    for iteration in range(1, max_iter + 1):
+        h_old, a_old = h, a
 
-            a_new = _l2_normalize(_parallel_spmv(chunks_A_T, h_old, executor))
-            h_new = _l2_normalize(_parallel_spmv(chunks_A,   a_new, executor))
+        # ---- a_new = A^T @ h_old, L2-normalised --------------------------
+        h_gb = _vec_from_np(h_old, dtype=gb.dtypes.FP32)
+        a_new_gb = A_T_gb.mxv(h_gb, gb.semiring.plus_times).new()
+        a_new = _vec_to_np(a_new_gb, n, dtype=np.float32, fill=0.0)
+        norm_a = float(np.linalg.norm(a_new))
+        if norm_a > 0.0:
+            a_new = a_new / norm_a
 
-            if np.linalg.norm(h_new - h_old) + np.linalg.norm(a_new - a_old) < tol:
-                converged = True
-                a, h = a_new, h_new
-                break
+        # ---- h_new = A @ a_new, L2-normalised ----------------------------
+        a_new_v = _vec_from_np(a_new, dtype=gb.dtypes.FP32)
+        h_new_gb = A_gb.mxv(a_new_v, gb.semiring.plus_times).new()
+        h_new = _vec_to_np(h_new_gb, n, dtype=np.float32, fill=0.0)
+        norm_h = float(np.linalg.norm(h_new))
+        if norm_h > 0.0:
+            h_new = h_new / norm_h
 
+        if float(np.linalg.norm(h_new - h_old)
+                 + np.linalg.norm(a_new - a_old)) < tol:
+            converged = True
             a, h = a_new, h_new
+            break
 
-    return _pack_result(h, a, iteration, converged)
+        a, h = a_new, h_new
+
+    result = _pack_result(h, a, iteration, converged)
+    result["note"] = f"graphblas SuiteSparse nthreads={n_threads}"
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -190,12 +111,12 @@ def hits_cpu_multi(
 def _cpu_multi(
     graph_csr: sp.csr_matrix,
     params:    dict | None = None,
-    n_workers: int = 4,
+    n_workers: int | None = None,
     **_,
 ) -> dict:
-    """Benchmark runner entry-point for cpu_multi mode."""
+    """Benchmark runner entry-point for cpu_multi mode (now GraphBLAS-backed)."""
     p = _merge_params(params)
     return {
         "output":       hits_cpu_multi(graph_csr, p, n_workers=n_workers),
-        "extra_params": {**p, "n_workers": n_workers},
+        "extra_params": {**p, "backend": "graphblas"},
     }

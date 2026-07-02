@@ -114,7 +114,18 @@ if not _CUDA_AVAILABLE:
         import pycuda.driver as _cuda_mod
         _cuda_mod.init()
         if _cuda_mod.Device.count() > 0:
-            import pycuda.autoinit  # noqa: F401
+            # Use the PRIMARY context (retain_primary_context) rather than
+            # `pycuda.autoinit` which calls `make_context()` and creates a
+            # SEPARATE non-primary context.  All six GPU algorithms also use
+            # `retain_primary_context().push()/pop()`.  When both the
+            # benchmarker and an algorithm use the same primary context,
+            # nested push/pop pairs are reference-counted and the context
+            # stays active for the lifetime of each BenchmarkTimer block.
+            # With `autoinit`'s separate context, the algorithm's pop
+            # switches to the non-primary context and `BenchmarkTimer`
+            # events (created in the primary ctx) become invalid.
+            _primary_ctx = _cuda_mod.Device(0).retain_primary_context()
+            _primary_ctx.push()
             cuda = _cuda_mod
             _GPU_TIMER_BACKEND = "pycuda"
             _CUDA_AVAILABLE = True

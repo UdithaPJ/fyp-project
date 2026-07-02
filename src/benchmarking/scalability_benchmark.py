@@ -92,7 +92,7 @@ MODES: tuple[str, ...] = ("cpu_single", "cpu_multi", "gpu_baseline", "gpu")
 
 _MODE_LABELS: dict[str, str] = {
     "cpu_single":   "CPU Single",
-    "cpu_multi":    "CPU Multi",
+    "cpu_multi":    "CPU GraphBLAS",     # was multiprocessing; now SuiteSparse
     "gpu_baseline": "GPU Baseline",
     "gpu":          "GPU Optimised",
 }
@@ -112,7 +112,7 @@ _TYPE_MARKERS: dict[str, str] = {
 
 _DEFAULT_PARAMS: dict[str, dict[str, Any]] = {
     "pagerank": {"damping": 0.85, "max_iter": 100, "tolerance": 1e-6},
-    "bfs":      {"source": 0, "max_depth": 5},
+    "bfs":      {"source": 0, "max_depth": 999},  # full reachable component
     "rwr":      {"restart_prob": 0.3, "max_iter": 100,
                  "tolerance": 1e-6, "seed_nodes": [0]},
     "hits":     {"max_iter": 100, "tolerance": 1e-6},
@@ -341,14 +341,21 @@ def _cpu_fn(algorithm: str, mode: str) -> Callable[[sp.csr_matrix, dict], Any]:
 
 
 def _run_once_timed(algorithm: str, mode: str, graph_csr: sp.csr_matrix,
-                    params: dict) -> tuple[float, float]:
-    """Return (elapsed_s, peak_delta_mb)."""
+                    params: dict) -> tuple[float, float, str]:
+    """Return (elapsed_s, peak_delta_mb, strategy_note).
+
+    strategy_note is at most 100 chars taken from result["note"] so the
+    CSV column stays readable.  CPU modes capture the note from the
+    algorithm's return dict; GPU modes take it from the runner envelope.
+    """
     with _MemTracker() as mem:
         if mode in ("cpu_single", "cpu_multi"):
             fn = _cpu_fn(algorithm, mode)
             t0 = time.perf_counter()
-            fn(graph_csr, params)
+            raw = fn(graph_csr, params)
             elapsed = time.perf_counter() - t0
+            inner = raw.get("output", raw) if isinstance(raw, dict) else {}
+            note = str(inner.get("note", ""))[:100] if isinstance(inner, dict) else ""
         else:
             from src.runner.algorithm_runner import run_algorithm
             envelope = run_algorithm(
@@ -359,7 +366,8 @@ def _run_once_timed(algorithm: str, mode: str, graph_csr: sp.csr_matrix,
                 params=params,
             )
             elapsed = float(envelope.get("execution_time", 0.0))
-    return elapsed, mem.peak_mb
+            note = str(envelope.get("result", {}).get("note", ""))[:100]
+    return elapsed, mem.peak_mb, note
 
 
 # ---------------------------------------------------------------------------
@@ -368,15 +376,16 @@ def _run_once_timed(algorithm: str, mode: str, graph_csr: sp.csr_matrix,
 
 @dataclass
 class ScalabilityRecord:
-    algorithm:  str
-    graph_type: str
-    n_nodes:    int
-    n_edges:    int
-    mode:       str
-    runtime_s:  float
-    peak_mb:    float
-    success:    bool
-    error:      Optional[str] = None
+    algorithm:     str
+    graph_type:    str
+    n_nodes:       int
+    n_edges:       int
+    mode:          str
+    runtime_s:     float
+    peak_mb:       float
+    success:       bool
+    error:         Optional[str] = None
+    strategy_note: str = ""      # last non-empty note from result["note"]
 
 
 # ---------------------------------------------------------------------------
@@ -408,6 +417,7 @@ class ScalabilityBenchmarker:
         network_type:    str = "ppi",
         output_dir:      str | Path = "experiments/outputs",
         n_runs:          int = 1,
+        warmup_runs:     int = 1,
         # Pre-generated graph support -----------------------------------
         pregenerated_dir: str | Path | None = None,
         edge_targets:    Iterable[int] | None = None,
@@ -423,6 +433,7 @@ class ScalabilityBenchmarker:
         self.reports_dir.mkdir(parents=True, exist_ok=True)
         self.plots_dir.mkdir(parents=True, exist_ok=True)
         self.n_runs          = max(1, int(n_runs))
+        self.warmup_runs     = max(0, int(warmup_runs))
         # Pre-generated graph directory; when set, graphs are loaded from
         # disk instead of being generated on the fly.
         self.pregenerated_dir: Path | None = (
@@ -523,17 +534,30 @@ class ScalabilityBenchmarker:
                               done, total, algorithm, graph_type, mode,
                               actual_n, actual_m)
 
-                    # Average over n_runs
+                    # Warmup — discard results, but log so we can confirm
+                    # the kernel compile / JIT cost is paid before timing.
+                    for _ in range(self.warmup_runs):
+                        _LOG.info("Warmup %s/%s n=%d", algorithm, mode, actual_n)
+                        try:
+                            _run_once_timed(algorithm, mode, g, params)
+                        except Exception:
+                            pass  # warmup failure is non-fatal
+
+                    # Timed runs
                     times: list[float] = []
                     mems:  list[float] = []
+                    last_note: str = ""
                     err:   Optional[str] = None
 
                     for _ in range(self.n_runs):
                         gc.collect()
                         try:
-                            t, mb = _run_once_timed(algorithm, mode, g, params)
+                            t, mb, note = _run_once_timed(algorithm, mode,
+                                                          g, params)
                             times.append(t)
                             mems.append(mb)
+                            if note:
+                                last_note = note
                         except Exception as exc:
                             err = f"{type(exc).__name__}: {exc}"
                             _LOG.warning("%s/%s/%s n=%d: %s",
@@ -551,6 +575,7 @@ class ScalabilityBenchmarker:
                             runtime_s=float(np.mean(times)),
                             peak_mb=float(np.mean(mems)),
                             success=True,
+                            strategy_note=last_note,
                         ))
                     else:
                         self.records.append(ScalabilityRecord(
@@ -581,7 +606,7 @@ class ScalabilityBenchmarker:
 
         fieldnames = [
             "algorithm", "graph_type", "n_nodes", "n_edges", "mode",
-            "runtime_s", "peak_mb", "speedup_vs_cpu_single",
+            "runtime_s", "peak_mb", "speedup_vs_cpu_single", "strategy_note",
         ]
         with out.open("w", encoding="utf-8", newline="") as f:
             w = csv.DictWriter(f, fieldnames=fieldnames)
@@ -602,6 +627,7 @@ class ScalabilityBenchmarker:
                     "runtime_s":  f"{r.runtime_s:.6f}" if np.isfinite(r.runtime_s) else "",
                     "peak_mb":    f"{r.peak_mb:.2f}"   if np.isfinite(r.peak_mb)   else "",
                     "speedup_vs_cpu_single": f"{spd:.4f}" if np.isfinite(spd) else "",
+                    "strategy_note": r.strategy_note,
                 })
         _LOG.info("ScalabilityBenchmarker: wrote %d rows to %s",
                   len(self.records), out)

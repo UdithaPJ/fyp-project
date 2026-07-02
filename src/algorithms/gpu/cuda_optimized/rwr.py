@@ -10,106 +10,102 @@ probability (1 - r) or teleports back to a seed with probability r.
 The steady-state vector ranks every node by its diffusion-influence
 relative to the seeds:
 
-  GRN    — seed with disease-associated TFs (TP53 in cancer, NF-κB in
-           inflammation); top-ranked genes are candidate downstream
-           regulatory targets, potentially many hops away from any seed.
-  PPI    — seed with known disease proteins; top-ranked proteins are
-           candidate disease modifiers (network medicine workflows).
-  miRNA  — seed with miRNAs of interest; top-ranked genes are
-           candidate co-targeted effectors of the miRNA panel.
+  GRN    — seed with disease-associated TFs; top-ranked genes are candidate
+            downstream regulatory targets.
+  PPI    — seed with known disease proteins; top-ranked proteins are candidate
+            disease modifiers.
+  miRNA  — seed with miRNAs of interest; top-ranked genes are candidate
+            co-targeted effectors.
 
 Steady-state equation:
     p* = (1 - r) · W · p* + r · p₀
 
-W is the column-stochastic transition matrix (columns sum to 1) and p₀
-is the seed distribution (uniform over seeds; uniform over all nodes
-when no seeds are provided).
+W is the column-stochastic transition matrix and p₀ is the seed
+distribution (uniform over seeds; uniform over all nodes when no seeds).
 
 Network-type-aware transition matrix
-------------------------------------
-GRN    : directed CSR, column-normalised by out-degree.
-         Dangling columns (out_degree == 0) get a self-loop so that
-         probability mass is conserved during diffusion.
-PPI    : A_sym = A + Aᵀ, binarised, then column-normalised.
-PPI    bidirectional interactions get equal weight per direction.
-miRNA  : directed bipartite CSR (miRNA - gene), column-normalised.
-         Gene-target nodes (out_degree == 0) get self-loops.
+-------------------------------------
+GRN   : directed CSR, column-normalised by out-degree.
+        Dangling columns (out_degree == 0) get a self-loop.
+PPI   : A_sym = A + Aᵀ, binarised, then column-normalised.
+miRNA : directed bipartite CSR (miRNA → gene), column-normalised.
+        Gene-target nodes (out_degree == 0) get self-loops.
 
-Optimised GPU pipeline (this module)
-------------------------------------
-1. GPU-only convergence reduction (``reduce_to_scalar_f32``):
-   - Block-partial L1 written by ``l1_convergence_rwr`` is reduced to
-     a single FP32 scalar on the GPU.  Only that one float crosses
-     PCIe per iteration (vs. the full partial-sum array before).
-   - Exactly ONE ``stream_compute.synchronize()`` per iteration.
+Optimised GPU pipeline
+-----------------------
+1.  Warp-per-node SpMV (rwr_spmv_warp_per_node / _fp16w / _batched):
+    One 256-thread block processes NODES_PER_BLOCK = 8 nodes at a time.
+    Each warp (32 threads) handles exactly one node — warp-shuffle
+    reduction, no shared-memory overhead, no per-warp __syncthreads__.
+    Compared to the previous one-block-per-node design:
+      • 8× fewer blocks → 8× lower scheduler pressure
+      • All warps in a block do useful work simultaneously
+      • Superior occupancy for the low-degree-majority of biological nets
 
-2. Hub-row ELLPACK for memory coalescing:
-   - Rows with ``degree >= hub_threshold`` are repacked into padded
-     ELLPACK (predictable stride, no ``row_ptr`` indirection).
-   - Adaptive hub threshold at the 95th degree percentile, clamped
-     to ``[WARP_SIZE, max_degree]`` and snapped to a power of 2.
-   - Remaining rows continue to use CSR with the existing thread /
-     warp / block three-tier dispatch.
+2.  GPU-side convergence reduction:
+    l1_convergence_rwr writes per-block L1 partials; reduce_to_scalar_f32
+    collapses them to a single scalar on the GPU.  Only that one float
+    crosses PCIe per convergence check.
 
-3. Shared-memory caching of p for small graphs (``rwr_spmv_smem_p``):
-   - When ``n <= SMEM_P_LIMIT`` (default 4096), the entire previous
-     iteration's p vector is cached in shared memory once per block.
-   - Eliminates the gmem reads of p during SpMV gather — the main
-     bandwidth-bound step for power-law biological networks.
-   - Auto-selected; falls back to the regular CSR/ELLPACK split for
-     large graphs.
+3.  Convergence checked every N iterations (default 10):
+    SpMV kernels queue continuously; sync + scalar read happen only every N
+    iterations.  Eliminates ~90 % of CPU-GPU synchronisation stalls vs
+    checking every iteration.  The final iteration always checks.
 
-4. Optional mixed precision (``precision_mode = "mixed"``):
-   - Transition weights stored as FP16 (``unsigned short`` half-bit
-     pattern), p / p_new / p₀ remain FP32, accumulation is FP32.
-   - Halves the w_values bandwidth at negligible accuracy cost
-     (RWR converges in 30-100 iterations, FP16 rounding error stays
-     well below the typical ``tolerance = 1e-6``).
+4.  Transition matrix W cached CPU-side:
+    The scipy symmetrisation + column-normalisation is recomputed only
+    when the graph object or network_type changes.
 
-5. Async overlap between SpMV and convergence reduction:
-   - ``stream_compute`` for SpMV; ``stream_transfer`` for async H2D
-     during setup AND for the convergence reduction launch.
-   - ``cuda.Event`` between the two streams orders the launches
-     without a host sync between them.
+5.  GPU CSR arrays cached device-side:
+    row_ptr / col_idx / w_values are re-uploaded only when the graph or
+    precision_mode changes.  Subsequent runs skip H2D entirely.
 
-6. Chunked execution for graphs exceeding VRAM (``_rwr_gpu_chunked``):
-   - p, p_new, p₀, and the partial-sum buffers stay full-size on the
-     device throughout.  CSR rows are streamed in chunks; per-chunk
-     scatter writes only into the chunk's row range of p_new.
-   - Double-buffer pipeline: ``stream_transfer`` pre-loads chunk i+1
-     while ``stream_compute`` runs chunk i SpMV.
-   - Auto-triggered when estimated VRAM > 80 % of free VRAM or
-     ``use_chunking=True`` from ``apply_config``.
+6.  Persistent GPU working buffers (_WorkingBufferCache):
+    d_p / d_pn / d_p0 / d_partial / d_l1_scalar are allocated once
+    and reused across repeated calls on the same n.  Reallocation
+    only occurs when the graph size (n) changes.
 
-7. Adaptive arch compilation (``_detect_arch_flag``):
-   - Runtime ``cuda.Device(0).compute_capability()`` →
-     ``-arch=sm_<major><minor>``.  Falls back to ``sm_75`` (RTX 20).
+7.  Optional mixed precision (FP16 weights, FP32 accumulation):
+    rwr_spmv_warp_per_node_fp16w halves the w_values bandwidth.
 
-Does NOT silently fall back to CPU — raises ``RuntimeError`` /
-``cuda.LogicError`` / ``MemoryError`` so the runner can surface the
-failure.  The CPU implementations live in a separate package:
-``src.algorithms.cpu.single_threaded.rwr`` and
-``src.algorithms.cpu.multi_threaded.rwr`` (benchmarking only).
+8.  Batched execution (rwr_spmv_warp_per_node_batched) for B ≤ MAX_BATCH.
+
+9.  Chunked execution (_rwr_gpu_chunked) for graphs exceeding VRAM.
+
+10. CUDA-event profiling (enable_profiling=True):
+    Per-run breakdown of SpMV time, convergence time, H2D transfer time,
+    total time, and derived overhead.  Zero overhead when disabled.
+
+11. benchmark_precision_modes() utility:
+    Automates FP32 vs FP16 comparison on any graph: warm-up, timed runs,
+    speedup ratio, top-node overlap, and a plain-English recommendation.
+
+Removed optimisations (introduced more overhead than benefit):
+  - Hub-row ELLPACK: preprocessing cost + two kernel launches per iter.
+  - SMEM-cached p vector: reduced SM occupancy; L1/L2 + __ldg suffices.
+  - Node reordering: O(n log n) sort + CSR reconstruction cost.
+
+Does NOT silently fall back to CPU.  Target: adaptive (sm_75 fallback).
 
 Multi-seed-set support
-----------------------
-``seed_nodes`` accepts either a flat list (single RWR run) or a
-list-of-lists (one RWR per inner list, scores averaged across runs to
-form a consensus influence vector).  Batched kernel handles
-``1 < B <= MAX_BATCH = 4``; larger batches loop the single-seed kernel.
+------------------------
+seed_nodes accepts a flat list (single RWR) or list-of-lists (one RWR per
+inner list, scores averaged to form a consensus influence vector).
+Batched kernel handles 1 < B <= MAX_BATCH = 4; larger batches loop the
+single-seed kernel.
 
 Parameter guide
 ---------------
-restart_prob    (float, default 0.3)    Teleport probability per step.
-max_iter        (int,   default 100)    Hard iteration cap.
-tolerance       (float, default 1e-6)   L1-norm early-stop threshold.
-seed_nodes      (list[int] or           Seeds for p₀.
-                 list[list[int]])
-network_type    (str,   default "grn")  One of "grn", "ppi", "mirna".
-block_size      (int,   default 256)    CUDA block dimension.
-precision_mode  (str,   default "fp32") "fp32" or "mixed" (FP16 W).
-ellpack_fraction(float, default 0.05)   Fraction of rows in ELLPACK.
-use_chunking    (bool,  default False)  Force chunked path on.
+restart_prob        (float, default 0.3)    Teleport probability per step.
+max_iter            (int,   default 100)    Hard iteration cap.
+tolerance           (float, default 1e-6)   L1-norm early-stop threshold.
+seed_nodes          (list)                  Seeds for p₀.
+network_type        (str,   default "grn")  One of "grn", "ppi", "mirna".
+block_size          (int,   default 256)    CUDA block dimension.
+precision_mode      (str,   default "fp32") "fp32" or "mixed" (FP16 W).
+use_chunking        (bool,  default False)  Force chunked path on.
+conv_check_interval (int,   default 10)     Check convergence every N iters.
+enable_profiling    (bool,  default False)  Attach CUDA-event timing data.
 """
 
 # ── GPU / CUDA-optimised implementation (PyCUDA custom kernels) ──────────
@@ -122,7 +118,7 @@ use_chunking    (bool,  default False)  Force chunked path on.
 from __future__ import annotations
 
 import logging
-import math
+import weakref
 from typing import Any
 
 import numpy as np
@@ -144,7 +140,6 @@ except Exception:                                       # noqa: BLE001
     PYCUDA_AVAILABLE = False
     logging.warning("PyCUDA not available — rwr_gpu() will raise.")
 
-# Optional: GPU config (block_size + chunking suggestions per tier).
 try:
     from src.optimization.gpu_config import apply_config, get_gpu_config
     _GPU_CONFIG_AVAILABLE = True
@@ -168,44 +163,172 @@ except Exception:                                       # noqa: BLE001
 # ---------------------------------------------------------------------------
 
 _DEFAULT_PARAMS: dict = {
-    "restart_prob":     0.3,
-    "max_iter":         100,
-    "tolerance":        1e-6,
-    "seed_nodes":       [],
-    "network_type":     "grn",
-    "block_size":       256,
-    "precision_mode":   "fp32",       # "fp32" or "mixed"
-    "ellpack_fraction": 0.05,         # ~5% of rows go to ELLPACK
-    "use_chunking":     False,
-    "use_zero_copy":    False,
-    "reorder_nodes":    False,
+    "restart_prob":         0.3,
+    "max_iter":             100,
+    "tolerance":            1e-6,
+    "seed_nodes":           [],
+    "network_type":         "grn",
+    "block_size":           256,
+    "precision_mode":       "fp32",   # "fp32" or "mixed"
+    "use_chunking":         False,
+    "use_zero_copy":        False,
+    "conv_check_interval":  10,       # changed from 5 → 10 (improvement 1)
+    "enable_profiling":     False,    # CUDA-event profiling (improvement 5)
 }
 
-BLOCK_SIZE: int          = 256
-WARP_SIZE: int           = 32
-MAX_BATCH: int           = 4              # batched kernel ceiling
-SMEM_P_LIMIT: int        = 4096           # n above which SMEM-cached p is skipped
-_TOP_NODES: int          = 20
-_TOP_SEEDS: int          = 10
+BLOCK_SIZE: int             = 256
+WARP_SIZE: int              = 32
+NODES_PER_BLOCK: int        = BLOCK_SIZE // WARP_SIZE   # = 8 (improvement 4)
+MAX_BATCH: int              = 4
+_TOP_NODES: int             = 20
+_TOP_SEEDS: int             = 10
 VRAM_BUDGET_FRACTION: float = 0.80
 
+# ---------------------------------------------------------------------------
+# CPU-side transition matrix cache
+# ---------------------------------------------------------------------------
+
+_W_CACHE: dict      = {}   # key -> (W: csr_matrix, note: str)
+_W_CACHE_REFS: dict = {}   # key -> weakref to graph_csr
+_W_CACHE_MAX: int   = 8
 
 # ---------------------------------------------------------------------------
-# CUDA kernel source
+# GPU CSR cache — most recently used graph's device arrays
+# ---------------------------------------------------------------------------
+
+class _GPUCSRCache:
+    """Single-entry device-array cache for the transition matrix CSR.
+
+    Thread safety: not thread-safe; intended for single-threaded use.
+    All invalidate() calls must occur while the CUDA primary context is
+    active (i.e. from inside rwr_gpu after the context push).
+    """
+
+    __slots__ = ("key", "d_row_ptr", "d_col_idx", "d_w_values")
+
+    def __init__(self) -> None:
+        self.key: Any  = None
+        self.d_row_ptr = None
+        self.d_col_idx = None
+        self.d_w_values = None
+
+    def matches(self, key: Any) -> bool:
+        return self.key == key and self.d_row_ptr is not None
+
+    def store(self, key: Any, d_row_ptr, d_col_idx, d_w_values) -> None:
+        self.key        = key
+        self.d_row_ptr  = d_row_ptr
+        self.d_col_idx  = d_col_idx
+        self.d_w_values = d_w_values
+
+    def invalidate(self) -> None:
+        for attr in ("d_row_ptr", "d_col_idx", "d_w_values"):
+            arr = getattr(self, attr, None)
+            if arr is not None:
+                try:
+                    arr.gpudata.free()
+                except Exception:                       # noqa: BLE001
+                    pass
+                setattr(self, attr, None)
+        self.key = None
+
+
+_GPU_CSR_CACHE = _GPUCSRCache()
+
+
+# ---------------------------------------------------------------------------
+# Persistent GPU working buffers — improvement 3
+# ---------------------------------------------------------------------------
+
+class _WorkingBufferCache:
+    """Reusable GPU working buffers for the single-seed serial path.
+
+    Avoids repeated gpuarray.empty() / gpuarray.free() on every call.
+    Buffers are reallocated only when n (number of nodes) changes.
+
+    Usage (inside rwr_gpu after context push):
+        _GPU_WORKING_BUFFERS.ensure(n)
+        buf = _GPU_WORKING_BUFFERS
+        cuda.memcpy_htod_async(buf.d_p.gpudata, h_p0, stream)
+        cuda.memcpy_htod_async(buf.d_p0.gpudata, h_p0, stream)
+        d_p, d_pn = buf.d_p, buf.d_pn   # local aliases for pointer swap
+
+    Thread safety: not thread-safe (single-threaded benchmarking use).
+    free() must be called while the CUDA primary context is active.
+    """
+
+    __slots__ = (
+        "n", "n_partial_blocks",
+        "d_p", "d_pn", "d_p0", "d_partial", "d_l1_scalar",
+    )
+
+    def __init__(self) -> None:
+        self.n               = 0
+        self.n_partial_blocks = 0
+        self.d_p             = None
+        self.d_pn            = None
+        self.d_p0            = None
+        self.d_partial       = None
+        self.d_l1_scalar     = None
+
+    # ------------------------------------------------------------------
+    def ensure(self, n: int) -> None:
+        """Allocate buffers for n nodes, or no-op if already allocated."""
+        if self.n == n and self.d_p is not None:
+            return
+        self.free()
+        npb = max(1, (n + BLOCK_SIZE - 1) // BLOCK_SIZE)
+        self.n                = n
+        self.n_partial_blocks = npb
+        self.d_p          = gpuarray.empty((n,),   np.float32)
+        self.d_pn         = gpuarray.empty((n,),   np.float32)
+        self.d_p0         = gpuarray.empty((n,),   np.float32)
+        self.d_partial    = gpuarray.empty((npb,), np.float32)
+        self.d_l1_scalar  = gpuarray.empty((1,),   np.float32)
+
+    # ------------------------------------------------------------------
+    def free(self) -> None:
+        """Free all cached device buffers (call with active CUDA context)."""
+        for attr in ("d_p", "d_pn", "d_p0", "d_partial", "d_l1_scalar"):
+            arr = getattr(self, attr, None)
+            if arr is not None:
+                try:
+                    arr.gpudata.free()
+                except Exception:                   # noqa: BLE001
+                    pass
+                setattr(self, attr, None)
+        self.n                = 0
+        self.n_partial_blocks = 0
+
+
+_GPU_WORKING_BUFFERS = _WorkingBufferCache()
+
+
+# ---------------------------------------------------------------------------
+# CUDA kernel source — improvement 4: warp-per-node scheduling
 # ---------------------------------------------------------------------------
 #
-# Kernels:
-#   reduce_to_scalar_f32           — GPU-side single-block reduction
-#                                     of a partial-sum array to one scalar.
-#   rwr_spmv_restart               — FP32 fused SpMV + restart (three-tier).
-#   rwr_spmv_restart_fp16w         — same but reads FP16 (unsigned short
-#                                     half-bit) weights, FP32 accumulation.
-#   rwr_spmv_smem_p                — small-graph SMEM-cached p variant.
-#   rwr_spmv_ellpack_hubs          — padded ELLPACK kernel for hub rows.
-#   l1_convergence_rwr             — (total)|p_new - p| block-partial.
-#   rwr_spmv_restart_batched       — multi-seed batched variant (B <= 4).
+# Kernel inventory:
+#   reduce_to_scalar_f32              — unchanged; GPU partial-sum reducer.
+#   rwr_spmv_warp_per_node            — FP32  SpMV + restart, warp-per-node.
+#   rwr_spmv_warp_per_node_fp16w      — FP16w SpMV + restart, warp-per-node.
+#   l1_convergence_rwr                — unchanged; flat L1 partial kernel.
+#   rwr_spmv_warp_per_node_batched    — batched SpMV, warp-per-node.
 #
-# All kernels live in one SourceModule (compiled once, cached).
+# Design rationale for warp-per-node vs previous one-block-per-node:
+#   Biological networks are power-law: the vast majority of nodes have
+#   degree << BLOCK_SIZE.  Under the old scheme a 256-thread block was
+#   launched for each node, but only 1 or 32 threads did useful work.
+#   With NODES_PER_BLOCK = 8, each block runs 8 warps simultaneously,
+#   all doing useful SpMV work.  This raises SM occupancy ~8× for the
+#   common low-degree case and removes shared-memory pressure entirely
+#   (warp shuffles replace the SMEM tree).
+#
+# Grid sizes (Python side):
+#   SpMV single : grid = (ceil(n / NODES_PER_BLOCK), 1, 1)
+#   SpMV batched: grid = (ceil(n / NODES_PER_BLOCK), B, 1)
+#   L1 conv     : grid = (ceil(n / BLOCK_SIZE), 1, 1)   [unchanged]
+#   Reduce scalar: grid = (1, 1, 1)                      [unchanged]
 
 KERNEL_SOURCE = r"""
 #include <cuda_fp16.h>
@@ -214,16 +337,15 @@ extern "C" {
 
 #define BLOCK_SIZE       256
 #define WARP_SIZE        32
-#define WARPS_PER_BLOCK  (BLOCK_SIZE / WARP_SIZE)
+#define WARPS_PER_BLOCK  (BLOCK_SIZE / WARP_SIZE)    // 8
+#define NODES_PER_BLOCK  (BLOCK_SIZE / WARP_SIZE)    // 8
+
 
 // =========================================================================
-// KERNEL: reduce_to_scalar_f32  (NEW)
+// KERNEL: reduce_to_scalar_f32  (unchanged)
 //
-// Strided load + shared-memory tree reduction in one kernel.  Launched
-// with grid=(1,1,1).  Writes a SINGLE float to scalar_output[0].  The
-// host can read just that one float (or keep it on GPU for the next
-// kernel that needs it).  Replaces the per-iteration .get() of the
-// partial-sum array.
+// Strided load + shared-memory tree reduction.  Launched grid=(1,1,1).
+// Writes a SINGLE float to scalar_output[0].
 // =========================================================================
 __global__ void reduce_to_scalar_f32(
     const float* __restrict__ partial_input,
@@ -232,14 +354,11 @@ __global__ void reduce_to_scalar_f32(
 {
     __shared__ float smem[BLOCK_SIZE];
     const int tid = threadIdx.x;
-
     float val = 0.0f;
-    for (int i = tid; i < input_len; i += BLOCK_SIZE) {
+    for (int i = tid; i < input_len; i += BLOCK_SIZE)
         val += partial_input[i];
-    }
     smem[tid] = val;
     __syncthreads();
-
     for (int s = BLOCK_SIZE >> 1; s > 0; s >>= 1) {
         if (tid < s) smem[tid] += smem[tid + s];
         __syncthreads();
@@ -249,23 +368,22 @@ __global__ void reduce_to_scalar_f32(
 
 
 // =========================================================================
-// KERNEL: rwr_spmv_restart  (FP32, three-tier)
+// KERNEL: rwr_spmv_warp_per_node  (FP32, warp-per-node)
 //
-// Fused SpMV + restart for a single seed set:
-//   p_new[i] = (1 - r) * total_j W[i,j] * p[j]  +  r * p0[i]
+// One 256-thread block processes NODES_PER_BLOCK = 8 nodes simultaneously.
+// Each warp (32 threads) is responsible for exactly one node:
+//   - warp_id  = threadIdx.x / WARP_SIZE  →  which node in this block
+//   - lane     = threadIdx.x % WARP_SIZE  →  which edge within that node
 //
-// One block per node i.  Three-tier degree-aware scheduling:
-//   LOW  (deg < 32)         : thread 0 only, serial scan
-//   MED  (32 <= deg < 256)  : first warp, stride-32 + shfl_down_sync
-//   HIGH (deg >= 256)       : full block, stride-256 + shared mem tree
+// Threads stride across the row with step WARP_SIZE, accumulating into a
+// warp-private float.  Five __shfl_down_sync calls reduce the warp to
+// lane-0 in ~5 cycles (no __syncthreads needed).
 //
-// Restart term r * p0[i] is added by thread 0 ONLY, after the
-// reduction, in the same write that stores p_new[i].
-//
-// __ldg(&p[col]) routes p neighbour reads through the read-only
-// texture cache.
+// __ldg(&p[col_idx[j]]) routes p reads through the read-only cache.
+// For degree == 0 (dangling node, should not occur after W construction
+// adds self-loops but kept as a safety guard), lane 0 writes r*p0[node_i].
 // =========================================================================
-__global__ void rwr_spmv_restart(
+__global__ void rwr_spmv_warp_per_node(
     const int*   __restrict__ row_ptr,
     const int*   __restrict__ col_idx,
     const float* __restrict__ w_values,
@@ -276,77 +394,42 @@ __global__ void rwr_spmv_restart(
     const float                r,
     const int                  n)
 {
-    __shared__ float smem[BLOCK_SIZE];
+    const int warp_id = threadIdx.x >> 5;               // threadIdx.x / 32
+    const int lane    = threadIdx.x & 31;               // threadIdx.x % 32
+    const int node_i  = (int)blockIdx.x * NODES_PER_BLOCK + warp_id;
 
-    const int node_i = blockIdx.x;
     if (node_i >= n) return;
 
     const int row_start = row_ptr[node_i];
     const int row_end   = row_ptr[node_i + 1];
-    const int degree    = row_end - row_start;
 
-    if (degree == 0) {
-        if (threadIdx.x == 0) p_new[node_i] = r * p0[node_i];
-        return;
-    }
-
-    // ---- LOW tier --------------------------------------------------------
-    if (degree < WARP_SIZE) {
-        if (threadIdx.x == 0) {
-            float sum = 0.0f;
-            for (int j = row_start; j < row_end; ++j) {
-                sum += w_values[j] * __ldg(&p[col_idx[j]]);
-            }
-            p_new[node_i] = one_minus_r * sum + r * p0[node_i];
-        }
-        return;
-    }
-
-    // ---- MED tier --------------------------------------------------------
-    if (degree < BLOCK_SIZE) {
-        if (threadIdx.x < WARP_SIZE) {
-            float partial = 0.0f;
-            for (int j = row_start + threadIdx.x; j < row_end; j += WARP_SIZE) {
-                partial += w_values[j] * __ldg(&p[col_idx[j]]);
-            }
-            for (int off = WARP_SIZE >> 1; off > 0; off >>= 1) {
-                partial += __shfl_down_sync(0xffffffffu, partial, off);
-            }
-            if (threadIdx.x == 0) {
-                p_new[node_i] = one_minus_r * partial + r * p0[node_i];
-            }
-        }
-        return;
-    }
-
-    // ---- HIGH tier -------------------------------------------------------
     float partial = 0.0f;
-    for (int j = row_start + threadIdx.x; j < row_end; j += BLOCK_SIZE) {
+    for (int j = row_start + lane; j < row_end; j += WARP_SIZE)
         partial += w_values[j] * __ldg(&p[col_idx[j]]);
-    }
-    smem[threadIdx.x] = partial;
-    __syncthreads();
-    for (int s = BLOCK_SIZE >> 1; s > 0; s >>= 1) {
-        if (threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x + s];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) {
-        p_new[node_i] = one_minus_r * smem[0] + r * p0[node_i];
-    }
+
+    // Warp reduction (unrolled — compiler-friendly, avoids loop overhead)
+    partial += __shfl_down_sync(0xffffffffu, partial, 16);
+    partial += __shfl_down_sync(0xffffffffu, partial, 8);
+    partial += __shfl_down_sync(0xffffffffu, partial, 4);
+    partial += __shfl_down_sync(0xffffffffu, partial, 2);
+    partial += __shfl_down_sync(0xffffffffu, partial, 1);
+
+    if (lane == 0)
+        p_new[node_i] = one_minus_r * partial + r * p0[node_i];
 }
 
 
 // =========================================================================
-// KERNEL: rwr_spmv_restart_fp16w  (NEW — mixed precision)
+// KERNEL: rwr_spmv_warp_per_node_fp16w  (FP16 weights, FP32 accum)
 //
-// Same dispatch as rwr_spmv_restart, but reads w_values as half (FP16)
-// and converts to float at use time.  Halves the bandwidth of the
-// w_values stream.  p / p_new / p0 stay FP32.  Accumulation is FP32.
+// Identical warp-per-node structure; reads w_values as FP16 bit patterns
+// and converts to float at use time.  Halves w_values bandwidth.
+// p / p_new / p0 remain FP32; accumulation is FP32.
 // =========================================================================
-__global__ void rwr_spmv_restart_fp16w(
+__global__ void rwr_spmv_warp_per_node_fp16w(
     const int*           __restrict__ row_ptr,
     const int*           __restrict__ col_idx,
-    const unsigned short* __restrict__ w_values_h,    // FP16 bit pattern
+    const unsigned short* __restrict__ w_values_h,
     const float*         __restrict__ p,
     const float*         __restrict__ p0,
     float*               __restrict__ p_new,
@@ -354,213 +437,37 @@ __global__ void rwr_spmv_restart_fp16w(
     const float                        r,
     const int                          n)
 {
-    __shared__ float smem[BLOCK_SIZE];
+    const int warp_id = threadIdx.x >> 5;
+    const int lane    = threadIdx.x & 31;
+    const int node_i  = (int)blockIdx.x * NODES_PER_BLOCK + warp_id;
 
-    const int node_i = blockIdx.x;
     if (node_i >= n) return;
 
     const int row_start = row_ptr[node_i];
     const int row_end   = row_ptr[node_i + 1];
-    const int degree    = row_end - row_start;
-
-    if (degree == 0) {
-        if (threadIdx.x == 0) p_new[node_i] = r * p0[node_i];
-        return;
-    }
-
-    // helper macro: load FP16 weight as float
-    #define WEIGHT(j) __half2float(*reinterpret_cast<const __half*>(&w_values_h[j]))
-
-    if (degree < WARP_SIZE) {
-        if (threadIdx.x == 0) {
-            float sum = 0.0f;
-            for (int j = row_start; j < row_end; ++j) {
-                sum += WEIGHT(j) * __ldg(&p[col_idx[j]]);
-            }
-            p_new[node_i] = one_minus_r * sum + r * p0[node_i];
-        }
-        return;
-    }
-
-    if (degree < BLOCK_SIZE) {
-        if (threadIdx.x < WARP_SIZE) {
-            float partial = 0.0f;
-            for (int j = row_start + threadIdx.x; j < row_end; j += WARP_SIZE) {
-                partial += WEIGHT(j) * __ldg(&p[col_idx[j]]);
-            }
-            for (int off = WARP_SIZE >> 1; off > 0; off >>= 1) {
-                partial += __shfl_down_sync(0xffffffffu, partial, off);
-            }
-            if (threadIdx.x == 0) {
-                p_new[node_i] = one_minus_r * partial + r * p0[node_i];
-            }
-        }
-        return;
-    }
 
     float partial = 0.0f;
-    for (int j = row_start + threadIdx.x; j < row_end; j += BLOCK_SIZE) {
-        partial += WEIGHT(j) * __ldg(&p[col_idx[j]]);
-    }
-    smem[threadIdx.x] = partial;
-    __syncthreads();
-    for (int s = BLOCK_SIZE >> 1; s > 0; s >>= 1) {
-        if (threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x + s];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) {
-        p_new[node_i] = one_minus_r * smem[0] + r * p0[node_i];
-    }
+    for (int j = row_start + lane; j < row_end; j += WARP_SIZE)
+        partial += __half2float(*reinterpret_cast<const __half*>(&w_values_h[j]))
+                   * __ldg(&p[col_idx[j]]);
 
-    #undef WEIGHT
+    partial += __shfl_down_sync(0xffffffffu, partial, 16);
+    partial += __shfl_down_sync(0xffffffffu, partial, 8);
+    partial += __shfl_down_sync(0xffffffffu, partial, 4);
+    partial += __shfl_down_sync(0xffffffffu, partial, 2);
+    partial += __shfl_down_sync(0xffffffffu, partial, 1);
+
+    if (lane == 0)
+        p_new[node_i] = one_minus_r * partial + r * p0[node_i];
 }
 
 
 // =========================================================================
-// KERNEL: rwr_spmv_smem_p  (NEW — small-graph SMEM cache)
+// KERNEL: l1_convergence_rwr  (unchanged — already optimal flat kernel)
 //
-// For graphs small enough that the entire p vector fits in shared
-// memory (n <= SMEM_P_LIMIT, ~4096 nodes = 16 KB / block).  Each block
-// first cooperatively loads p[0..n) into SMEM, then evaluates row
-// blockIdx.x.  Eliminates the gmem reads of p during the SpMV gather.
-//
-// Launch contract: block=(BLOCK_SIZE,1,1), grid=(n,1,1), dynamic SMEM
-// = n * sizeof(float) bytes.
-// =========================================================================
-__global__ void rwr_spmv_smem_p(
-    const int*   __restrict__ row_ptr,
-    const int*   __restrict__ col_idx,
-    const float* __restrict__ w_values,
-    const float* __restrict__ p,
-    const float* __restrict__ p0,
-    float*       __restrict__ p_new,
-    const float                one_minus_r,
-    const float                r,
-    const int                  n)
-{
-    extern __shared__ float p_cache[];
-
-    // ---- Cooperative load of p into SMEM ----
-    for (int i = threadIdx.x; i < n; i += blockDim.x) {
-        p_cache[i] = p[i];
-    }
-    __syncthreads();
-
-    const int node_i = blockIdx.x;
-    if (node_i >= n) return;
-
-    const int row_start = row_ptr[node_i];
-    const int row_end   = row_ptr[node_i + 1];
-    const int degree    = row_end - row_start;
-
-    if (degree == 0) {
-        if (threadIdx.x == 0) p_new[node_i] = r * p0[node_i];
-        return;
-    }
-
-    __shared__ float smem_red[BLOCK_SIZE];
-
-    if (degree < WARP_SIZE) {
-        if (threadIdx.x == 0) {
-            float sum = 0.0f;
-            for (int j = row_start; j < row_end; ++j) {
-                sum += w_values[j] * p_cache[col_idx[j]];
-            }
-            p_new[node_i] = one_minus_r * sum + r * p0[node_i];
-        }
-        return;
-    }
-
-    if (degree < BLOCK_SIZE) {
-        if (threadIdx.x < WARP_SIZE) {
-            float partial = 0.0f;
-            for (int j = row_start + threadIdx.x; j < row_end; j += WARP_SIZE) {
-                partial += w_values[j] * p_cache[col_idx[j]];
-            }
-            for (int off = WARP_SIZE >> 1; off > 0; off >>= 1) {
-                partial += __shfl_down_sync(0xffffffffu, partial, off);
-            }
-            if (threadIdx.x == 0) {
-                p_new[node_i] = one_minus_r * partial + r * p0[node_i];
-            }
-        }
-        return;
-    }
-
-    float partial = 0.0f;
-    for (int j = row_start + threadIdx.x; j < row_end; j += BLOCK_SIZE) {
-        partial += w_values[j] * p_cache[col_idx[j]];
-    }
-    smem_red[threadIdx.x] = partial;
-    __syncthreads();
-    for (int s = BLOCK_SIZE >> 1; s > 0; s >>= 1) {
-        if (threadIdx.x < s) smem_red[threadIdx.x] += smem_red[threadIdx.x + s];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) {
-        p_new[node_i] = one_minus_r * smem_red[0] + r * p0[node_i];
-    }
-}
-
-
-// =========================================================================
-// KERNEL: rwr_spmv_ellpack_hubs  (NEW — ELLPACK for hub rows)
-//
-// One block per hub row.  Padded ELLPACK layout: hub_col_idx and
-// hub_w_values are [num_hubs x max_row_len] row-major arrays;
-// padding entries have col_idx == -1 and are skipped.
-//
-// Predictable stride (max_row_len) eliminates the row_ptr indirection
-// and gives much better memory coalescing for the hub-tier nodes,
-// which dominate the long tail of the SpMV cost on power-law graphs.
-//
-// Writes p_new directly (no atomic — one block per output node).
-// =========================================================================
-__global__ void rwr_spmv_ellpack_hubs(
-    const int*   __restrict__ hub_ids,       // length num_hubs (global node id)
-    const int*   __restrict__ hub_col_idx,   // [num_hubs x max_row_len]
-    const float* __restrict__ hub_w_values,  // [num_hubs x max_row_len]
-    const int                  max_row_len,
-    const float* __restrict__ p,
-    const float* __restrict__ p0,
-    float*       __restrict__ p_new,
-    const float                one_minus_r,
-    const float                r,
-    const int                  num_hubs)
-{
-    __shared__ float smem[BLOCK_SIZE];
-
-    const int hub_idx = blockIdx.x;
-    if (hub_idx >= num_hubs) return;
-    const int node_i = hub_ids[hub_idx];
-
-    const int row_base = hub_idx * max_row_len;
-
-    float partial = 0.0f;
-    for (int k = threadIdx.x; k < max_row_len; k += BLOCK_SIZE) {
-        const int c = hub_col_idx[row_base + k];
-        if (c >= 0) {
-            partial += hub_w_values[row_base + k] * __ldg(&p[c]);
-        }
-    }
-    smem[threadIdx.x] = partial;
-    __syncthreads();
-    for (int s = BLOCK_SIZE >> 1; s > 0; s >>= 1) {
-        if (threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x + s];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) {
-        p_new[node_i] = one_minus_r * smem[0] + r * p0[node_i];
-    }
-}
-
-
-// =========================================================================
-// KERNEL: l1_convergence_rwr  (UNCHANGED)
-//
-// (total) |p_new[i] - p[i]| per block via warp-shuffle intra-warp reduction
-// then a final warp-shuffle across the WARPS_PER_BLOCK partial sums in
-// shared memory.  Partials reduced by reduce_to_scalar_f32.
+// One thread per element: partial |p_new[i] - p[i]| accumulated into a
+// warp-level sum via __shfl_down_sync, then one warp in SMEM reduction.
+// Grid = (ceil(n / BLOCK_SIZE), 1, 1); partials fed to reduce_to_scalar.
 // =========================================================================
 __global__ void l1_convergence_rwr(
     const float* __restrict__ p_new,
@@ -573,9 +480,8 @@ __global__ void l1_convergence_rwr(
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     float val = (tid < n) ? fabsf(p_new[tid] - p[tid]) : 0.0f;
 
-    for (int off = WARP_SIZE >> 1; off > 0; off >>= 1) {
+    for (int off = WARP_SIZE >> 1; off > 0; off >>= 1)
         val += __shfl_down_sync(0xffffffffu, val, off);
-    }
 
     const int lane    = threadIdx.x & (WARP_SIZE - 1);
     const int warp_id = threadIdx.x / WARP_SIZE;
@@ -584,20 +490,21 @@ __global__ void l1_convergence_rwr(
 
     if (threadIdx.x < WARP_SIZE) {
         val = (threadIdx.x < WARPS_PER_BLOCK) ? smem[threadIdx.x] : 0.0f;
-        for (int off = WARPS_PER_BLOCK >> 1; off > 0; off >>= 1) {
+        for (int off = WARPS_PER_BLOCK >> 1; off > 0; off >>= 1)
             val += __shfl_down_sync(0xffffffffu, val, off);
-        }
         if (threadIdx.x == 0) partial_sums[blockIdx.x] = val;
     }
 }
 
 
 // =========================================================================
-// KERNEL: rwr_spmv_restart_batched  (UNCHANGED — multi-seed batched)
+// KERNEL: rwr_spmv_warp_per_node_batched  (multi-seed, B <= MAX_BATCH)
 //
-// Batched multi-seed RWR.  gridDim = (n, B, 1).
+// Grid: (ceil(n / NODES_PER_BLOCK), B, 1).
+// Each warp handles node (blockIdx.x * NPB + warp_id) for seed blockIdx.y.
+// p / p0 / p_new stored as [n × B] row-major flat arrays.
 // =========================================================================
-__global__ void rwr_spmv_restart_batched(
+__global__ void rwr_spmv_warp_per_node_batched(
     const int*   __restrict__ row_ptr,
     const int*   __restrict__ col_idx,
     const float* __restrict__ w_values,
@@ -609,62 +516,29 @@ __global__ void rwr_spmv_restart_batched(
     const int                  n,
     const int                  B)
 {
-    __shared__ float smem[BLOCK_SIZE];
+    const int warp_id = threadIdx.x >> 5;
+    const int lane    = threadIdx.x & 31;
+    const int node_i  = (int)blockIdx.x * NODES_PER_BLOCK + warp_id;
+    const int seed_b  = (int)blockIdx.y;
 
-    const int node_i = blockIdx.x;
-    const int seed_b = blockIdx.y;
     if (node_i >= n || seed_b >= B) return;
 
     const int row_start = row_ptr[node_i];
     const int row_end   = row_ptr[node_i + 1];
-    const int degree    = row_end - row_start;
     const int out_idx   = node_i * B + seed_b;
 
-    if (degree == 0) {
-        if (threadIdx.x == 0) p_new[out_idx] = r * p0[out_idx];
-        return;
-    }
-
-    if (degree < WARP_SIZE) {
-        if (threadIdx.x == 0) {
-            float sum = 0.0f;
-            for (int j = row_start; j < row_end; ++j) {
-                sum += w_values[j] * __ldg(&p[col_idx[j] * B + seed_b]);
-            }
-            p_new[out_idx] = one_minus_r * sum + r * p0[out_idx];
-        }
-        return;
-    }
-
-    if (degree < BLOCK_SIZE) {
-        if (threadIdx.x < WARP_SIZE) {
-            float partial = 0.0f;
-            for (int j = row_start + threadIdx.x; j < row_end; j += WARP_SIZE) {
-                partial += w_values[j] * __ldg(&p[col_idx[j] * B + seed_b]);
-            }
-            for (int off = WARP_SIZE >> 1; off > 0; off >>= 1) {
-                partial += __shfl_down_sync(0xffffffffu, partial, off);
-            }
-            if (threadIdx.x == 0) {
-                p_new[out_idx] = one_minus_r * partial + r * p0[out_idx];
-            }
-        }
-        return;
-    }
-
     float partial = 0.0f;
-    for (int j = row_start + threadIdx.x; j < row_end; j += BLOCK_SIZE) {
+    for (int j = row_start + lane; j < row_end; j += WARP_SIZE)
         partial += w_values[j] * __ldg(&p[col_idx[j] * B + seed_b]);
-    }
-    smem[threadIdx.x] = partial;
-    __syncthreads();
-    for (int s = BLOCK_SIZE >> 1; s > 0; s >>= 1) {
-        if (threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x + s];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) {
-        p_new[out_idx] = one_minus_r * smem[0] + r * p0[out_idx];
-    }
+
+    partial += __shfl_down_sync(0xffffffffu, partial, 16);
+    partial += __shfl_down_sync(0xffffffffu, partial, 8);
+    partial += __shfl_down_sync(0xffffffffu, partial, 4);
+    partial += __shfl_down_sync(0xffffffffu, partial, 2);
+    partial += __shfl_down_sync(0xffffffffu, partial, 1);
+
+    if (lane == 0)
+        p_new[out_idx] = one_minus_r * partial + r * p0[out_idx];
 }
 
 }  // extern "C"
@@ -679,11 +553,7 @@ _kernel_cache: dict[str, dict[str, Any]] = {}
 
 
 def _detect_arch_flag() -> str:
-    """Return ``-arch=sm_XY`` for the current device, with a Turing fallback.
-
-    Falls back to ``sm_75`` (RTX 20-series) if PyCUDA cannot probe the
-    device — that matches the project's target hardware.
-    """
+    """Return ``-arch=sm_XY`` for the current device (sm_75 fallback)."""
     try:
         cuda.init()
         cc_major, cc_minor = cuda.Device(0).compute_capability()
@@ -706,14 +576,14 @@ def _get_kernels() -> dict[str, Any]:
             options=[arch_flag, "-O3"],
             no_extern_c=True,
         )
+        # Python-facing keys are unchanged so callers don't need updating.
+        # CUDA function names reflect the new warp-per-node design.
         _kernel_cache["rwr"] = {
             "reduce_scalar":        mod.get_function("reduce_to_scalar_f32"),
-            "spmv_restart":         mod.get_function("rwr_spmv_restart"),
-            "spmv_restart_fp16w":   mod.get_function("rwr_spmv_restart_fp16w"),
-            "spmv_smem_p":          mod.get_function("rwr_spmv_smem_p"),
-            "spmv_ellpack_hubs":    mod.get_function("rwr_spmv_ellpack_hubs"),
+            "spmv_restart":         mod.get_function("rwr_spmv_warp_per_node"),
+            "spmv_restart_fp16w":   mod.get_function("rwr_spmv_warp_per_node_fp16w"),
             "l1_conv":              mod.get_function("l1_convergence_rwr"),
-            "spmv_restart_batched": mod.get_function("rwr_spmv_restart_batched"),
+            "spmv_restart_batched": mod.get_function("rwr_spmv_warp_per_node_batched"),
             "_arch_flag":           arch_flag,
         }
     return _kernel_cache["rwr"]
@@ -735,25 +605,18 @@ def _build_transition_matrix(
     graph_csr: sp.csr_matrix,
     network_type: str,
 ) -> tuple[sp.csr_matrix, str]:
-    """Build the column-stochastic transition matrix W for RWR.
-
-    RWR update: ``p_new = (1 - r) · W · p + r · p₀``.  W must be
-    column-stochastic (every column sums to 1) so that the random
-    walk preserves probability mass.
-    """
+    """Build the column-stochastic transition matrix W for RWR."""
     nt = str(network_type).lower()
-
     if nt == "ppi":
         A = (graph_csr + graph_csr.T).astype(np.float32)
-        A.data = np.ones_like(A.data, dtype=np.float32)        # binarise
+        A.data = np.ones_like(A.data, dtype=np.float32)
         note = "PPI: A + Aᵀ binarised, then column-normalised"
-    else:  # grn / mirna / default
+    else:
         A = graph_csr.astype(np.float32)
         note = f"{nt.upper()}: directed CSR, column-normalised by out-degree"
 
     A = A.tocsr()
     A.sum_duplicates()
-
     out_degrees = np.asarray(A.sum(axis=1), dtype=np.float64).flatten()
     safe_degs   = np.where(out_degrees == 0.0, 1.0, out_degrees)
     D_inv       = sp.diags(1.0 / safe_degs, format="csr")
@@ -766,20 +629,41 @@ def _build_transition_matrix(
         for j in zero_cols:
             W_lil[int(j), int(j)] = 1.0
         W = W_lil.tocsr().astype(np.float32)
-
     return W, note
 
 
-def _build_p0(
-    seed_nodes,
-    n: int,
+def _get_cached_W(
+    graph_csr: sp.csr_matrix,
     network_type: str,
-) -> np.ndarray:
-    """Build the restart vector p₀ (length n, sums to 1.0).
+) -> tuple[sp.csr_matrix, str]:
+    """Return cached (W, note); recompute if graph or network_type changed.
 
-    Empty / invalid seeds → uniform 1/n (global PageRank-like).
-    Otherwise → uniform 1/|seeds| over valid seed indices.
+    Key: (object id, shape, nnz, network_type).  Weakref guards against
+    Python reusing the same id for a different object after GC.
     """
+    key = (id(graph_csr), graph_csr.shape, int(graph_csr.nnz), network_type)
+    if key in _W_CACHE:
+        ref = _W_CACHE_REFS.get(key)
+        if ref is None or ref() is graph_csr:
+            return _W_CACHE[key]
+        del _W_CACHE[key]
+        _W_CACHE_REFS.pop(key, None)
+
+    W, note = _build_transition_matrix(graph_csr, network_type)
+    if len(_W_CACHE) >= _W_CACHE_MAX:
+        evict = next(iter(_W_CACHE))
+        del _W_CACHE[evict]
+        _W_CACHE_REFS.pop(evict, None)
+    _W_CACHE[key] = (W, note)
+    try:
+        _W_CACHE_REFS[key] = weakref.ref(graph_csr)
+    except TypeError:
+        _W_CACHE_REFS[key] = None
+    return W, note
+
+
+def _build_p0(seed_nodes, n: int, network_type: str) -> np.ndarray:
+    """Build the restart vector p₀ (length n, sums to 1.0)."""
     p0 = np.zeros(n, dtype=np.float32)
     valid = [int(s) for s in (seed_nodes or []) if isinstance(s, (int, np.integer))
              and 0 <= int(s) < n]
@@ -790,143 +674,20 @@ def _build_p0(
     return p0
 
 
-def _reorder_nodes_by_degree(
-    W: sp.csr_matrix,
-) -> tuple[sp.csr_matrix, np.ndarray]:
-    """Permute W's rows and columns so similar-degree nodes are adjacent."""
-    degrees = np.diff(W.indptr).astype(np.int32)
-    perm    = np.argsort(degrees).astype(np.int32)
-    W_row   = W[perm, :].tocsr()
-    W_full  = W_row[:, perm].tocsr()
-    return W_full.astype(np.float32), perm
+def _fp32_to_fp16_bits(values: np.ndarray) -> np.ndarray:
+    """Convert FP32 array to FP16 bit pattern stored as uint16."""
+    return values.astype(np.float16).view(np.uint16).astype(np.uint16)
 
 
 def _estimate_rwr_vram(n: int, nnz: int, batch_size: int = 1,
                        fp16_weights: bool = False) -> int:
     """Conservative VRAM estimate (bytes) for RWR working set."""
-    w_value_bytes = 2 if fp16_weights else 4
-    csr_b      = (n + 1) * 4 + nnz * 4 + nnz * w_value_bytes
-    pr_b       = n * 4 * (2 + batch_size)                 # p, p_new, B × p₀
-    partial_b  = max(1, (n + BLOCK_SIZE - 1) // BLOCK_SIZE) * 4
-    scalar_b   = 4 * 4                                    # convergence scalars
+    w_val_bytes = 2 if fp16_weights else 4
+    csr_b     = (n + 1) * 4 + nnz * 4 + nnz * w_val_bytes
+    pr_b      = n * 4 * (2 + batch_size)
+    partial_b = max(1, (n + BLOCK_SIZE - 1) // BLOCK_SIZE) * 4
+    scalar_b  = 4 * 4
     return int(csr_b + pr_b + partial_b + scalar_b)
-
-
-# ---------------------------------------------------------------------------
-# Adaptive hub threshold + ELLPACK builder
-# ---------------------------------------------------------------------------
-
-def _compute_adaptive_hub_threshold(
-    row_lens: np.ndarray,
-    target_ellpack_fraction: float = 0.05,
-) -> int:
-    """Return a hub threshold (row length) at the (1 - target) percentile.
-
-    Clamped to ``[WARP_SIZE, max_degree]`` and snapped to a power of 2.
-    """
-    if row_lens.size == 0:
-        return WARP_SIZE
-    deg_int = row_lens.astype(np.int64)
-    pct = (1.0 - max(0.0, min(target_ellpack_fraction, 1.0))) * 100.0
-    threshold = int(np.percentile(deg_int, pct))
-    threshold = max(threshold, WARP_SIZE)
-    threshold = min(threshold, int(deg_int.max()) if deg_int.size > 0 else WARP_SIZE)
-    threshold = max(threshold, 1)
-    snapped = int(2 ** round(math.log2(max(threshold, 1))))
-    return max(snapped, WARP_SIZE)
-
-
-def _build_ellpack_split(
-    W: sp.csr_matrix,
-    hub_threshold: int,
-) -> tuple[dict, dict]:
-    """Split W's rows into (hub_ellpack, low_csr) based on row length.
-
-    Returns
-    -------
-    ellpack : dict
-        {"hub_ids": int32[num_hubs],
-         "hub_col_idx": int32[num_hubs * max_row_len],
-         "hub_w_values": float32[num_hubs * max_row_len],
-         "max_row_len": int,
-         "num_hubs": int}
-        Padding entries have col_idx == -1.
-    low_csr : dict
-        {"row_ptr": int32[n+1], "col_idx": int32[nnz_low],
-         "values": float32[nnz_low], "n": int}
-        Hub rows are zeroed in row_ptr (row_end == row_start) so the
-        CSR kernel naturally skips them.
-    """
-    n = int(W.shape[0])
-    row_lens = np.diff(W.indptr).astype(np.int32)
-    hub_mask = row_lens >= hub_threshold
-    hub_ids  = np.where(hub_mask)[0].astype(np.int32)
-    num_hubs = int(hub_ids.size)
-
-    # ---- Build ELLPACK ----------------------------------------------------
-    if num_hubs == 0:
-        ellpack = {
-            "hub_ids":     np.empty((0,), dtype=np.int32),
-            "hub_col_idx": np.empty((0,), dtype=np.int32),
-            "hub_w_values": np.empty((0,), dtype=np.float32),
-            "max_row_len": 0,
-            "num_hubs":    0,
-        }
-    else:
-        max_row_len = int(row_lens[hub_mask].max())
-        hub_col_idx  = np.full((num_hubs * max_row_len,), -1, dtype=np.int32)
-        hub_w_values = np.zeros((num_hubs * max_row_len,), dtype=np.float32)
-        indptr  = W.indptr
-        indices = W.indices
-        values  = W.data.astype(np.float32, copy=False)
-        for h_idx, node_i in enumerate(hub_ids):
-            rs = int(indptr[node_i])
-            re = int(indptr[node_i + 1])
-            k = re - rs
-            base = h_idx * max_row_len
-            hub_col_idx[base:base + k]  = indices[rs:re]
-            hub_w_values[base:base + k] = values[rs:re]
-        ellpack = {
-            "hub_ids":      hub_ids,
-            "hub_col_idx":  hub_col_idx,
-            "hub_w_values": hub_w_values,
-            "max_row_len":  max_row_len,
-            "num_hubs":     num_hubs,
-        }
-
-    # ---- Build low CSR (zero out hub rows) -------------------------------
-    new_indptr = W.indptr.astype(np.int32, copy=True)
-    if num_hubs > 0:
-        # Zero out hub rows by collapsing their row_end to row_start
-        keep_mask = np.ones(int(W.nnz), dtype=bool)
-        for node_i in hub_ids:
-            rs = int(W.indptr[node_i])
-            re = int(W.indptr[node_i + 1])
-            keep_mask[rs:re] = False
-        new_col_idx = W.indices[keep_mask].astype(np.int32, copy=False)
-        new_values  = W.data[keep_mask].astype(np.float32, copy=False)
-        # Rebuild row_ptr
-        new_row_lens = row_lens.copy()
-        new_row_lens[hub_mask] = 0
-        new_indptr = np.empty(n + 1, dtype=np.int32)
-        new_indptr[0] = 0
-        np.cumsum(new_row_lens, out=new_indptr[1:])
-    else:
-        new_col_idx = W.indices.astype(np.int32, copy=False)
-        new_values  = W.data.astype(np.float32, copy=False)
-
-    low_csr = {
-        "row_ptr": new_indptr,
-        "col_idx": new_col_idx,
-        "values":  new_values,
-        "n":       n,
-    }
-    return ellpack, low_csr
-
-
-def _fp32_to_fp16_bits(values: np.ndarray) -> np.ndarray:
-    """Convert an FP32 array to FP16 bit pattern as ``uint16`` (numpy)."""
-    return values.astype(np.float16).view(np.uint16).astype(np.uint16)
 
 
 # ---------------------------------------------------------------------------
@@ -934,7 +695,6 @@ def _fp32_to_fp16_bits(values: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 def _top_k(scores: np.ndarray, k: int = _TOP_NODES) -> list[int]:
-    """Return the top-k node indices by descending score."""
     if scores.size == 0:
         return []
     k = min(k, scores.size)
@@ -946,10 +706,9 @@ def _top_k_among(
     candidate_indices: np.ndarray,
     k: int,
 ) -> list[int]:
-    """Top-k from a candidate subset, ordered by score descending."""
     if candidate_indices.size == 0:
         return []
-    sub = scores[candidate_indices]
+    sub   = scores[candidate_indices]
     order = np.argsort(sub)[::-1][:k]
     return candidate_indices[order].astype(int).tolist()
 
@@ -969,8 +728,8 @@ class _ChunkBuffer:
         self.d_col_idx  = gpuarray.empty((max_nnz,),       np.int32)
         self.d_values   = gpuarray.empty((max_nnz,),       np.float32)
         self.d_node_ids = gpuarray.empty((max_nodes,),     np.int32)
-        self.max_nnz   = max_nnz
-        self.max_nodes = max_nodes
+        self.max_nnz    = max_nnz
+        self.max_nodes  = max_nodes
 
     def free(self) -> None:
         for arr in (self.d_row_ptr, self.d_col_idx,
@@ -981,27 +740,18 @@ class _ChunkBuffer:
                 pass
 
 
-def _build_csr_chunks(
-    W: sp.csr_matrix,
-    chunk_size: int,
-) -> list[dict]:
-    """Split W into row-chunks for chunked SpMV.
-
-    Each chunk dict has: ``node_ids`` (original row indices),
-    ``indptr`` (rebased CSR indptr for this chunk), ``indices``,
-    ``values``.
-    """
+def _build_csr_chunks(W: sp.csr_matrix, chunk_size: int) -> list[dict]:
+    """Split W into row-chunks for chunked SpMV."""
     n = int(W.shape[0])
     chunks: list[dict] = []
     for start in range(0, n, chunk_size):
-        end = min(start + chunk_size, n)
+        end      = min(start + chunk_size, n)
         node_ids = np.arange(start, end, dtype=np.int32)
-        rs = int(W.indptr[start])
-        re = int(W.indptr[end])
-        local_indptr = (W.indptr[start:end + 1] - rs).astype(np.int32)
+        rs       = int(W.indptr[start])
+        re       = int(W.indptr[end])
         chunks.append({
             "node_ids": node_ids,
-            "indptr":   local_indptr,
+            "indptr":   (W.indptr[start:end + 1] - rs).astype(np.int32),
             "indices":  W.indices[rs:re].astype(np.int32, copy=False),
             "values":   W.data[rs:re].astype(np.float32, copy=False),
         })
@@ -1009,29 +759,21 @@ def _build_csr_chunks(
 
 
 # ---------------------------------------------------------------------------
-# Chunked SpMV kernel (CSR with explicit node_ids)
-# ---------------------------------------------------------------------------
-# We do NOT add a separate "chunked" CUDA kernel: we reuse spmv_restart
-# by passing chunked CSR + remapping with a tiny driver-side loop that
-# offsets the output writes via a chunk-local row_ptr layout.  Each
-# chunk is processed as a separate kernel launch with its own (chunked
-# n) grid, but the same kernel reads its row_ptr / col_idx / values.
-
-# ---------------------------------------------------------------------------
-# Helper kernel (compiled with the others) that handles the chunk's
-# row→node mapping. We use a tiny wrapper kernel that translates blockIdx
-# back to the chunk's node_ids[chunk_local_row] and writes p_new[node_i].
-# Implemented inline below as a wrapper around `spmv_restart` semantics
-# but with a `node_ids` indirection.
+# Chunk-aware SpMV kernel — warp-per-node layout
 # ---------------------------------------------------------------------------
 
 _CHUNK_KERNEL_SOURCE = r"""
 extern "C" {
 
-#define BLOCK_SIZE       256
-#define WARP_SIZE        32
+#define BLOCK_SIZE      256
+#define WARP_SIZE       32
+#define NODES_PER_BLOCK (BLOCK_SIZE / WARP_SIZE)    // 8
 
-__global__ void rwr_spmv_restart_chunk(
+// Warp-per-node chunk kernel.
+//   local_i = blockIdx.x * NODES_PER_BLOCK + warp_id   (chunk-local row)
+//   node_i  = chunk_node_ids[local_i]                   (global node id)
+// row_ptr / col_idx / values use chunk-local indices (rebased indptr).
+__global__ void rwr_spmv_warp_per_node_chunk(
     const int*   __restrict__ row_ptr,
     const int*   __restrict__ col_idx,
     const float* __restrict__ w_values,
@@ -1043,61 +785,28 @@ __global__ void rwr_spmv_restart_chunk(
     const float                r,
     const int                  chunk_size)
 {
-    __shared__ float smem[BLOCK_SIZE];
+    const int warp_id = threadIdx.x >> 5;
+    const int lane    = threadIdx.x & 31;
+    const int local_i = (int)blockIdx.x * NODES_PER_BLOCK + warp_id;
 
-    const int local_i = blockIdx.x;
     if (local_i >= chunk_size) return;
     const int node_i = chunk_node_ids[local_i];
 
     const int row_start = row_ptr[local_i];
     const int row_end   = row_ptr[local_i + 1];
-    const int degree    = row_end - row_start;
-
-    if (degree == 0) {
-        if (threadIdx.x == 0) p_new[node_i] = r * p0[node_i];
-        return;
-    }
-
-    if (degree < WARP_SIZE) {
-        if (threadIdx.x == 0) {
-            float sum = 0.0f;
-            for (int j = row_start; j < row_end; ++j) {
-                sum += w_values[j] * __ldg(&p[col_idx[j]]);
-            }
-            p_new[node_i] = one_minus_r * sum + r * p0[node_i];
-        }
-        return;
-    }
-
-    if (degree < BLOCK_SIZE) {
-        if (threadIdx.x < WARP_SIZE) {
-            float partial = 0.0f;
-            for (int j = row_start + threadIdx.x; j < row_end; j += WARP_SIZE) {
-                partial += w_values[j] * __ldg(&p[col_idx[j]]);
-            }
-            for (int off = WARP_SIZE >> 1; off > 0; off >>= 1) {
-                partial += __shfl_down_sync(0xffffffffu, partial, off);
-            }
-            if (threadIdx.x == 0) {
-                p_new[node_i] = one_minus_r * partial + r * p0[node_i];
-            }
-        }
-        return;
-    }
 
     float partial = 0.0f;
-    for (int j = row_start + threadIdx.x; j < row_end; j += BLOCK_SIZE) {
+    for (int j = row_start + lane; j < row_end; j += WARP_SIZE)
         partial += w_values[j] * __ldg(&p[col_idx[j]]);
-    }
-    smem[threadIdx.x] = partial;
-    __syncthreads();
-    for (int s = BLOCK_SIZE >> 1; s > 0; s >>= 1) {
-        if (threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x + s];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) {
-        p_new[node_i] = one_minus_r * smem[0] + r * p0[node_i];
-    }
+
+    partial += __shfl_down_sync(0xffffffffu, partial, 16);
+    partial += __shfl_down_sync(0xffffffffu, partial, 8);
+    partial += __shfl_down_sync(0xffffffffu, partial, 4);
+    partial += __shfl_down_sync(0xffffffffu, partial, 2);
+    partial += __shfl_down_sync(0xffffffffu, partial, 1);
+
+    if (lane == 0)
+        p_new[node_i] = one_minus_r * partial + r * p0[node_i];
 }
 
 }  // extern "C"
@@ -1105,7 +814,7 @@ __global__ void rwr_spmv_restart_chunk(
 
 
 def _get_chunk_kernel() -> Any:
-    """Compile (or fetch) the chunk-aware SpMV kernel."""
+    """Compile (or fetch) the warp-per-node chunk SpMV kernel."""
     if "rwr_chunk" not in _kernel_cache:
         if not PYCUDA_AVAILABLE:
             raise RuntimeError("PyCUDA required.")
@@ -1116,14 +825,13 @@ def _get_chunk_kernel() -> Any:
             no_extern_c=True,
         )
         _kernel_cache["rwr_chunk"] = {
-            "spmv_chunk": mod.get_function("rwr_spmv_restart_chunk"),
-            "_arch_flag": arch_flag,
+            "spmv_chunk": mod.get_function("rwr_spmv_warp_per_node_chunk"),
         }
     return _kernel_cache["rwr_chunk"]
 
 
 # ---------------------------------------------------------------------------
-# Chunked GPU iteration (single-seed only — batched chunked is future work)
+# Chunked GPU iteration
 # ---------------------------------------------------------------------------
 
 def _rwr_gpu_chunked(
@@ -1133,31 +841,31 @@ def _rwr_gpu_chunked(
     r_val: float,
     max_iter: int,
     tolerance: float,
+    conv_check_interval: int,
     kernels: dict,
     stream_compute,
     stream_transfer,
     chunk_size: int,
 ) -> tuple[np.ndarray, int, bool]:
-    """Chunked SpMV pipeline for graphs that exceed VRAM.
+    """Chunked warp-per-node SpMV for graphs that exceed VRAM.
 
-    p / p_new / p0 stay full-size on the device.  CSR rows are
-    streamed in chunks with a double-buffer pipeline.  Returns
-    (scores_np, iterations, converged).
+    p / p_new / p0 remain full-size on the device.  CSR rows stream in
+    chunks via a double-buffer pipeline.  Convergence is checked every
+    conv_check_interval iterations; the final iteration always checks.
     """
     chunk_kernels = _get_chunk_kernel()
-    k_chunk    = chunk_kernels["spmv_chunk"]
-    k_l1       = kernels["l1_conv"]
-    k_reduce   = kernels["reduce_scalar"]
+    k_chunk  = chunk_kernels["spmv_chunk"]
+    k_l1     = kernels["l1_conv"]
+    k_reduce = kernels["reduce_scalar"]
 
-    n = int(W.shape[0])
+    n      = int(W.shape[0])
     chunks = _build_csr_chunks(W, chunk_size=chunk_size)
     max_chunk_nnz   = max((c["values"].size for c in chunks), default=1)
     max_chunk_nodes = max((c["node_ids"].size for c in chunks), default=1)
 
-    # ---- Allocate persistent vectors ---------------------------------------
     h_p0 = np.ascontiguousarray(p0_np, np.float32)
     d_p0 = gpuarray.to_gpu(h_p0)
-    d_p  = gpuarray.to_gpu(h_p0.copy())                 # p starts = p0
+    d_p  = gpuarray.to_gpu(h_p0.copy())
     d_pn = gpuarray.zeros((n,), np.float32)
 
     n_partial_blocks = max(1, (n + BLOCK_SIZE - 1) // BLOCK_SIZE)
@@ -1171,20 +879,11 @@ def _rwr_gpu_chunked(
     events = [cuda.Event(), cuda.Event()]
 
     def _upload_chunk(chunk: dict, buf: _ChunkBuffer) -> None:
-        cuda.memcpy_htod_async(
-            buf.d_row_ptr.gpudata, chunk["indptr"], stream_transfer,
-        )
-        cuda.memcpy_htod_async(
-            buf.d_col_idx.gpudata, chunk["indices"], stream_transfer,
-        )
-        cuda.memcpy_htod_async(
-            buf.d_values.gpudata, chunk["values"], stream_transfer,
-        )
-        cuda.memcpy_htod_async(
-            buf.d_node_ids.gpudata, chunk["node_ids"], stream_transfer,
-        )
+        cuda.memcpy_htod_async(buf.d_row_ptr.gpudata,  chunk["indptr"],   stream_transfer)
+        cuda.memcpy_htod_async(buf.d_col_idx.gpudata,  chunk["indices"],  stream_transfer)
+        cuda.memcpy_htod_async(buf.d_values.gpudata,   chunk["values"],   stream_transfer)
+        cuda.memcpy_htod_async(buf.d_node_ids.gpudata, chunk["node_ids"], stream_transfer)
 
-    # Pre-load chunk 0
     _upload_chunk(chunks[0], buffers[0])
     events[0].record(stream_transfer)
 
@@ -1194,51 +893,51 @@ def _rwr_gpu_chunked(
         for it in range(max_iter):
             iterations = it + 1
 
-            # ---- Per-iteration: stream chunks --------------------------
             for ci, chunk in enumerate(chunks):
                 buf = buffers[ci % 2]
                 stream_compute.wait_for_event(events[ci % 2])
+                chunk_sz = int(chunk["node_ids"].size)
+                chunk_blocks = (chunk_sz + NODES_PER_BLOCK - 1) // NODES_PER_BLOCK
                 k_chunk(
                     buf.d_row_ptr, buf.d_col_idx, buf.d_values,
                     buf.d_node_ids, d_p, d_p0, d_pn,
                     np.float32(one_minus_r), np.float32(r_val),
-                    np.int32(chunk["node_ids"].size),
+                    np.int32(chunk_sz),
                     block=(BLOCK_SIZE, 1, 1),
-                    grid=(int(chunk["node_ids"].size), 1, 1),
+                    grid=(chunk_blocks, 1, 1),
                     stream=stream_compute,
                 )
-                # Pre-load next chunk on transfer stream
                 if ci + 1 < len(chunks):
                     nxt_buf = buffers[(ci + 1) % 2]
                     _upload_chunk(chunks[ci + 1], nxt_buf)
                     events[(ci + 1) % 2].record(stream_transfer)
                 elif it + 1 < max_iter:
-                    # Reset to chunk 0 for next iteration
                     _upload_chunk(chunks[0], buffers[0])
                     events[0].record(stream_transfer)
 
-            # ---- Convergence (GPU-side reduction) ---------------------
-            k_l1(
-                d_pn, d_p, d_partial, np.int32(n),
-                block=(BLOCK_SIZE, 1, 1),
-                grid=(n_partial_blocks, 1, 1),
-                stream=stream_compute,
-            )
-            k_reduce(
-                d_partial, d_l1_scalar, np.int32(n_partial_blocks),
-                block=(BLOCK_SIZE, 1, 1),
-                grid=(1, 1, 1),
-                stream=stream_compute,
-            )
-
-            stream_compute.synchronize()                 # ONE sync
-            l1 = float(d_l1_scalar.get()[0])
+            # Convergence check every N iterations (improvement 1 + 3)
+            do_check = (iterations % conv_check_interval == 0) or (iterations == max_iter)
+            if do_check:
+                k_l1(
+                    d_pn, d_p, d_partial, np.int32(n),
+                    block=(BLOCK_SIZE, 1, 1),
+                    grid=(n_partial_blocks, 1, 1),
+                    stream=stream_compute,
+                )
+                k_reduce(
+                    d_partial, d_l1_scalar, np.int32(n_partial_blocks),
+                    block=(BLOCK_SIZE, 1, 1),
+                    grid=(1, 1, 1),
+                    stream=stream_compute,
+                )
 
             d_p, d_pn = d_pn, d_p
 
-            if l1 < tolerance:
-                converged = True
-                break
+            if do_check:
+                stream_compute.synchronize()
+                if float(d_l1_scalar.get()[0]) < tolerance:
+                    converged = True
+                    break
 
         scores_np = d_p.get()
         return scores_np, iterations, converged
@@ -1260,30 +959,23 @@ def _rwr_gpu_chunked(
 def rwr_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
     """RWR — GPU-accelerated via custom PyCUDA kernels.
 
-    Optimisations (see module docstring for full list):
-      1. GPU-side scalar reductions for convergence (one sync per iter).
-      2. Hub-row ELLPACK + low-row CSR hybrid (memory coalescing).
-      3. SMEM-cached p for small graphs.
-      4. Optional mixed precision (FP16 weights).
-      5. Multi-stream async overlap.
-      6. Chunked execution for VRAM-bound graphs.
-
-    Returns
-    -------
-    dict — see CLAUDE.md "RWR" result spec.
+    Changes in this version:
+      1.  conv_check_interval default raised to 10 (~90 % fewer syncs).
+      2.  Warp-per-node kernel: 8 nodes per 256-thread block.
+      3.  Persistent working buffers: d_p/d_pn/d_p0/d_partial/d_l1_scalar
+          allocated once per graph size, reused across repeated calls.
+      4.  CUDA-event profiling returned in result["result"]["profiling"]
+          when enable_profiling=True.
 
     Raises
     ------
-    RuntimeError
-        If PyCUDA is unavailable or no CUDA device can be initialised.
-    MemoryError
-        If GPU allocation fails (even after chunked path is attempted).
+    RuntimeError   PyCUDA unavailable or no CUDA device found.
+    MemoryError    GPU allocation fails even after chunked path.
     """
     if not PYCUDA_AVAILABLE:
         raise RuntimeError(
             "PyCUDA is required for rwr_gpu(). "
-            "Install pycuda or use the CPU implementation from "
-            "src/algorithms/cpu/single_threaded/rwr.py via the runner."
+            "Install pycuda or use the CPU implementation."
         )
 
     pushed_ctx = None
@@ -1296,27 +988,30 @@ def rwr_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
     except cuda.LogicError as e:
         raise RuntimeError(f"CUDA initialisation failed: {e}") from e
 
+    # Temporary GPU allocations freed in the finally block.
+    # Cached arrays (GPU CSR, working buffers) are NOT added here.
     d_buffers: list = []
+
     try:
-        # ---- Parameter merging ----------------------------------------
+        # ---- Parameter merging -------------------------------------------
         p = _merge_params(params)
         if _GPU_CONFIG_AVAILABLE:
             p = apply_config("rwr", graph_csr, p) or p
             for k, v in _DEFAULT_PARAMS.items():
                 p.setdefault(k, v)
 
-        restart_prob     = float(p["restart_prob"])
-        max_iter         = int(p["max_iter"])
-        tolerance        = float(p["tolerance"])
-        seed_nodes       = p.get("seed_nodes") or []
-        network_type     = str(p.get("network_type", "grn"))
-        block_size       = int(p.get("block_size", BLOCK_SIZE))
+        restart_prob        = float(p["restart_prob"])
+        max_iter            = int(p["max_iter"])
+        tolerance           = float(p["tolerance"])
+        seed_nodes          = p.get("seed_nodes") or []
+        network_type        = str(p.get("network_type", "grn"))
+        block_size          = int(p.get("block_size", BLOCK_SIZE))
         if block_size <= 0 or block_size > 1024:
             block_size = BLOCK_SIZE
-        precision_mode   = str(p.get("precision_mode", "fp32")).lower()
-        ellpack_fraction = float(p.get("ellpack_fraction", 0.05))
-        use_chunking_req = bool(p.get("use_chunking", False))
-        reorder_nodes    = bool(p.get("reorder_nodes", False))
+        precision_mode      = str(p.get("precision_mode", "fp32")).lower()
+        use_chunking_req    = bool(p.get("use_chunking", False))
+        conv_check_interval = max(1, int(p.get("conv_check_interval", 10)))
+        enable_profiling    = bool(p.get("enable_profiling", False))
 
         n = int(graph_csr.shape[0])
         if n == 0:
@@ -1325,7 +1020,7 @@ def rwr_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
         one_minus_r = np.float32(1.0 - restart_prob)
         r_val       = np.float32(restart_prob)
 
-        # ---- Detect batched input -------------------------------------
+        # ---- Detect batched input ----------------------------------------
         if (len(seed_nodes) > 0
                 and isinstance(seed_nodes[0], (list, tuple, np.ndarray))):
             seed_sets = [list(s) for s in seed_nodes]
@@ -1333,40 +1028,29 @@ def rwr_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
             seed_sets = [list(seed_nodes)]
         batch_size = len(seed_sets)
 
-        # ---- Build transition matrix ----------------------------------
-        W, transition_note = _build_transition_matrix(graph_csr, network_type)
+        # ---- Transition matrix (CPU cache) -------------------------------
+        W, transition_note = _get_cached_W(graph_csr, network_type)
 
-        # ---- Optional node reordering ---------------------------------
-        perm = None
-        if reorder_nodes:
-            W, perm = _reorder_nodes_by_degree(W)
-            inv_perm = np.argsort(perm).astype(np.int32)
-            seed_sets = [
-                [int(inv_perm[int(s)]) for s in sset if 0 <= int(s) < n]
-                for sset in seed_sets
-            ]
-
-        # ---- Build p₀ vectors -----------------------------------------
+        # ---- p₀ vectors --------------------------------------------------
         p0_list = [_build_p0(sset, n, network_type) for sset in seed_sets]
 
         fp16_weights = (precision_mode == "mixed")
 
-        # ---- VRAM estimate + chunked dispatch decision ----------------
+        # ---- VRAM check + chunking decision ------------------------------
         est_bytes = _estimate_rwr_vram(
             n=n, nnz=int(W.nnz), batch_size=batch_size,
             fp16_weights=fp16_weights,
         )
         try:
-            free_bytes, _total = cuda.mem_get_info()
-        except Exception:                                   # noqa: BLE001
+            free_bytes, _ = cuda.mem_get_info()
+        except Exception:                               # noqa: BLE001
             free_bytes = 1 << 30
 
         use_chunking = use_chunking_req or (est_bytes > VRAM_BUDGET_FRACTION * free_bytes)
-        # Batched + chunked is not supported in this pass — fall back to regular.
         if batch_size > 1 and use_chunking:
             logging.info(
-                "rwr_gpu: chunked + batched is not implemented; running "
-                "batched path on the full graph (may OOM)."
+                "rwr_gpu: chunked + batched not implemented; "
+                "running batched path on full graph (may OOM)."
             )
             use_chunking = False
 
@@ -1374,355 +1058,350 @@ def rwr_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
             raise MemoryError(
                 f"RWR GPU needs ~{est_bytes/1e6:.1f} MB but only "
                 f"{free_bytes/1e6:.1f} MB free.  Try use_chunking=True "
-                f"or precision_mode='mixed', or use a higher-VRAM device."
+                f"or precision_mode='mixed'."
             )
 
-        kernels = _get_kernels()
-
-        # ---- Streams + timing -----------------------------------------
+        kernels         = _get_kernels()
         stream_compute  = cuda.Stream()
         stream_transfer = cuda.Stream()
         start_event     = cuda.Event()
         end_event       = cuda.Event()
-        # MEMORY_FIX (timing audit): start_event is recorded later, after
-        # H2D + chunk-buffer setup, immediately before each iteration loop.
-        # See start_event.record() calls below for each execution path.
 
-        # ---- Chunked path -------------------------------------------------
+        # Warp-per-node grid dimension
+        n_spmv_blocks = (n + NODES_PER_BLOCK - 1) // NODES_PER_BLOCK
+        n_partial_blocks = max(1, (n + BLOCK_SIZE - 1) // BLOCK_SIZE)
+
+        # ---- Chunked path ------------------------------------------------
         if use_chunking and batch_size == 1:
-            # Pick chunk size from free VRAM
-            available = max(1, int(free_bytes * 0.6))
-            avg_nnz = max(1.0, W.nnz / n)
+            avg_nnz        = max(1.0, W.nnz / n)
             bytes_per_node = int((1 + 2 * avg_nnz) * 4)
-            chunk_size = max(1, min(n, available // max(bytes_per_node, 1)))
+            chunk_size     = max(1, min(n, int(free_bytes * 0.6) // max(bytes_per_node, 1)))
 
-            # MEMORY_FIX (timing audit): record start right before the
-            # chunked iteration so the H2D ramp-up is excluded.  The chunked
-            # path uploads chunks lazily inside the inner loop, which is
-            # genuine algorithm work and stays inside the timed region.
             start_event.record(stream_compute)
-            scores_np, iterations, converged = _rwr_gpu_chunked(
+            scores_np, iters, converged = _rwr_gpu_chunked(
                 W=W, p0_np=p0_list[0],
                 one_minus_r=float(one_minus_r), r_val=float(r_val),
                 max_iter=max_iter, tolerance=tolerance,
+                conv_check_interval=conv_check_interval,
                 kernels=kernels,
                 stream_compute=stream_compute,
                 stream_transfer=stream_transfer,
                 chunk_size=chunk_size,
             )
-
             end_event.record(stream_compute)
             end_event.synchronize()
             elapsed = start_event.time_till(end_event) / 1000.0
 
-            if perm is not None:
-                remap = np.zeros_like(scores_np)
-                remap[perm] = scores_np
-                scores_np = remap
-
-            all_scores = [{
-                "seed_set":   seed_sets[0],
-                "scores":     scores_np,
-                "iterations": iterations,
-                "converged":  converged,
-            }]
             return _finalize_result(
-                all_scores=all_scores,
-                n=n,
-                seed_sets=seed_sets,
-                network_type=network_type,
-                graph_csr=graph_csr,
-                elapsed=elapsed,
+                all_scores=[{"seed_set": seed_sets[0], "scores": scores_np,
+                             "iterations": iters, "converged": converged}],
+                n=n, seed_sets=seed_sets, network_type=network_type,
+                graph_csr=graph_csr, elapsed=elapsed,
                 transition_note=transition_note,
-                perm=perm,
                 arch_flag=kernels.get("_arch_flag", "?"),
-                precision_mode=precision_mode,
-                num_hubs=0,
-                chunked=True,
+                precision_mode=precision_mode, chunked=True,
+                profiling_data=None,
             )
 
-        # ---- Build hub ELLPACK / CSR split ---------------------------
-        row_lens = np.diff(W.indptr).astype(np.int32)
-        if ellpack_fraction > 0.0:
-            hub_threshold = _compute_adaptive_hub_threshold(
-                row_lens, target_ellpack_fraction=ellpack_fraction,
-            )
-            ellpack, low_csr = _build_ellpack_split(W, hub_threshold)
+        # ---- Prepare GPU CSR arrays (use device cache if available) ------
+        gpu_cache_key = (id(graph_csr), graph_csr.shape,
+                         int(graph_csr.nnz), network_type, precision_mode)
+
+        if _GPU_CSR_CACHE.matches(gpu_cache_key):
+            d_row_ptr  = _GPU_CSR_CACHE.d_row_ptr
+            d_col_idx  = _GPU_CSR_CACHE.d_col_idx
+            d_w_values = _GPU_CSR_CACHE.d_w_values
         else:
-            hub_threshold = 0
-            ellpack = {
-                "hub_ids":      np.empty((0,), np.int32),
-                "hub_col_idx":  np.empty((0,), np.int32),
-                "hub_w_values": np.empty((0,), np.float32),
-                "max_row_len":  0,
-                "num_hubs":     0,
-            }
-            low_csr = {
-                "row_ptr": W.indptr.astype(np.int32),
-                "col_idx": W.indices.astype(np.int32),
-                "values":  W.data.astype(np.float32),
-                "n":       n,
-            }
-        num_hubs = ellpack["num_hubs"]
-
-        def _to_gpu_async(arr: np.ndarray):
-            ga = gpuarray.to_gpu_async(arr, stream=stream_transfer)
-            d_buffers.append(ga)
-            return ga
-
-        def _empty(shape, dtype):
-            ga = gpuarray.empty(shape, dtype=dtype)
-            d_buffers.append(ga)
-            return ga
-
-        # ---- Upload CSR (low rows) -----------------------------------
-        h_row_ptr = np.ascontiguousarray(low_csr["row_ptr"], dtype=np.int32)
-        h_col_idx = np.ascontiguousarray(low_csr["col_idx"], dtype=np.int32)
-        if fp16_weights:
-            h_w_values = np.ascontiguousarray(
-                _fp32_to_fp16_bits(low_csr["values"].astype(np.float32)),
-                dtype=np.uint16,
+            _GPU_CSR_CACHE.invalidate()          # free old (context active)
+            h_row_ptr = np.ascontiguousarray(W.indptr,  dtype=np.int32)
+            h_col_idx = np.ascontiguousarray(W.indices, dtype=np.int32)
+            h_w_values = (
+                np.ascontiguousarray(
+                    _fp32_to_fp16_bits(W.data.astype(np.float32)), dtype=np.uint16)
+                if fp16_weights
+                else np.ascontiguousarray(W.data, dtype=np.float32)
             )
-        else:
-            h_w_values = np.ascontiguousarray(low_csr["values"], dtype=np.float32)
+            d_row_ptr  = gpuarray.to_gpu_async(h_row_ptr,  stream=stream_transfer)
+            d_col_idx  = gpuarray.to_gpu_async(h_col_idx,  stream=stream_transfer)
+            d_w_values = gpuarray.to_gpu_async(h_w_values, stream=stream_transfer)
+            _GPU_CSR_CACHE.store(gpu_cache_key, d_row_ptr, d_col_idx, d_w_values)
 
-        d_row_ptr = _to_gpu_async(h_row_ptr)
-        d_col_idx = _to_gpu_async(h_col_idx)
-        d_w_values = _to_gpu_async(h_w_values)
+        # ---- Select SpMV kernel ------------------------------------------
+        k_spmv   = kernels["spmv_restart_fp16w"] if fp16_weights else kernels["spmv_restart"]
+        k_l1     = kernels["l1_conv"]
+        k_reduce = kernels["reduce_scalar"]
 
-        # ---- Upload ELLPACK hubs (if any) ----------------------------
-        d_hub_ids = d_hub_col = d_hub_w = None
-        if num_hubs > 0:
-            h_hub_ids = np.ascontiguousarray(ellpack["hub_ids"], dtype=np.int32)
-            h_hub_col = np.ascontiguousarray(ellpack["hub_col_idx"], dtype=np.int32)
-            # ELLPACK weights remain FP32 (small fraction of total bytes,
-            # FP16 conversion adds complexity for marginal gain here).
-            h_hub_w   = np.ascontiguousarray(ellpack["hub_w_values"], dtype=np.float32)
-            d_hub_ids = _to_gpu_async(h_hub_ids)
-            d_hub_col = _to_gpu_async(h_hub_col)
-            d_hub_w   = _to_gpu_async(h_hub_w)
-
-        n_partial_blocks = max(1, (n + BLOCK_SIZE - 1) // BLOCK_SIZE)
-        d_partial   = _empty((n_partial_blocks,), np.float32)
-        d_l1_scalar = _empty((1,), np.float32)
-
-        # ---- Choose execution path -----------------------------------
         use_batched = (1 < batch_size <= MAX_BATCH)
-        use_smem_p  = (
-            n <= SMEM_P_LIMIT
-            and not use_batched
-            and num_hubs == 0
-            and not fp16_weights
-        )
-
         all_scores: list[dict] = []
 
+        # ==================================================================
+        # BATCHED PATH  (B <= MAX_BATCH, no working buffer cache)
+        # ==================================================================
         if use_batched:
-            # ---------- Batched path (FP32 only, no ELLPACK / SMEM cache) ----
             p0_matrix = np.column_stack(p0_list).astype(np.float32)
             h_p0_flat = np.ascontiguousarray(p0_matrix.reshape(-1), np.float32)
 
-            d_p0  = _to_gpu_async(h_p0_flat)
-            d_p   = _to_gpu_async(h_p0_flat.copy())
-            d_pn  = _empty((n * batch_size,), np.float32)
+            def _tmp(arr=None, shape=None, dtype=np.float32):
+                ga = (gpuarray.to_gpu_async(arr, stream=stream_transfer)
+                      if arr is not None else gpuarray.empty(shape, dtype))
+                d_buffers.append(ga)
+                return ga
 
-            n_partial_batched = max(
-                1, (n * batch_size + BLOCK_SIZE - 1) // BLOCK_SIZE,
-            )
-            d_partial_b   = _empty((n_partial_batched,), np.float32)
-            d_l1_scalar_b = _empty((1,), np.float32)
+            d_p0 = _tmp(arr=h_p0_flat)
+            d_p  = _tmp(arr=h_p0_flat.copy())
+            d_pn = _tmp(shape=(n * batch_size,))
+
+            nB               = n * batch_size
+            n_partial_batched = max(1, (nB + BLOCK_SIZE - 1) // BLOCK_SIZE)
+            d_partial_b   = _tmp(shape=(n_partial_batched,))
+            d_l1_scalar_b = _tmp(shape=(1,))
+            k_batched     = kernels["spmv_restart_batched"]
+            n_batched_blocks = (n + NODES_PER_BLOCK - 1) // NODES_PER_BLOCK
+
+            # Profiling setup for batched path
+            b_spmv_evts: list = []
+            b_conv_evts: list = []
 
             stream_transfer.synchronize()
-
-            k_batched = kernels["spmv_restart_batched"]
-            k_l1      = kernels["l1_conv"]
-            k_reduce  = kernels["reduce_scalar"]
+            start_event.record(stream_compute)
 
             converged  = False
             iterations = 0
-            # MEMORY_FIX (timing audit): time only the iteration loop.
-            start_event.record(stream_compute)
             for it in range(max_iter):
                 iterations = it + 1
+
+                if enable_profiling:
+                    _es = cuda.Event(); _es.record(stream_compute)
+
                 k_batched(
                     d_row_ptr, d_col_idx, d_w_values,
                     d_p, d_p0, d_pn,
                     one_minus_r, r_val,
                     np.int32(n), np.int32(batch_size),
                     block=(BLOCK_SIZE, 1, 1),
-                    grid=(n, batch_size, 1),
+                    grid=(n_batched_blocks, batch_size, 1),
                     stream=stream_compute,
                 )
-                k_l1(
-                    d_pn, d_p, d_partial_b, np.int32(n * batch_size),
-                    block=(BLOCK_SIZE, 1, 1),
-                    grid=(n_partial_batched, 1, 1),
-                    stream=stream_compute,
-                )
-                k_reduce(
-                    d_partial_b, d_l1_scalar_b, np.int32(n_partial_batched),
-                    block=(BLOCK_SIZE, 1, 1),
-                    grid=(1, 1, 1),
-                    stream=stream_compute,
-                )
-                stream_compute.synchronize()                 # ONE sync
-                l1_total = float(d_l1_scalar_b.get()[0])
 
-                d_p, d_pn = d_pn, d_p
+                if enable_profiling:
+                    _ee = cuda.Event(); _ee.record(stream_compute)
+                    b_spmv_evts.append((_es, _ee))
 
-                if l1_total < tolerance * batch_size:
-                    converged = True
-                    break
+                do_check = (iterations % conv_check_interval == 0) or (iterations == max_iter)
+                if do_check:
+                    if enable_profiling:
+                        _cs = cuda.Event(); _cs.record(stream_compute)
 
-            p_final = d_p.get().reshape(n, batch_size)
-            for b in range(batch_size):
-                scores_b = p_final[:, b].copy()
-                if perm is not None:
-                    remap = np.zeros_like(scores_b)
-                    remap[perm] = scores_b
-                    scores_b = remap
-                all_scores.append({
-                    "seed_set":   seed_sets[b],
-                    "scores":     scores_b,
-                    "iterations": iterations,
-                    "converged":  converged,
-                })
-
-        else:
-            # ---------- Serial-per-seed-set path -------------------------
-            k_l1     = kernels["l1_conv"]
-            k_reduce = kernels["reduce_scalar"]
-            k_ell    = kernels["spmv_ellpack_hubs"] if num_hubs > 0 else None
-
-            if fp16_weights:
-                k_spmv = kernels["spmv_restart_fp16w"]
-            elif use_smem_p:
-                k_spmv = kernels["spmv_smem_p"]
-            else:
-                k_spmv = kernels["spmv_restart"]
-
-            stream_transfer.synchronize()
-            # MEMORY_FIX (timing audit): time only the algorithm iteration
-            # work; the per-seed-set d_p0/d_p upload is still inside the
-            # timed region because each seed set is independent algorithm
-            # work in a multi-seed-set run.
-            start_event.record(stream_compute)
-
-            for b_idx, (sset, p0_np) in enumerate(zip(seed_sets, p0_list)):
-                h_p0 = np.ascontiguousarray(p0_np, np.float32)
-
-                d_p0 = _to_gpu_async(h_p0)
-                d_p  = _to_gpu_async(h_p0.copy())
-                d_pn = _empty((n,), np.float32)
-                stream_transfer.synchronize()
-
-                converged  = False
-                iterations = 0
-                smem_p_bytes = (n * 4) if use_smem_p else 0
-
-                for it in range(max_iter):
-                    iterations = it + 1
-
-                    # ---- Low-CSR rows (or SMEM-cached, or FP16) ----
-                    if use_smem_p:
-                        k_spmv(
-                            d_row_ptr, d_col_idx, d_w_values,
-                            d_p, d_p0, d_pn,
-                            one_minus_r, r_val, np.int32(n),
-                            block=(BLOCK_SIZE, 1, 1),
-                            grid=(n, 1, 1),
-                            shared=smem_p_bytes,
-                            stream=stream_compute,
-                        )
-                    else:
-                        k_spmv(
-                            d_row_ptr, d_col_idx, d_w_values,
-                            d_p, d_p0, d_pn,
-                            one_minus_r, r_val, np.int32(n),
-                            block=(BLOCK_SIZE, 1, 1),
-                            grid=(n, 1, 1),
-                            stream=stream_compute,
-                        )
-
-                    # ---- Hub-row ELLPACK (overrides p_new for hubs) ----
-                    if k_ell is not None and num_hubs > 0:
-                        k_ell(
-                            d_hub_ids, d_hub_col, d_hub_w,
-                            np.int32(ellpack["max_row_len"]),
-                            d_p, d_p0, d_pn,
-                            one_minus_r, r_val,
-                            np.int32(num_hubs),
-                            block=(BLOCK_SIZE, 1, 1),
-                            grid=(num_hubs, 1, 1),
-                            stream=stream_compute,
-                        )
-
-                    # ---- Convergence (GPU-side scalar reduction) ----
                     k_l1(
-                        d_pn, d_p, d_partial, np.int32(n),
+                        d_pn, d_p, d_partial_b, np.int32(nB),
                         block=(BLOCK_SIZE, 1, 1),
-                        grid=(n_partial_blocks, 1, 1),
+                        grid=(n_partial_batched, 1, 1),
                         stream=stream_compute,
                     )
                     k_reduce(
-                        d_partial, d_l1_scalar, np.int32(n_partial_blocks),
+                        d_partial_b, d_l1_scalar_b, np.int32(n_partial_batched),
                         block=(BLOCK_SIZE, 1, 1),
                         grid=(1, 1, 1),
                         stream=stream_compute,
                     )
 
-                    stream_compute.synchronize()                 # ONE sync
-                    l1 = float(d_l1_scalar.get()[0])
+                    if enable_profiling:
+                        _ce = cuda.Event(); _ce.record(stream_compute)
+                        b_conv_evts.append((_cs, _ce))
 
-                    d_p, d_pn = d_pn, d_p
+                d_p, d_pn = d_pn, d_p
 
-                    if l1 < tolerance:
+                if do_check:
+                    stream_compute.synchronize()
+                    if float(d_l1_scalar_b.get()[0]) < tolerance * batch_size:
                         converged = True
                         break
 
-                scores_b = d_p.get()
-                if perm is not None:
-                    remap = np.zeros_like(scores_b)
-                    remap[perm] = scores_b
-                    scores_b = remap
-
+            p_final = d_p.get().reshape(n, batch_size)
+            for b in range(batch_size):
                 all_scores.append({
-                    "seed_set":   sset,
-                    "scores":     scores_b,
+                    "seed_set":   seed_sets[b],
+                    "scores":     p_final[:, b].copy(),
                     "iterations": iterations,
                     "converged":  converged,
                 })
 
-                for arr in (d_p0, d_p, d_pn):
-                    try:
-                        arr.gpudata.free()
-                    except Exception:                       # noqa: BLE001
-                        pass
-                    # MEMORY_FIX: identity-based removal — PyCUDA gpuarrays
-                    # override __eq__ to do elementwise compare, which
-                    # raises NotImplementedError on shape mismatch when
-                    # ``arr in d_buffers`` is evaluated.
-                    for idx in range(len(d_buffers) - 1, -1, -1):
-                        if d_buffers[idx] is arr:
-                            d_buffers.pop(idx)
+            end_event.record(stream_compute)
+            end_event.synchronize()
+            elapsed = start_event.time_till(end_event) / 1000.0
+
+            prof = None
+            if enable_profiling:
+                spmv_ms = sum(s.time_till(e) for s, e in b_spmv_evts)
+                conv_ms = sum(s.time_till(e) for s, e in b_conv_evts)
+                total_ms = elapsed * 1000.0
+                prof = {
+                    "spmv_ms":              round(spmv_ms, 4),
+                    "convergence_ms":       round(conv_ms, 4),
+                    "transfer_ms":          0.0,  # CSR upload excluded from timed region
+                    "total_ms":             round(total_ms, 4),
+                    "overhead_ms":          round(total_ms - spmv_ms - conv_ms, 4),
+                    "iterations":           iterations,
+                    "convergence_checks":   len(b_conv_evts),
+                    "avg_spmv_ms_per_iter": round(spmv_ms / max(1, iterations), 4),
+                    "avg_conv_ms_per_check": round(conv_ms / max(1, len(b_conv_evts)), 4),
+                }
+
+            return _finalize_result(
+                all_scores=all_scores, n=n, seed_sets=seed_sets,
+                network_type=network_type, graph_csr=graph_csr,
+                elapsed=elapsed, transition_note=transition_note,
+                arch_flag=kernels.get("_arch_flag", "?"),
+                precision_mode=precision_mode, chunked=False,
+                profiling_data=prof,
+            )
+
+        # ==================================================================
+        # SERIAL PER-SEED-SET PATH  (uses persistent working buffer cache)
+        # ==================================================================
+
+        # Ensure working buffers are allocated for this n (no-op if already done)
+        _GPU_WORKING_BUFFERS.ensure(n)
+        wbuf = _GPU_WORKING_BUFFERS
+
+        # Accumulated profiling across all seed sets
+        prof_spmv_ms  = 0.0
+        prof_conv_ms  = 0.0
+        prof_xfer_ms  = 0.0
+        prof_conv_checks = 0
+
+        stream_transfer.synchronize()   # ensure CSR upload is done before timing
+        start_event.record(stream_compute)
+
+        for b_idx, (sset, p0_np) in enumerate(zip(seed_sets, p0_list)):
+            h_p0 = np.ascontiguousarray(p0_np, np.float32)
+
+            # ---- H2D transfer timing (improvement 5) --------------------
+            if enable_profiling:
+                ev_xfer_s = cuda.Event()
+                ev_xfer_e = cuda.Event()
+                ev_xfer_s.record(stream_transfer)
+
+            # Re-initialise persistent buffers with this seed set's p0.
+            # d_pn is a scratch buffer; it will be fully overwritten by the
+            # first SpMV so no zeroing is needed.
+            cuda.memcpy_htod_async(wbuf.d_p.gpudata,  h_p0, stream_transfer)
+            cuda.memcpy_htod_async(wbuf.d_p0.gpudata, h_p0, stream_transfer)
+
+            if enable_profiling:
+                ev_xfer_e.record(stream_transfer)
+
+            stream_transfer.synchronize()
+
+            if enable_profiling:
+                prof_xfer_ms += ev_xfer_s.time_till(ev_xfer_e)
+
+            # Local aliases for pointer swap (wbuf attrs are stable)
+            d_p  = wbuf.d_p
+            d_pn = wbuf.d_pn
+            d_p0 = wbuf.d_p0
+
+            converged  = False
+            iterations = 0
+            it_spmv_evts: list = []
+            it_conv_evts: list = []
+
+            # ---- Iteration loop -----------------------------------------
+            for it in range(max_iter):
+                iterations = it + 1
+
+                if enable_profiling:
+                    _es = cuda.Event(); _es.record(stream_compute)
+
+                # Warp-per-node SpMV (improvement 4)
+                k_spmv(
+                    d_row_ptr, d_col_idx, d_w_values,
+                    d_p, d_p0, d_pn,
+                    one_minus_r, r_val, np.int32(n),
+                    block=(BLOCK_SIZE, 1, 1),
+                    grid=(n_spmv_blocks, 1, 1),
+                    stream=stream_compute,
+                )
+
+                if enable_profiling:
+                    _ee = cuda.Event(); _ee.record(stream_compute)
+                    it_spmv_evts.append((_es, _ee))
+
+                # Convergence check every N iters (improvement 1)
+                do_check = (iterations % conv_check_interval == 0) or (iterations == max_iter)
+                if do_check:
+                    if enable_profiling:
+                        _cs = cuda.Event(); _cs.record(stream_compute)
+
+                    k_l1(
+                        d_pn, d_p, wbuf.d_partial, np.int32(n),
+                        block=(BLOCK_SIZE, 1, 1),
+                        grid=(n_partial_blocks, 1, 1),
+                        stream=stream_compute,
+                    )
+                    k_reduce(
+                        wbuf.d_partial, wbuf.d_l1_scalar, np.int32(n_partial_blocks),
+                        block=(BLOCK_SIZE, 1, 1),
+                        grid=(1, 1, 1),
+                        stream=stream_compute,
+                    )
+
+                    if enable_profiling:
+                        _ce = cuda.Event(); _ce.record(stream_compute)
+                        it_conv_evts.append((_cs, _ce))
+
+                # Pointer swap (no GPU work, just Python references)
+                d_p, d_pn = d_pn, d_p
+
+                if do_check:
+                    stream_compute.synchronize()          # ONE sync per check
+                    if float(wbuf.d_l1_scalar.get()[0]) < tolerance:
+                        converged = True
+                        break
+
+            # ---- Collect per-seed-set profiling -------------------------
+            if enable_profiling:
+                prof_spmv_ms   += sum(s.time_till(e) for s, e in it_spmv_evts)
+                prof_conv_ms   += sum(s.time_till(e) for s, e in it_conv_evts)
+                prof_conv_checks += len(it_conv_evts)
+
+            scores_b = d_p.get()
+            all_scores.append({
+                "seed_set":   sset,
+                "scores":     scores_b,
+                "iterations": iterations,
+                "converged":  converged,
+            })
 
         end_event.record(stream_compute)
         end_event.synchronize()
         elapsed = start_event.time_till(end_event) / 1000.0
 
+        prof = None
+        if enable_profiling:
+            total_ms = elapsed * 1000.0
+            prof = {
+                "spmv_ms":               round(prof_spmv_ms, 4),
+                "convergence_ms":        round(prof_conv_ms, 4),
+                "transfer_ms":           round(prof_xfer_ms, 4),
+                "total_ms":              round(total_ms, 4),
+                "overhead_ms":           round(total_ms - prof_spmv_ms
+                                               - prof_conv_ms - prof_xfer_ms, 4),
+                "iterations":            sum(s["iterations"] for s in all_scores),
+                "convergence_checks":    prof_conv_checks,
+                "avg_spmv_ms_per_iter":  round(
+                    prof_spmv_ms / max(1, sum(s["iterations"] for s in all_scores)), 4),
+                "avg_conv_ms_per_check": round(
+                    prof_conv_ms / max(1, prof_conv_checks), 4),
+            }
+
         return _finalize_result(
-            all_scores=all_scores,
-            n=n,
-            seed_sets=seed_sets,
-            network_type=network_type,
-            graph_csr=graph_csr,
-            elapsed=elapsed,
-            transition_note=transition_note,
-            perm=perm,
+            all_scores=all_scores, n=n, seed_sets=seed_sets,
+            network_type=network_type, graph_csr=graph_csr,
+            elapsed=elapsed, transition_note=transition_note,
             arch_flag=kernels.get("_arch_flag", "?"),
-            precision_mode=precision_mode,
-            num_hubs=num_hubs,
-            chunked=False,
+            precision_mode=precision_mode, chunked=False,
+            profiling_data=prof,
         )
 
     except cuda.LogicError as e:
@@ -1731,24 +1410,24 @@ def rwr_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
     except MemoryError:
         logging.warning(
             "VRAM exhausted in rwr_gpu.  Retry with use_chunking=True "
-            "or precision_mode='mixed', or use a higher-VRAM device."
+            "or precision_mode='mixed'."
         )
         raise
     finally:
         for arr in d_buffers:
             try:
                 arr.gpudata.free()
-            except Exception:                               # noqa: BLE001
+            except Exception:                           # noqa: BLE001
                 pass
         if pushed_ctx is not None:
             try:
                 pushed_ctx.pop()
-            except Exception:                               # noqa: BLE001
+            except Exception:                           # noqa: BLE001
                 pass
 
 
 # ---------------------------------------------------------------------------
-# Result aggregation (shared between regular and chunked paths)
+# Result aggregation
 # ---------------------------------------------------------------------------
 
 def _finalize_result(
@@ -1760,11 +1439,10 @@ def _finalize_result(
     graph_csr: sp.csr_matrix,
     elapsed: float,
     transition_note: str,
-    perm: np.ndarray | None,
     arch_flag: str,
     precision_mode: str,
-    num_hubs: int,
     chunked: bool,
+    profiling_data: dict | None = None,
 ) -> dict:
     """Build the final result dict (matches the CLAUDE.md RWR spec)."""
     if len(all_scores) == 1:
@@ -1773,18 +1451,15 @@ def _finalize_result(
         any_converged    = bool(all_scores[0]["converged"])
         batch_results    = None
     else:
-        score_matrix = np.array([s["scores"] for s in all_scores],
-                                dtype=np.float64)
+        score_matrix     = np.array([s["scores"] for s in all_scores], dtype=np.float64)
         primary_scores   = score_matrix.mean(axis=0).astype(np.float32)
         total_iterations = int(max(s["iterations"] for s in all_scores))
         any_converged    = bool(all(s["converged"] for s in all_scores))
         batch_results    = [
-            {
-                "seed_set":   list(s["seed_set"]),
-                "scores":     [float(x) for x in s["scores"]],
-                "iterations": int(s["iterations"]),
-                "converged":  bool(s["converged"]),
-            }
+            {"seed_set": list(s["seed_set"]),
+             "scores":   [float(x) for x in s["scores"]],
+             "iterations": int(s["iterations"]),
+             "converged":  bool(s["converged"])}
             for s in all_scores
         ]
 
@@ -1794,8 +1469,6 @@ def _finalize_result(
                 if 0 <= int(idx) < n}),
         dtype=np.int32,
     )
-    if perm is not None and all_seed_indices.size > 0:
-        all_seed_indices = perm[all_seed_indices]
     if all_seed_indices.size > 0:
         top_seeds = _top_k_among(primary_scores, all_seed_indices, _TOP_SEEDS)
     else:
@@ -1803,11 +1476,9 @@ def _finalize_result(
 
     note = (
         f"{transition_note}. "
-        f"GPU pipeline: hub_ellpack_count={num_hubs}, "
-        f"precision={precision_mode}, "
-        f"chunked={chunked}, "
-        f"arch={arch_flag}, "
-        f"syncs_per_iter=1."
+        f"GPU pipeline: warp_per_node, precision={precision_mode}, "
+        f"chunked={chunked}, arch={arch_flag}, "
+        f"syncs_per_check=1 (check every N iters)."
     )
 
     inner: dict = {
@@ -1820,6 +1491,8 @@ def _finalize_result(
     }
     if batch_results is not None:
         inner["batch_results"] = batch_results
+    if profiling_data is not None:
+        inner["profiling"] = profiling_data
 
     return {
         "algorithm":      "rwr",
@@ -1833,14 +1506,150 @@ def _finalize_result(
 
 
 # ---------------------------------------------------------------------------
+# FP32 vs Mixed-Precision benchmark utility — improvement 2
+# ---------------------------------------------------------------------------
+
+def benchmark_precision_modes(
+    graph_csr: sp.csr_matrix,
+    params: dict | None = None,
+    num_warmup: int = 2,
+    num_runs: int = 5,
+) -> dict:
+    """Compare FP32 and mixed-precision (FP16 weights) on the given graph.
+
+    Methodology
+    -----------
+    1.  Run each mode `num_warmup` times to populate all caches (W, GPU CSR,
+        working buffers, kernel compilation).
+    2.  Run each mode `num_runs` times; use execution_time from each result
+        (CUDA-event timing already excludes context setup and CSR upload).
+    3.  Report mean / std / min / max times, speedup ratio, top-node overlap,
+        and a plain-English recommendation.
+
+    Important: the function does NOT automatically switch the active
+    precision mode.  It only benchmarks and reports.
+
+    Parameters
+    ----------
+    graph_csr   : scipy CSR matrix to benchmark on.
+    params      : optional base parameter dict (network_type, seed_nodes, …).
+                  precision_mode is overridden internally for each mode.
+    num_warmup  : warm-up runs per mode (populate all caches).
+    num_runs    : timed runs per mode.
+
+    Returns
+    -------
+    dict with keys:
+        fp32, mixed           — per-mode timing and convergence statistics.
+        speedup_mixed_over_fp32 — fp32_mean / mixed_mean (>1 means mixed faster).
+        recommendation        — plain-English string.
+        numerically_equivalent — True if top-20 nodes overlap >= 90 %.
+        top_nodes_overlap_fraction — exact overlap fraction.
+        num_warmup, num_runs  — benchmark configuration for reproducibility.
+    """
+    if not PYCUDA_AVAILABLE:
+        raise RuntimeError("PyCUDA is required for benchmark_precision_modes().")
+
+    base = _merge_params(params)
+    # Disable nested profiling during the benchmark (would skew timings)
+    base["enable_profiling"] = False
+
+    results: dict[str, dict] = {}
+
+    for mode in ("fp32", "mixed"):
+        mode_params = {**base, "precision_mode": mode}
+
+        # ---- Warm-up (populate all caches) ------------------------------
+        last_result: dict | None = None
+        for _ in range(max(1, num_warmup)):
+            try:
+                last_result = rwr_gpu(graph_csr, mode_params)
+            except Exception as exc:                    # noqa: BLE001
+                results[mode] = {"error": str(exc)}
+                break
+        else:
+            # ---- Timed runs ---------------------------------------------
+            times: list[float] = []
+            iters_list: list[int] = []
+            conv_list: list[bool] = []
+            for _ in range(max(1, num_runs)):
+                try:
+                    r = rwr_gpu(graph_csr, mode_params)
+                    times.append(float(r["execution_time"]) * 1000.0)  # → ms
+                    iters_list.append(int(r["result"]["iterations"]))
+                    conv_list.append(bool(r["result"]["converged"]))
+                    last_result = r
+                except Exception as exc:                # noqa: BLE001
+                    logging.warning("benchmark_precision_modes [%s] run failed: %s",
+                                    mode, exc)
+
+            if times:
+                arr = np.asarray(times, dtype=np.float64)
+                results[mode] = {
+                    "mean_ms":   float(np.mean(arr)),
+                    "std_ms":    float(np.std(arr)),
+                    "min_ms":    float(np.min(arr)),
+                    "max_ms":    float(np.max(arr)),
+                    "iterations": int(round(float(np.median(iters_list)))),
+                    "converged":  bool(all(conv_list)),
+                    "top_nodes":  (last_result["result"]["top_nodes"]
+                                   if last_result is not None else []),
+                    "num_valid_runs": len(times),
+                }
+            else:
+                results[mode] = {"error": "all timed runs failed", "top_nodes": []}
+
+    # ---- Comparison metrics ---------------------------------------------
+    fp32_ok  = "error" not in results.get("fp32",  {"error": True})
+    mixed_ok = "error" not in results.get("mixed", {"error": True})
+
+    if fp32_ok and mixed_ok:
+        fp32_mean  = results["fp32"]["mean_ms"]
+        mixed_mean = results["mixed"]["mean_ms"]
+        speedup    = fp32_mean / mixed_mean if mixed_mean > 0 else 0.0
+
+        fp32_top  = set(results["fp32"].get("top_nodes",  []))
+        mixed_top = set(results["mixed"].get("top_nodes", []))
+        union_sz  = max(1, len(fp32_top | mixed_top))
+        overlap   = len(fp32_top & mixed_top)
+        overlap_frac = overlap / union_sz
+        num_equiv = overlap_frac >= 0.90
+
+        if speedup > 1.10:
+            rec = (f"Use precision_mode='mixed': {speedup:.2f}× faster than FP32 "
+                   f"({mixed_mean:.2f} ms vs {fp32_mean:.2f} ms).")
+        elif speedup < 0.90:
+            rec = (f"Use precision_mode='fp32': mixed-precision is {1/speedup:.2f}× "
+                   f"slower on this graph ({mixed_mean:.2f} ms vs {fp32_mean:.2f} ms).  "
+                   f"FP32 benefits from better DRAM burst alignment at this sparsity.")
+        else:
+            rec = (f"Both modes perform similarly ({fp32_mean:.2f} ms vs "
+                   f"{mixed_mean:.2f} ms, speedup={speedup:.2f}×).  "
+                   f"Prefer precision_mode='fp32' for full numerical accuracy.")
+    else:
+        speedup      = 0.0
+        overlap_frac = 0.0
+        num_equiv    = False
+        rec          = "Could not compare: one or both modes failed."
+
+    return {
+        "fp32":                       results.get("fp32",  {}),
+        "mixed":                      results.get("mixed", {}),
+        "speedup_mixed_over_fp32":    round(speedup, 4),
+        "recommendation":             rec,
+        "numerically_equivalent":     num_equiv,
+        "top_nodes_overlap_fraction": round(overlap_frac, 4),
+        "num_warmup":                 num_warmup,
+        "num_runs":                   num_runs,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Runner interface
 # ---------------------------------------------------------------------------
 
 def _gpu(graph_csr: sp.csr_matrix, params: dict | None = None, **_) -> dict:
-    """Runner entry point — preserves the legacy ``{output, extra_params}``
-    shape required by ``src.benchmarking.benchmark`` and
-    ``src.runner.algorithm_runner``.
-    """
-    p = _merge_params(params)
+    """Runner entry point — returns ``{output, extra_params}`` envelope."""
+    p    = _merge_params(params)
     full = rwr_gpu(graph_csr, p)
     return {"output": full, "extra_params": p}

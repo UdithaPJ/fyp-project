@@ -2,35 +2,41 @@
 src/algorithms/cpu/multi_threaded/pagerank.py
 =============================================
 
-PageRank — multi-process CPU implementation only.
+PageRank — GraphBLAS-backed cpu_multi implementation.
 
-The SpMV step (M @ PR) — the bottleneck in each iteration — is split into
-row-range chunks and dispatched to a ProcessPoolExecutor.  Each worker
-reconstructs a CSR sub-matrix for its rows and performs a local SpMV.
-The partial results are concatenated to form the full output vector.
+The mode string ``cpu_multi`` is preserved for benchmark continuity, but
+the implementation underneath is now SuiteSparse:GraphBLAS via
+``python-graphblas`` — no ProcessPoolExecutor, no pickle IPC, no
+BLAS oversubscription.  See ``_graphblas_utils.py`` for the rationale.
 
-Dangling redistribution and convergence checks remain serial (trivial cost).
+Algorithm
+---------
+Standard power iteration with network-type-aware dangling redistribution.
+The transition matrix ``M`` (column-stochastic) is built via GraphBLAS
+SpGEMM ``D_inv @ A`` then transposed; the per-iteration SpMV uses the
+``plus_times`` semiring through SuiteSparse's parallel SpMV kernel.
 
-Shared helpers imported from src.algorithms.common.helpers:
-    _build_transition_matrix, _split_top_nodes
-
-For the single-threaded variant see:
-    src.algorithms.cpu.single_threaded.pagerank
+For the deterministic single-thread variant see
+``src.algorithms.cpu.single_threaded.pagerank``.
 """
 
 from __future__ import annotations
 
 import warnings
-from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 import scipy.sparse as sp
 
-from src.algorithms.common.helpers import (
-    _build_transition_matrix,
-    _split_top_nodes,
-    _worker_init_no_blas,
+from src.algorithms.common.helpers import _split_top_nodes
+from src.algorithms.cpu.multi_threaded._graphblas_utils import (
+    _configure_threads,
+    _from_scipy,
+    _require_graphblas,
+    _vec_from_np,
+    _vec_to_np,
+    gb,
 )
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -43,32 +49,8 @@ _DEFAULT_PARAMS: dict = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Private helpers
-# ---------------------------------------------------------------------------
-
 def _merge_params(user_params: dict | None) -> dict:
     return {**_DEFAULT_PARAMS, **(user_params or {})}
-
-
-# ---------------------------------------------------------------------------
-# Module-level worker — must be at module scope for ProcessPoolExecutor pickle
-# ---------------------------------------------------------------------------
-
-def _spmv_row_chunk(args: tuple) -> np.ndarray:
-    """
-    ProcessPoolExecutor worker: compute CSR SpMV for a contiguous row range.
-
-    Receives (data, indices, indptr, pr, n_cols) where indptr is re-zeroed
-    to the chunk's local start.  Returns the partial result vector.
-    """
-    data, indices, indptr, pr, n_cols = args
-    n_rows_chunk = len(indptr) - 1
-    M_chunk = sp.csr_matrix(
-        (data, indices, indptr),
-        shape=(n_rows_chunk, n_cols),
-    )
-    return (M_chunk @ pr).astype(np.float64)
 
 
 # ---------------------------------------------------------------------------
@@ -78,16 +60,9 @@ def _spmv_row_chunk(args: tuple) -> np.ndarray:
 def pagerank_cpu_multi(
     graph_csr: sp.csr_matrix,
     params:    dict,
-    n_workers: int = 4,
+    n_workers: int | None = None,
 ) -> dict:
-    """
-    PageRank — multi-process CPU implementation.
-
-    The SpMV step (M @ PR) is split into row-range chunks and dispatched
-    to a ProcessPoolExecutor.  Each worker reconstructs a CSR sub-matrix
-    for its rows and performs a local SpMV; partial results are concatenated.
-
-    Dangling redistribution and convergence checks remain serial.
+    """PageRank using SuiteSparse:GraphBLAS for the SpMV iteration.
 
     Parameters
     ----------
@@ -96,89 +71,98 @@ def pagerank_cpu_multi(
         damping   (float, default 0.85)
         max_iter  (int,   default 100)
         tolerance (float, default 1e-6)
-    n_workers : int — number of parallel worker processes
+        network_type (str) — "grn" | "ppi" | "mirna"
+    n_workers : int | None
+        OpenMP thread count passed to SuiteSparse.  ``None`` uses
+        ``os.cpu_count()``.
 
     Returns
     -------
-    dict with keys: scores, iterations, converged, top_regulators, top_targets
+    dict with keys: scores, iterations, converged, top_regulators,
+                    top_targets, note
     """
-    p        = _merge_params(params)
-    d        = float(p["damping"])
-    max_iter = int(p["max_iter"])
-    tol      = float(p["tolerance"])
+    _require_graphblas()
+    n_threads = _configure_threads(n_workers)
 
-    N = graph_csr.shape[0]
-    M, dangling_mask = _build_transition_matrix(graph_csr)
-    teleport_per_node = (1.0 - d) / N
+    p            = _merge_params(params)
+    d            = float(p["damping"])
+    max_iter     = int(p["max_iter"])
+    tol          = float(p["tolerance"])
+    network_type = str(p.get("network_type", "grn")).lower()
 
-    out_degrees = np.asarray(graph_csr.sum(axis=1)).flatten()
-    active_mask = out_degrees > 0
-    n_active    = int(active_mask.sum())
+    n = int(graph_csr.shape[0])
+    if n == 0:
+        return {
+            "scores": [], "iterations": 0, "converged": True,
+            "top_regulators": [], "top_targets": [],
+            "note": "graphblas SuiteSparse (empty graph)",
+        }
+
+    # ---- Build column-stochastic transition matrix M_T -------------------
+    # M[j, i] = A[i, j] / out_degree(i)
+    # We build (D_inv @ A) which is row-normalised, then transpose.
+    A_gb = _from_scipy(graph_csr, dtype=np.float32)
+    out_deg_gb = A_gb.reduce_rowwise(gb.monoid.plus).new()
+    out_deg = _vec_to_np(out_deg_gb, n, dtype=np.float32, fill=0.0)
+
+    dangling_mask = out_deg == 0
+    active_mask = ~dangling_mask
+    n_active = int(active_mask.sum())
+
+    inv_deg = np.zeros(n, dtype=np.float32)
+    inv_deg[active_mask] = 1.0 / out_deg[active_mask]
+    D_inv = gb.ss.diag(_vec_from_np(inv_deg, dtype=gb.dtypes.FP32))
+    M_T = (D_inv @ A_gb).T.new()
+
+    teleport_per_node = (1.0 - d) / n
+
     if n_active == 0:
         warnings.warn(
-            "Warning: no outgoing-edge nodes found, using uniform dangling redistribution",
-            UserWarning,
-            stacklevel=2,
+            "no outgoing-edge nodes found, using uniform dangling redistribution",
+            UserWarning, stacklevel=2,
         )
+        eligible_mask = np.ones(n, dtype=bool)
+    elif network_type == "ppi":
+        eligible_mask = np.ones(n, dtype=bool)
+    else:  # grn / mirna
+        eligible_mask = active_mask
 
-    # Pre-build chunk argument templates (data/indices/indptr slices of M)
-    chunk_size  = max(1, (N + n_workers - 1) // n_workers)
-    chunk_specs: list[tuple] = []
+    n_eligible = int(eligible_mask.sum())
 
-    for start in range(0, N, chunk_size):
-        end        = min(start + chunk_size, N)
-        ptr_s      = int(M.indptr[start])
-        ptr_e      = int(M.indptr[end])
-        local_indptr = (M.indptr[start:end + 1] - M.indptr[start]).copy()
-        chunk_specs.append((
-            M.data[ptr_s:ptr_e].copy(),
-            M.indices[ptr_s:ptr_e].copy(),
-            local_indptr,
-            None,   # placeholder — PR is filled per-iteration below
-            N,
-        ))
-
-    PR        = np.full(N, 1.0 / N, dtype=np.float64)
+    PR = np.full(n, 1.0 / n, dtype=np.float32)
     converged = False
+    iteration = 0
 
-    # MEMORY_FIX (H-1/H-3): spin up the pool ONCE, with a BLAS-tamed
-    # initializer, and reuse it across every iteration's SpMV.  The old
-    # code recreated a ProcessPoolExecutor inside the loop — 100 iter ×
-    # n_workers spawns dominated benchmark time on Windows (spawn ≈ 1 s).
-    with ProcessPoolExecutor(
-        max_workers=n_workers, initializer=_worker_init_no_blas
-    ) as executor:
-        for iteration in range(1, max_iter + 1):
-            PR_old = PR
+    for iteration in range(1, max_iter + 1):
+        PR_old = PR
 
-            dangling_mass = d * float(PR_old[dangling_mask].sum())
-            dangling_contrib = np.zeros(N, dtype=np.float64)
-            if n_active > 0:
-                dangling_contrib[active_mask] = dangling_mass / n_active
-            else:
-                dangling_contrib[:] = dangling_mass / N
+        # ---- SpMV via SuiteSparse:GraphBLAS -----------------------------
+        PR_gb = _vec_from_np(PR_old, dtype=gb.dtypes.FP32)
+        result_gb = M_T.mxv(PR_gb, gb.semiring.plus_times).new()
+        result = _vec_to_np(result_gb, n, dtype=np.float32, fill=0.0)
 
-            args_list = [
-                (spec[0], spec[1], spec[2], PR_old, spec[4])
-                for spec in chunk_specs
-            ]
+        # ---- Network-type-aware dangling redistribution -----------------
+        dangling_mass = d * float(PR_old[dangling_mask].sum())
+        dangling_contrib = np.zeros(n, dtype=np.float32)
+        if n_eligible > 0:
+            dangling_contrib[eligible_mask] = dangling_mass / n_eligible
+        else:
+            dangling_contrib[:] = dangling_mass / n
 
-            partial_results = list(executor.map(_spmv_row_chunk, args_list))
+        PR = d * result + dangling_contrib + teleport_per_node
 
-            spmv_result = np.concatenate(partial_results)
-            PR = d * spmv_result + dangling_contrib + teleport_per_node
+        if float(np.abs(PR - PR_old).sum()) < tol:
+            converged = True
+            break
 
-            if np.abs(PR - PR_old).sum() < tol:
-                converged = True
-                break
-
-    top_reg, top_tgt = _split_top_nodes(PR, out_degrees)
+    top_reg, top_tgt = _split_top_nodes(PR, out_deg)
     return {
         "scores":         PR.tolist(),
         "iterations":     iteration,
         "converged":      converged,
         "top_regulators": top_reg,
         "top_targets":    top_tgt,
+        "note":           f"graphblas SuiteSparse nthreads={n_threads}",
     }
 
 
@@ -189,12 +173,12 @@ def pagerank_cpu_multi(
 def _cpu_multi(
     graph_csr: sp.csr_matrix,
     params:    dict | None = None,
-    n_workers: int = 4,
+    n_workers: int | None = None,
     **_,
 ) -> dict:
-    """Benchmark runner entry-point for cpu_multi mode."""
+    """Benchmark runner entry-point for cpu_multi mode (now GraphBLAS-backed)."""
     p = _merge_params(params)
     return {
         "output":       pagerank_cpu_multi(graph_csr, p, n_workers=n_workers),
-        "extra_params": {**p, "n_workers": n_workers},
+        "extra_params": {**p, "backend": "graphblas"},
     }
