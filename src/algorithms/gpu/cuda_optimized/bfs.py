@@ -595,9 +595,10 @@ def clear_bfs_graph_cache() -> None:
 
 
 def clear_bfs_caches() -> None:
-    """Free both the working-buffer cache and the resident-graph cache."""
+    """Free the working-buffer cache, resident-graph cache, and event pool."""
     clear_bfs_buffer_cache()
     clear_bfs_graph_cache()
+    clear_bfs_event_pool()
 
 
 # ---------------------------------------------------------------------------
@@ -765,14 +766,39 @@ def _pack_result(
 # Opt 4: CUDA-event profiling accumulator
 # ---------------------------------------------------------------------------
 
+# `cuda.Event()` construction is a real driver call (cuEventCreate) plus
+# Python object allocation — NOT free, and NOT captured by the event's own
+# elapsed-time measurement (which only covers GPU-side execution between two
+# already-existing events).  A profiled BFS run creates 1-2 pairs PER LEVEL;
+# on a graph needing dozens of levels this construction cost alone can swamp
+# the (genuinely tiny) kernel execution time it's trying to measure, making
+# enable_profiling=True wall-clock numbers meaningless as a proxy for the
+# unprofiled algorithm.  Fix: a growable pool of (start, end) Event pairs
+# reused across BOTH levels within one call AND across separate calls
+# (mirrors the buffer/graph cache pattern) — construction cost is paid once
+# on the first run that needs N pairs, never again for runs needing <= N.
+_BFS_EVENT_POOL: list[tuple] = []
+
+
+def clear_bfs_event_pool() -> None:
+    """Drop all pooled profiling Event objects (they free with the context)."""
+    _BFS_EVENT_POOL.clear()
+
+
 class _ProfAccum:
-    """Accumulate CUDA-event wall times (ms) across all BFS levels."""
+    """Accumulate CUDA-event wall times (ms) across all BFS levels.
+
+    Borrows (start, end) Event pairs from ``_BFS_EVENT_POOL`` by index and
+    grows the pool only the first time more concurrently-outstanding pairs
+    are needed than currently exist — so profiling overhead amortises away
+    on repeated calls instead of re-paying Event construction every level.
+    """
 
     __slots__ = (
         "h2d_ms", "push_ms", "pull_ms",
         "w2b_ms", "b2w_ms", "swap_ms",
         "size_dtoh_ms", "cascade_dtoh_ms", "final_d2h_ms",
-        "_evs",
+        "_evs", "_pool_idx",
     )
 
     def __init__(self) -> None:
@@ -786,11 +812,19 @@ class _ProfAccum:
         self.cascade_dtoh_ms = 0.0
         self.final_d2h_ms    = 0.0
         self._evs: list[tuple] = []   # (start_ev, end_ev, field)
+        self._pool_idx = 0
 
     def _pair(self, field: str) -> tuple:
-        """Record a (start, end, field) pair; start is immediately recorded."""
-        s = cuda.Event()
-        e = cuda.Event()
+        """Borrow (or allocate) a (start, end) pair; start is immediately
+        recorded.  Recording is a cheap async enqueue — only construction
+        is expensive, and construction only happens once per pool slot."""
+        if self._pool_idx < len(_BFS_EVENT_POOL):
+            s, e = _BFS_EVENT_POOL[self._pool_idx]
+        else:
+            s = cuda.Event()
+            e = cuda.Event()
+            _BFS_EVENT_POOL.append((s, e))
+        self._pool_idx += 1
         s.record()
         self._evs.append((s, e, field))
         return s, e

@@ -5,27 +5,34 @@ scripts/diagnose_bfs_overhead.py
 Run this on the GPU box (with pycuda + a working CUDA toolchain, and
 ideally python-suitesparse-graphblas for the cpu_multi comparison) to
 diagnose where GPU-optimised BFS time goes relative to CPU GraphBLAS,
-after the Opt-2 fast-path fix in
-``src/algorithms/gpu/cuda_optimized/bfs.py`` (removed a per-level
-synchronous ``memcpy_htod`` + a wasted O(N) bitmap-zero that were
-undermining the "no per-level sync" design).
+after two fixes in ``src/algorithms/gpu/cuda_optimized/bfs.py``:
+
+  * Opt-2 fast-path fix: removed a per-level synchronous ``memcpy_htod``
+    + a wasted O(N) bitmap-zero that were undermining the "no per-level
+    sync" design.
+  * Profiler Event-pool fix: ``enable_profiling=True`` used to allocate
+    two fresh ``cuda.Event()`` objects EVERY level, and Event construction
+    is a real (non-trivial) driver call not captured by the events' own
+    elapsed-time measurement — this could make profiled wall-clock time
+    look 10-40x worse than the actual unprofiled algorithm.  Events are
+    now pooled and reused.
 
 What it does
 ------------
 For each of the three benchmark graph families (barabasi_albert,
-erdos_renyi, watts_strogatz) at a small and a large size:
+erdos_renyi, watts_strogatz) at each requested size:
 
   1. Generates the graph with the SAME generators the scalability
      benchmark uses (avg out-degree ~= 6).
-  2. Runs GPU BFS TWICE with collect_cascade=False, direction_mode=
-     "push_only", cache_graph=True, enable_profiling=True — mirroring
-     the benchmark's warmup + timed run.  The warmup populates the
-     resident-graph cache; the timed run should show h2d_ms ~= 0 and
-     the profiling dict shows exactly where the remaining time goes
-     (push_ms / swap_ms / size_dtoh_ms / final_d2h_ms).
+  2. Runs GPU BFS through TWO phases:
+       Phase A — enable_profiling=False, exactly matching the real
+                 benchmark (src/benchmarking/scalability_benchmark.py).
+                 This is the number to compare against CPU GraphBLAS.
+       Phase B — enable_profiling=True, for the per-kernel breakdown.
+                 Also prints levels_run so we can confirm the no_sync_
+                 levels early-termination logic is firing as designed.
   3. Runs cpu_multi (GraphBLAS) with the matching collect_cascade=False
      for an apples-to-apples wall-clock comparison.
-  4. Prints a summary table.
 
 Usage
 -----
@@ -74,40 +81,68 @@ def _run_gpu(csr: sp.csr_matrix, label: str) -> None:
         _bfs_gpu_optimized, clear_bfs_caches,
     )
 
-    params = {
+    base_params = {
         "source": 0,
         "max_depth": 999,
         "network_type": "ppi",
         "collect_cascade": False,
         "direction_mode": "push_only",
         "cache_graph": True,
-        "enable_profiling": True,
     }
 
-    clear_bfs_caches()  # start clean for this graph
+    print(f"  [GPU optimised] {label}")
 
-    # Warmup — populates the resident-graph cache (symmetrize + H2D paid here)
+    # ---- Phase A: PRODUCTION path (enable_profiling=False) --------------
+    # This matches src/benchmarking/scalability_benchmark.py exactly — no
+    # profiling instrumentation, so no Event()-construction overhead.  This
+    # is the number that should be compared against CPU GraphBLAS.
+    clear_bfs_caches()
+    params_prod = {**base_params, "enable_profiling": False}
+
     t0 = time.perf_counter()
-    warm = _bfs_gpu_optimized(csr, params)
+    warm = _bfs_gpu_optimized(csr, params_prod)
     t_warm = time.perf_counter() - t0
 
-    # Timed — should hit the resident-graph cache (h2d_ms ~= 0)
     t0 = time.perf_counter()
-    timed = _bfs_gpu_optimized(csr, params)
+    timed = _bfs_gpu_optimized(csr, params_prod)
     t_timed = time.perf_counter() - t0
 
-    print(f"  [GPU optimised] {label}")
-    print(f"    warmup : {t_warm*1000:8.2f} ms  "
+    n_levels = len(timed.get("traversal_modes", []))
+    print(f"    [production, no profiling]")
+    print(f"      warmup : {t_warm*1000:8.2f} ms  "
           f"(num_reachable={warm['num_reachable']})")
-    print(f"    timed  : {t_timed*1000:8.2f} ms  "
-          f"(num_reachable={timed['num_reachable']})")
-    prof = timed.get("profiling")
+    print(f"      timed  : {t_timed*1000:8.2f} ms  "
+          f"(num_reachable={timed['num_reachable']}, "
+          f"levels_run={n_levels})")
+
+    # ---- Phase B: DIAGNOSTIC path (enable_profiling=True) ---------------
+    # Same graph, resident-graph cache still warm from Phase A — but now
+    # with per-phase CUDA-event timing.  Phase A never touched the event
+    # pool (profiling was off), so this phase's warmup call pays Event
+    # construction once; the timed call reuses the pool and should show
+    # wall time much closer to sum(profile) than before the pooling fix.
+    params_diag = {**base_params, "enable_profiling": True}
+
+    t0 = time.perf_counter()
+    warm2 = _bfs_gpu_optimized(csr, params_diag)
+    t_warm2 = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    timed2 = _bfs_gpu_optimized(csr, params_diag)
+    t_timed2 = time.perf_counter() - t0
+
+    print(f"    [diagnostic, profiling on]")
+    print(f"      warmup : {t_warm2*1000:8.2f} ms  "
+          f"(levels_run={len(warm2.get('traversal_modes', []))})")
+    print(f"      timed  : {t_timed2*1000:8.2f} ms  "
+          f"(levels_run={len(timed2.get('traversal_modes', []))})")
+    prof = timed2.get("profiling")
     if prof:
         parts = ", ".join(f"{k}={v:.3f}" for k, v in prof.items() if v)
-        print(f"    profile: {parts}")
+        print(f"      profile: {parts}")
         accounted = sum(v for v in prof.values())
-        print(f"    sum(profile)={accounted:.3f} ms vs wall={t_timed*1000:.3f} ms "
-              f"(gap = host-side Python overhead not covered by CUDA events)")
+        print(f"      sum(profile)={accounted:.3f} ms vs wall={t_timed2*1000:.3f} ms "
+              f"(gap should now be small — was profiler Event-churn before the fix)")
 
     clear_bfs_caches()
 
