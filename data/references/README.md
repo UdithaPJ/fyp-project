@@ -20,9 +20,15 @@ references for defensible, non-circular validation.
 | grn (interaction) | TRRUST v2 | https://www.grnpedia.org/trrust/ → `trrust_rawdata.human.tsv` | `trrust` | `FYP_TRRUST_PATH` | `--trrust-path` |
 | ppi (interaction) | BioGRID | https://downloads.thebiogrid.org/BioGRID → `BIOGRID-ALL-*.tab3.txt` | `biogrid` | `FYP_BIOGRID_PATH` | `--biogrid-path` |
 | mirna (interaction) | miRTarBase | https://mirtarbase.cuhk.edu.hk/ → `hsa_MTI.xlsx` (save as CSV/TSV) | `mirtarbase` / `hsa_mti` | `FYP_MIRTARBASE_PATH` | `--mirtarbase-path` |
-| disease (orthogonal) | DisGeNET | https://www.disgenet.org/downloads → `curated_gene_disease_associations.tsv` | `disgenet` / `gene_disease` | `FYP_DISGENET_PATH` | `--disgenet-path` |
+| disease (orthogonal) | DisGeNET (needs academic approval) | https://www.disgenet.org/downloads → `curated_gene_disease_associations.tsv` | `disgenet` / `gene_disease` | `FYP_DISGENET_PATH` | `--disgenet-path` |
+| disease (orthogonal, **no login**) | **DISEASES** (Jensen Lab) | https://download.jensenlab.org/human_disease_integrated_full.tsv | `human_disease_integrated` / `diseases_integrated` | `FYP_DISGENET_PATH` | `--disgenet-path` |
+| disease (orthogonal, no login) | GWAS Catalog | https://www.ebi.ac.uk/gwas/docs/file-downloads → "All associations v1.0" (TSV) | `gwas_catalog` / `gwas-associations` | `FYP_DISGENET_PATH` | `--disgenet-path` |
 | essential (orthogonal) | DEG / OGEE | http://origin.tubic.org/deg/ or https://v3.ogee.info/ (human essential genes) | `deg` / `ogee` / `essential` | `FYP_DEG_PATH` | `--deg-path` |
+| essential (orthogonal, **no login**) | **HART CEGv2** (core essentials) | https://github.com/hart-lab/bagel/blob/master/CEGv2.txt (Raw) | `cegv2` / `hart_essential` | `FYP_DEG_PATH` | `--deg-path` |
+| essential (orthogonal, instant signup) | DepMap Common Essentials | https://depmap.org/portal/data_page/ → CRISPR → "Common Essentials" | `common_essentials` / `commonessentials` | `FYP_DEG_PATH` | `--deg-path` |
 | drug_target (orthogonal) | DrugBank | https://go.drugbank.com/releases → target polypeptide CSV (`Gene Name` column) | `drugbank` / `drug_target` | `FYP_DRUGBANK_PATH` | `--drugbank-path` |
+| drug_target (orthogonal, **no login**) | **Therapeutic Target Database (TTD)** | https://db.idrblab.net/ttd/full-data-download → "Target information" (TSV) | `ttd_target` / `target_information` | `FYP_DRUGBANK_PATH` | `--drugbank-path` |
+| drug_target (orthogonal, no login) | Guide to Pharmacology (IUPHAR) | https://www.guidetopharmacology.org/download.jsp → "Targets and Families" (CSV) | `iuphar` / `targets_and_families` | `FYP_DRUGBANK_PATH` | `--drugbank-path` |
 | GO | Gene Ontology | http://current.geneontology.org/annotations/goa_human.gaf.gz (gunzip it) | `goa` / `.gaf` | `FYP_GO_PATH` | `--go-path` |
 
 Search order per reference: explicit CLI path → env var → `data/raw/` →

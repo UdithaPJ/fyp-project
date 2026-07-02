@@ -80,12 +80,25 @@ _PATTERNS: dict[str, tuple[str, ...]] = {
     "trrust":     ("trrust", "trrust_rawdata", "trrust.human"),
     "biogrid":    ("biogrid", "biogrid-all", "biogrid_human"),
     "mirtarbase": ("mirtarbase", "mirtar", "hsa_mti"),
-    # Orthogonal gene-set references (evidence unrelated to network topology)
+    # Orthogonal gene-set references (evidence unrelated to network topology).
+    # Multiple filename patterns per kind so the loader auto-discovers any of
+    # several equivalent public databases the user might have on hand:
+    #   disease     – DisGeNET, DISEASES (Jensen Lab), GWAS Catalog
+    #   essential   – DEG, OGEE, DepMap CRISPR common essentials,
+    #                 HART lab CEG core-essential gene lists
+    #   drug_target – DrugBank, Therapeutic Target Database (TTD),
+    #                 Guide to Pharmacology (IUPHAR)
     "disgenet":   ("disgenet", "gene_disease", "curated_gene_disease",
-                   "all_gene_disease"),
-    "deg":        ("deg", "ogee", "essential"),
+                   "all_gene_disease",
+                   "human_disease_integrated", "diseases_integrated",
+                   "gwas_catalog", "gwas-associations"),
+    "deg":        ("deg", "ogee", "essential",
+                   "common_essentials", "commonessentials",
+                   "cegv2", "ceg2", "hart_essential"),
     "drugbank":   ("drugbank", "drug_target", "drug-target",
-                   "all_target_polypeptide"),
+                   "all_target_polypeptide",
+                   "ttd_target", "ttd-target", "target_information",
+                   "targets_and_families", "iuphar", "guidetopharmacology"),
     # Gene Ontology annotations (GAF 2.x)
     "go":         ("goa_human", "goa", "gene_association", ".gaf"),
     # STRING protein-info map (Ensembl protein id → gene symbol)
@@ -171,10 +184,26 @@ def _iter_table(path: Path, sep_candidates: tuple[str, ...] = ("\t", ",", ";", "
         if not buf_lines:
             return
 
-        # Try DictReader (header) first
+        # Try DictReader (header) first.
+        # Row is treated as a header only when EVERY non-empty cell looks
+        # like a column name — i.e. contains letters, is not a plain number,
+        # and does NOT start with a biological identifier prefix such as
+        # ENSP / ENSG / HGNC:.  Files like DISEASES whose first data row
+        # begins with an Ensembl id are correctly recognised as header-less.
         first = buf_lines[0].rstrip("\n\r").split(chosen_sep)
-        has_header = any(any(c.isalpha() for c in cell) and not cell.replace(".", "").replace("-", "").isdigit()
-                          for cell in first)
+        non_empty = [c for c in first if c.strip()]
+        def _looks_like_header_cell(c: str) -> bool:
+            c = c.strip()
+            if not any(ch.isalpha() for ch in c):
+                return False
+            if c.replace(".", "").replace("-", "").isdigit():
+                return False
+            if c.upper().startswith(_IDENTIFIER_PREFIXES):
+                return False
+            return True
+        has_header = bool(non_empty) and all(
+            _looks_like_header_cell(c) for c in non_empty
+        )
 
         if has_header:
             reader = csv.DictReader(buf_lines, delimiter=chosen_sep)
@@ -401,24 +430,115 @@ class GeneSetReference:
 # Candidate gene-symbol column names per gene-set kind.  First present
 # column wins; positional fallback uses the first alphabetic column.
 _GENE_SET_COLUMNS: dict[str, tuple[str, ...]] = {
+    # DisGeNET → "geneSymbol"; DISEASES/Jensen → col2 = "Gene symbol";
+    # GWAS Catalog → "MAPPED_GENE" (may be multi-valued, best-effort);
+    # fall through to the first alphabetic cell for header-less files.
     "disgenet": ("geneSymbol", "gene_symbol", "genesymbol", "symbol",
-                 "gene", "gene_name"),
+                 "gene", "gene_name", "Gene symbol", "MAPPED_GENE",
+                 "REPORTED GENE(S)"),
+    # DEG/OGEE → "gene_symbol"; DepMap Common Essentials → "gene" or
+    # "Gene" (values like "TP53 (7157)" — the loader keeps them, matching
+    # trims to the parenthesised suffix — see column-hint doc);
+    # HART CEGv2.txt → "GENE" (single column, one gene per line).
     "deg":      ("gene_symbol", "symbol", "gene", "gene_name", "locus",
-                 "genename"),
+                 "genename", "Gene", "GENE"),
+    # DrugBank → "Gene Name"; TTD → "TARGETID" is a code, "TARGNAME"
+    # is descriptive — the useful column is "GENENAME" or "UNIPROID";
+    # IUPHAR Targets and Families → "HGNC symbol" or "Human Ensembl Gene".
     "drugbank": ("Gene Name", "gene_name", "gene", "genename", "symbol",
-                 "HGNC", "hgnc_symbol"),
+                 "HGNC", "hgnc_symbol", "GENENAME", "TARGET_NAME",
+                 "HGNC symbol", "Human Ensembl Gene", "Target Gene Symbol"),
 }
 
 
+_IDENTIFIER_PREFIXES = ("ENSP", "ENSG", "ENST", "HGNC:", "UNIPROT:",
+                        "UNIPROTKB:", "NCBI:", "ENTREZ:")
+
+
 def _first_alpha_value(row: dict) -> Optional[str]:
-    """First value that contains a letter (a plausible gene symbol)."""
+    """First value that looks like a gene symbol.
+
+    Skips cells that are pure identifiers (Ensembl/UniProt/HGNC) so files
+    like DISEASES (col 1 = Ensembl id, col 2 = gene symbol) fall through
+    to the correct column.
+    """
     for v in row.values():
         if v is None:
             continue
         s = str(v).strip()
-        if s and any(c.isalpha() for c in s):
-            return s
+        if not s or not any(c.isalpha() for c in s):
+            continue
+        if s.upper().startswith(_IDENTIFIER_PREFIXES):
+            continue
+        return s
     return None
+
+
+def _clean_symbol(raw: str) -> str:
+    """Normalise a gene-symbol cell.
+
+    Handles the common source-specific quirks:
+      * DepMap  – ``"TP53 (7157)"``  → ``"TP53"``   (strip Entrez suffix)
+      * GWAS    – ``"TP53, MYC"``    → ``"TP53"``   (first gene of a list;
+                                                     GWAS-style multi-gene
+                                                     rows are common)
+      * IUPHAR  – ``"HGNC:11998"``   → ``""``       (drop identifier-only)
+    """
+    s = str(raw).strip()
+    # DepMap "SYM (12345)" — cut at the space before the paren
+    if " (" in s and s.endswith(")"):
+        s = s.split(" (", 1)[0].strip()
+    # multi-gene rows: take the first entry
+    for sep in (",", " - ", ";", "|"):
+        if sep in s:
+            s = s.split(sep, 1)[0].strip()
+            break
+    # drop pure-identifier rows
+    if s.upper().startswith(("HGNC:", "UNIPROT:", "ENSG", "ENSP")):
+        return ""
+    return s
+
+
+def _is_ttd_flat_format(path: Path) -> bool:
+    """Sniff whether ``path`` is TTD's ``<target_id>\\t<field>\\t<value>``
+    long-format record file (not a table).  Detects by scanning up to the
+    first 200 non-blank lines for ``T<digits>\\tGENENAME\\t*`` rows.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            checked = 0
+            for line in f:
+                line = line.rstrip("\n\r")
+                if not line or line.startswith("-"):
+                    continue
+                parts = line.split("\t")
+                if (len(parts) >= 3
+                        and parts[0].startswith("T")
+                        and parts[0][1:].isdigit()
+                        and parts[1].strip() == "GENENAME"):
+                    return True
+                checked += 1
+                if checked > 200:
+                    return False
+    except Exception:
+        return False
+    return False
+
+
+def _load_ttd_flat(path: Path, name: str) -> GeneSetReference:
+    """Parse TTD's flat record file — extract every ``GENENAME`` value."""
+    rs = GeneSetReference(name=name, kind="drug_target", source_path=path)
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            parts = line.rstrip("\n\r").split("\t")
+            if len(parts) < 3 or parts[1].strip() != "GENENAME":
+                continue
+            gene = _clean_symbol(parts[2])
+            if not gene:
+                continue
+            rs.genes.add(_norm(gene))
+            rs.n_records += 1
+    return rs
 
 
 def _load_gene_set(kind: str, name: str,
@@ -428,12 +548,26 @@ def _load_gene_set(kind: str, name: str,
     Extracts one gene symbol per row using the candidate columns for
     ``kind`` (positional fallback: first alphabetic cell).  Never raises;
     returns ``None`` when the file is missing or yields no symbols.
+
+    Special-cased formats:
+      * TTD (drug_target) — detected by ``_is_ttd_flat_format``, parsed
+        via :func:`_load_ttd_flat` (long-format records rather than a table).
+
+    Source-specific cell formats (DepMap ``"SYM (id)"``, GWAS multi-gene
+    lists, IUPHAR pure identifiers) are normalised by :func:`_clean_symbol`.
     """
     p = _find_file(kind, path)
     if p is None:
         _LOG.info("%s reference not found — orthogonal %s validation skipped.",
                   name, kind)
         return None
+
+    # TTD-specific fast path
+    if kind == "drugbank" and _is_ttd_flat_format(p):
+        rs = _load_ttd_flat(p, name="TTD")
+        _LOG.info("%s (TTD flat) loaded: %d rows, %d unique genes",
+                  name, rs.n_records, len(rs.genes))
+        return rs if rs.genes else None
 
     rs = GeneSetReference(name=name, kind={
         "disgenet": "disease",
@@ -452,6 +586,9 @@ def _load_gene_set(kind: str, name: str,
                 break
         if gene is None:
             gene = _first_alpha_value(row)
+        if not gene:
+            continue
+        gene = _clean_symbol(gene)
         if not gene:
             continue
         g = _norm(gene)

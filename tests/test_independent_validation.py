@@ -128,6 +128,67 @@ def test_load_go_aspect_filter(tmp_path: Path):
 
 
 # ===========================================================================
+# Loader tolerance for real-world reference file quirks
+# ===========================================================================
+
+def test_load_gene_set_ttd_flat_format(tmp_path: Path):
+    """TTD ships a long-format record file rather than a table:
+    ``<target_id>\\t<field_name>\\t<value>``.  The loader must detect this
+    layout and pull symbols from ``GENENAME`` rows only.
+    """
+    from src.validation.reference_loader import load_gene_set
+    ttd = tmp_path / "P1-01-TTD_target_download.txt"
+    ttd.write_text(
+        "-----\n"
+        "TTD - preamble\n"
+        "-----\n\n"
+        "T47101\tTARGETID\tT47101\n"
+        "T47101\tGENENAME\tFGFR1\n"
+        "T47101\tBIOCLASS\tKinase\n"
+        "T47101\tDRUGINFO\tD0O6UY\tPemigatinib\tApproved\n"
+        "\n"
+        "T59328\tTARGETID\tT59328\n"
+        "T59328\tGENENAME\tEGFR\n"
+        "T89515\tGENENAME\tPDF\n"
+    )
+    r = load_gene_set("drug_target", ttd)
+    assert r is not None
+    assert r.name == "TTD"
+    assert r.genes == {"FGFR1", "EGFR", "PDF"}
+    # Junk fields (BIOCLASS/DRUGINFO/preamble) must NOT be treated as genes.
+    assert "KINASE" not in r.genes
+    assert "PEMIGATINIB" not in r.genes
+
+
+def test_load_gene_set_disease_headerless(tmp_path: Path):
+    """DISEASES (Jensen Lab) has no header row and col 1 is an Ensembl id.
+    The loader must skip identifier-only cells and pick col 2.
+    """
+    from src.validation.reference_loader import load_gene_set
+    f = tmp_path / "human_disease_integrated_full.tsv"
+    f.write_text(
+        "ENSP00000000001\tTP53\tDOID:1612\tbreast cancer\t3.0\n"
+        "ENSP00000000002\tBRCA1\tDOID:1612\tbreast cancer\t3.5\n"
+        "ENSP00000000003\tMYC\tDOID:0001\tcancer\t2.0\n"
+    )
+    r = load_gene_set("disease", f)
+    assert r is not None
+    assert r.genes == {"TP53", "BRCA1", "MYC"}
+
+
+def test_load_gene_set_depmap_paren_suffix(tmp_path: Path):
+    """DepMap Common Essentials uses ``"TP53 (7157)"`` for the Gene column;
+    ``_clean_symbol`` must strip the parenthesised Entrez suffix.
+    """
+    from src.validation.reference_loader import load_gene_set
+    f = tmp_path / "depmap_common_essentials.csv"
+    f.write_text("gene\nTP53 (7157)\nMYC (4609)\nBRCA1 (672)\n")
+    r = load_gene_set("essential", f)
+    assert r is not None
+    assert r.genes == {"TP53", "MYC", "BRCA1"}
+
+
+# ===========================================================================
 # STRING id → gene-symbol remap
 # ===========================================================================
 
