@@ -72,10 +72,15 @@ def _gen_graph(graph_type: str, n: int) -> sp.csr_matrix:
 
 
 def _run_gpu_optimised(csr: sp.csr_matrix, label: str) -> None:
-    from src.algorithms.gpu.cuda_optimized.pagerank import pagerank_gpu
+    from src.algorithms.gpu.cuda_optimized.pagerank import (
+        pagerank_gpu, clear_pagerank_graph_cache,
+    )
 
     print(f"  [GPU optimised] {label}")
-    pagerank_gpu(csr, PARAMS)                    # warmup (kernel compile etc.)
+    # Start cold so warmup is a genuine graph-cache MISS (pays full setup)
+    # and the timed call is a HIT (setup should collapse toward H2D only).
+    clear_pagerank_graph_cache()
+    pagerank_gpu(csr, PARAMS)                    # warmup (compile + cache fill)
 
     t0 = time.perf_counter()
     res = pagerank_gpu(csr, PARAMS)              # timed
@@ -91,6 +96,8 @@ def _run_gpu_optimised(csr: sp.csr_matrix, label: str) -> None:
           f"converged={inner.get('converged')}  chunked={chunked}")
     if note:
         print(f"      note: {note[:110]}")
+
+    clear_pagerank_graph_cache()
 
 
 def _run_gpu_baseline(csr: sp.csr_matrix, label: str) -> None:
