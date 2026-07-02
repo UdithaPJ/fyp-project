@@ -1081,16 +1081,19 @@ def _bfs_gpu_optimized(graph_csr: sp.csr_matrix, params: dict) -> dict:
             if use_dev_size:
                 # ==============================================================
                 # Opt 2 fast path: push_only + device-size frontier.
-                # No per-level DTOH until the batch sync check.
+                # No per-level DTOH, no per-level H2D, no per-level bitmap
+                # work — the loop body is exactly two device-only kernel
+                # launches (push + swap) until the batch sync check.
+                #
+                # d_next_size is zeroed ONCE before the loop (see setup
+                # above); swap_frontier_sizes re-zeroes it on the device at
+                # the end of every iteration, so no host round-trip is
+                # needed here.  d_nxt_bmp (pull frontier bitmap) is never
+                # read in push-only mode, so it is intentionally left
+                # untouched — zeroing it every level was pure wasted O(N)
+                # work with no consumer.
                 # ==============================================================
                 for depth in range(1, max_depth + 1):
-                    # Reset next-size and bitmap on device
-                    cuda.memcpy_htod(d_next_size, zero_i32)
-                    k_fill_u(
-                        d_nxt_bmp, np.int32(bitmap_words), np.uint32(0),
-                        block=(block_size, 1, 1), grid=(grid_words, 1, 1),
-                    )
-
                     traversal_modes.append("push_dev")
 
                     if prof:
