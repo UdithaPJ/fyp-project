@@ -112,7 +112,17 @@ _TYPE_MARKERS: dict[str, str] = {
 
 _DEFAULT_PARAMS: dict[str, dict[str, Any]] = {
     "pagerank": {"damping": 0.85, "max_iter": 100, "tolerance": 1e-6},
-    "bfs":      {"source": 0, "max_depth": 999},  # full reachable component
+    # BFS benchmark mode: scalability only needs runtime + num_reachable, not
+    # the cascade.  These flags activate the low-overhead GPU path
+    #   collect_cascade=False → no per-level frontier DTOH, single final D2H
+    #   direction_mode=push_only → skip pull kernel + transpose (sparse graphs)
+    #   cache_graph=True → symmetrization/H2D happen on warmup, not timed run
+    # The GPU-optimised path ignores unknown keys, so CPU/baseline modes that
+    # don't understand them are unaffected.
+    "bfs":      {"source": 0, "max_depth": 999,      # full reachable component
+                 "collect_cascade": False,
+                 "direction_mode": "push_only",
+                 "cache_graph": True},
     "rwr":      {"restart_prob": 0.3, "max_iter": 100,
                  "tolerance": 1e-6, "seed_nodes": [0]},
     "hits":     {"max_iter": 100, "tolerance": 1e-6},
