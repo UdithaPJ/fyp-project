@@ -4,51 +4,41 @@ src/algorithms/gpu/basic/hits.py
 
 HITS — GPU baseline implementation.
 
-Backend (priority order)
-------------------------
-1. cuGraph ``cugraph.hits`` — preferred.  Used when the installed RAPIDS
-   version provides a working single-GPU HITS implementation.
-2. CuPy power-iteration fallback — activated automatically when cuGraph
-   raises any of the multi-GPU dispatch errors known to appear in
-   RAPIDS 24.02–24.06 (``cugraph_mg_hits: CUGRAPH_UNKNOWN_E``,
-   ``RuntimeError: non-success value returned from cugraph_mg_hits``).
+Backend
+-------
+cuGraph ``cugraph.hits`` only — no CuPy fallback.  Matches the hard-fail
+policy shared by every cuGraph-only baseline in this package (pagerank,
+bfs, louvain, rwr): raise ``ImportError`` at module import time if
+cuGraph/cuDF are absent, and raise on any cuGraph runtime failure rather
+than silently switching backends.
 
-Why the fallback is necessary
-------------------------------
-In RAPIDS 24.02–24.06, ``cugraph.hits`` was silently re-routed through
-the ``pylibcugraph`` handle-based API.  On a single-GPU machine without
-Dask / NCCL setup the C layer returns ``CUGRAPH_UNKNOWN_E``, which Python
-surfaces as::
+Known RAPIDS regression (informational — no longer worked around here)
+------------------------------------------------------------------------
+In RAPIDS 24.02–26.x, ``cugraph.hits`` can be silently re-routed through
+the ``pylibcugraph`` multi-GPU handle-based API.  On a single-GPU machine
+without Dask / NCCL setup the C layer returns ``CUGRAPH_UNKNOWN_E``,
+surfaced as::
 
     RuntimeError: non-success value returned from cugraph_mg_hits: CUGRAPH_UNKNOWN_E
 
-Other algorithms (PageRank, BFS, Louvain, RWR) have their own C entry
-points that were not affected by this regression.  Only HITS hits this
-path in the affected RAPIDS versions.
+If you hit this, it is a RAPIDS packaging defect on this install, not a
+bug in this file — per the project's baseline hard-fail policy, HITS
+raises rather than falling back to CuPy.  Fix at the environment level
+(RAPIDS version pin / rebuild), not by adding a fallback here.
 
-Fixes applied
--------------
+Fixes retained
+---------------
 FIX-1  Always symmetrize the graph before passing to cugraph.hits.
        HITS is defined on undirected graphs (Kleinberg 1999).  Passing a
        directed graph for GRN/miRNA triggered a second, separate C
        dispatch path that also routes to cugraph_mg_hits in RAPIDS 24.x.
-       The old code: symmetrize_for only when nt=="ppi"; directed=True
-       for GRN/miRNA.  Fixed: always directed=False, always symmetrize.
-
-FIX-2  CuPy power-iteration fallback.
-       On any RuntimeError whose message contains "cugraph_mg_hits" or
-       "CUGRAPH_UNKNOWN", fall through to a CuPy L2-normalised power
-       iteration.  The result["backend"] key distinguishes which path ran.
+       Always directed=False, always symmetrize, regardless of network_type.
 
 FIX-3  Score scatter via numpy indexing instead of np.put.
        np.put(hub_arr, vertex, hubs) is correct for 1-D arrays, but
        if cuGraph renumbers vertices internally the returned vertex IDs
        may not cover 0..n-1.  Explicit advanced indexing plus a bounds
        check is safer and equally fast.
-
-FIX-4  Detailed diagnostic logging on every failure.
-       Logs RAPIDS version, graph dimensions, GPU memory, dtype, and the
-       full traceback so failures can be reproduced from the log alone.
 
 Result keys (mirror src/algorithms/gpu/cuda_optimized/hits.py)
 -------------------------------------------------------------
@@ -60,14 +50,14 @@ Result keys (mirror src/algorithms/gpu/cuda_optimized/hits.py)
 from __future__ import annotations
 
 import logging
-import traceback
 import time
 from typing import Any
 
 import numpy as np
 import scipy.sparse as sp
 
-# Hard-fail: cuGraph + cuDF are required as the primary path.
+# Hard-fail: cuGraph + cuDF are required.  No CuPy fallback — matches
+# pagerank.py / bfs.py / louvain.py / rwr.py.
 try:
     import cugraph   # noqa: F401
     import cudf      # noqa: F401
@@ -82,17 +72,8 @@ except ImportError as _e:
         f"Original error: {_e}"
     ) from _e
 
-# CuPy is the fallback for the known cugraph_mg_hits regression.
-try:
-    import cupy as _cupy                              # type: ignore
-    import cupyx.scipy.sparse as _cupyx_sp            # type: ignore
-    _CUPY_AVAILABLE = True
-except ImportError:
-    _CUPY_AVAILABLE = False
-
 from ._utils import (
     BASELINE_MODE_CUGRAPH,
-    BASELINE_MODE_CUPY,
     TOP_HITS,
     build_envelope, cugraph_build_graph, cugraph_extract_column,
     cugraph_function, symmetrize_for,
@@ -100,17 +81,6 @@ from ._utils import (
 )
 
 _LOG = logging.getLogger(__name__)
-
-# Error fragments that identify the multi-GPU dispatch failure.
-# We match substrings so minor message variations across RAPIDS versions
-# are all caught by the same guard.
-_MG_ERROR_PATTERNS = (
-    "cugraph_mg_hits",
-    "CUGRAPH_UNKNOWN",
-    "cugraph_mg_",          # any MG C function
-    "raft::handle",         # Dask handle not initialised
-    "nccl",                 # NCCL not configured
-)
 
 _DEFAULT_PARAMS: dict = {
     "max_iter":     100,
@@ -163,12 +133,6 @@ def _log_graph_properties(graph_csr: sp.csr_matrix) -> str:
             f"dtype={graph_csr.dtype}")
     _LOG.info("[HITS baseline graph] %s", msg)
     return msg
-
-
-def _is_mg_error(exc: Exception) -> bool:
-    """Return True when ``exc`` is a known multi-GPU dispatch error."""
-    msg = str(exc).lower()
-    return any(pat.lower() in msg for pat in _MG_ERROR_PATTERNS)
 
 
 # ---------------------------------------------------------------------------
@@ -261,174 +225,49 @@ def _hits_cugraph(
 
 
 # ---------------------------------------------------------------------------
-# FIX-2: CuPy power-iteration fallback
-# ---------------------------------------------------------------------------
-
-def _hits_cupy(
-    graph_csr: sp.csr_matrix, params: dict,
-) -> tuple[np.ndarray, np.ndarray, int, bool]:
-    """L2-normalised HITS power iteration via CuPy.
-
-    This path is activated when cugraph.hits routes to the MG C kernel on
-    a single-GPU machine (known regression in RAPIDS 24.02–24.06).
-
-    The algorithm is the standard Kleinberg HITS:
-        a_new = A^T h  (authorities receive from hubs via in-edges)
-        h_new = A  a   (hubs point to authorities via out-edges)
-    Both vectors are L2-normalised after each update.  A is the
-    symmetrised adjacency — HITS is only well-defined on undirected graphs.
-    """
-    if not _CUPY_AVAILABLE:
-        raise RuntimeError(
-            "CuPy is not installed and cugraph.hits is unavailable.  "
-            "pip install cupy-cuda12x  (adjust CUDA suffix)."
-        )
-
-    max_iter = int(params["max_iter"])
-    tol      = float(params["tolerance"])
-    n        = int(graph_csr.shape[0])
-
-    # Symmetrize on CPU (cheap), then move to GPU once.
-    A_sym_sp = graph_csr + graph_csr.T
-    if A_sym_sp.nnz > 0:
-        A_sym_sp.data = np.ones_like(A_sym_sp.data, dtype=np.float32)
-    A_sym_sp = A_sym_sp.tocsr().astype(np.float32)
-
-    A   = _cupyx_sp.csr_matrix(A_sym_sp)
-    A_T = A.T.tocsr()
-
-    h = _cupy.ones(n, dtype=_cupy.float32)
-    a = _cupy.ones(n, dtype=_cupy.float32)
-
-    converged  = False
-    iterations = 0
-    for it in range(max_iter):
-        iterations = it + 1
-        h_old, a_old = h, a
-
-        # Authority update: a_new = A^T h
-        a_new = A_T.dot(h_old)
-        norm_a = float(_cupy.linalg.norm(a_new))
-        if norm_a > 0.0:
-            a_new = a_new / norm_a
-
-        # Hub update: h_new = A a_new
-        h_new = A.dot(a_new)
-        norm_h = float(_cupy.linalg.norm(h_new))
-        if norm_h > 0.0:
-            h_new = h_new / norm_h
-
-        delta = float(
-            _cupy.abs(h_new - h_old).sum() + _cupy.abs(a_new - a_old).sum()
-        )
-        h, a = h_new, a_new
-        if delta < tol:
-            converged = True
-            break
-
-    hub_arr  = _cupy.asnumpy(h).astype(np.float32)
-    auth_arr = _cupy.asnumpy(a).astype(np.float32)
-    return hub_arr, auth_arr, iterations, converged
-
-
-# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
 def hits_gpu_baseline(
     graph_csr: sp.csr_matrix, params: dict | None = None,
 ) -> dict:
-    """HITS — GPU baseline (cuGraph preferred, CuPy fallback).
+    """HITS — GPU baseline (cuGraph only, no fallback).
 
     Returns
     -------
     dict
-        Standard 7-key envelope.  ``result["backend"]`` is ``"cugraph"``
-        or ``"cupy_fallback"`` depending on which path succeeded.
-        ``result["mode"]`` is ``"gpu_baseline_cugraph"`` or
-        ``"gpu_baseline_cupy"`` accordingly.
+        7-key standard result envelope; ``result["mode"]`` is
+        ``"gpu_baseline_cugraph"``.  Raises on any cuGraph failure —
+        see the module docstring for the known RAPIDS regression this
+        may surface as.
     """
     p            = {**_DEFAULT_PARAMS, **(params or {})}
     network_type = str(p.get("network_type", "grn")).lower()
 
     # FIX-1: HITS is defined on undirected graphs (Kleinberg 1999).
-    # Always symmetrize regardless of network type.  The previous code
-    # only symmetrized for PPI and passed a directed graph for GRN/miRNA,
-    # which triggered the MG dispatch in RAPIDS 24.x.
+    # Always symmetrize regardless of network type — the old code only
+    # symmetrized for PPI and passed a directed graph for GRN/miRNA, which
+    # triggered a second, separate MG dispatch path in RAPIDS 24.x.
     csr_sym  = symmetrize_for(graph_csr, "ppi")   # "ppi" always returns A+A^T binarised
 
-    # Build graph BEFORE timing (H-4 fix retained).
+    # Build graph BEFORE timing (mirrors the H-4 fix in the sibling files).
     # FIX-1 continued: always directed=False — HITS has no concept of edge direction.
     G = cugraph_build_graph(csr_sym, directed=False, weighted=False)
 
-    # ---- Try cuGraph path -----------------------------------------------
-    t0 = time.perf_counter()
     _log_graph_properties(graph_csr)
-    env_str = _log_environment()
+    _log_environment()
 
-    try:
-        hub, auth, iters, converged = _hits_cugraph(G, graph_csr, p)
-        elapsed = time.perf_counter() - t0
-        backend = "cugraph"
-        mode    = BASELINE_MODE_CUGRAPH
+    t0 = time.perf_counter()
+    hub, auth, iters, converged = _hits_cugraph(G, graph_csr, p)
+    elapsed = time.perf_counter() - t0
 
-        _LOG.info(
-            "[HITS baseline] cuGraph path OK  n=%d nnz=%d iters=%d "
-            "elapsed=%.3fs",
-            graph_csr.shape[0], graph_csr.nnz, iters, elapsed,
-        )
-
-    except Exception as cg_exc:
-        elapsed_fail = time.perf_counter() - t0
-
-        # FIX-4: log full diagnostics on any cuGraph failure.
-        _LOG.warning(
-            "[HITS baseline] cuGraph FAILED after %.3fs — "
-            "n=%d nnz=%d env=(%s)\n"
-            "Error: %s\n"
-            "Traceback:\n%s",
-            elapsed_fail,
-            graph_csr.shape[0], graph_csr.nnz,
-            env_str,
-            cg_exc,
-            traceback.format_exc(),
-        )
-
-        # FIX-2: if this looks like the MG-dispatch bug, fall through to CuPy.
-        if _is_mg_error(cg_exc):
-            _LOG.warning(
-                "[HITS baseline] Detected cugraph_mg_hits dispatch error "
-                "(RAPIDS 24.x regression on single-GPU machines).  "
-                "Falling back to CuPy power iteration.  "
-                "result[\"backend\"] will be \"cupy_fallback\"."
-            )
-            try:
-                t1 = time.perf_counter()
-                hub, auth, iters, converged = _hits_cupy(graph_csr, p)
-                elapsed  = time.perf_counter() - t1
-                backend  = "cupy_fallback"
-                mode     = BASELINE_MODE_CUPY
-
-                _LOG.info(
-                    "[HITS baseline] CuPy fallback OK  n=%d iters=%d "
-                    "converged=%s elapsed=%.3fs",
-                    graph_csr.shape[0], iters, converged, elapsed,
-                )
-            except Exception as cp_exc:
-                _LOG.error(
-                    "[HITS baseline] CuPy fallback also FAILED: %s", cp_exc,
-                )
-                raise RuntimeError(
-                    f"HITS GPU baseline: both cuGraph and CuPy paths failed.\n"
-                    f"  cuGraph error: {cg_exc}\n"
-                    f"  CuPy error   : {cp_exc}"
-                ) from cp_exc
-        else:
-            # A different cuGraph error — re-raise as-is.
-            raise
+    _LOG.info(
+        "[HITS baseline] cuGraph path OK  n=%d nnz=%d iters=%d elapsed=%.3fs",
+        graph_csr.shape[0], graph_csr.nnz, iters, elapsed,
+    )
 
     inner = _pack_result(hub, auth, iters, converged, network_type)
-    inner["backend"] = backend
+    inner["backend"] = "cugraph"
 
     return build_envelope(
         algorithm="hits",
@@ -436,5 +275,5 @@ def hits_gpu_baseline(
         execution_time=elapsed,
         graph_csr=graph_csr,
         inner=inner,
-        mode=mode,
+        mode=BASELINE_MODE_CUGRAPH,
     )

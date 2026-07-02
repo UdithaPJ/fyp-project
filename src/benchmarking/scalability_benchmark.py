@@ -125,7 +125,14 @@ _DEFAULT_PARAMS: dict[str, dict[str, Any]] = {
                  "cache_graph": True},
     "rwr":      {"restart_prob": 0.3, "max_iter": 100,
                  "tolerance": 1e-6, "seed_nodes": [0]},
-    "hits":     {"max_iter": 100, "tolerance": 1e-6},
+    # HITS: cuGraph's C++ implementation hard-raises ("HITS failed to
+    # converge") instead of returning converged=False when max_iter is
+    # exhausted.  The internal convergence threshold scales as
+    # n_vertices * tolerance, so tolerance is already fairly loose at
+    # scale — the real constraint is max_iter: near-regular test graphs
+    # (ER/WS, narrow degree distribution) have a small spectral gap and
+    # need many more power-iteration steps than the old default of 100.
+    "hits":     {"max_iter": 500, "tolerance": 1e-4},
     "louvain":  {"min_delta_q": 1e-4, "max_levels": 10, "resolution": 1.0},
     "mcl":      {"expansion": 2, "inflation": 2.0, "prune_threshold": 0.001,
                  "max_iter": 100, "convergence_tol": 1e-4},
