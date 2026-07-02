@@ -60,10 +60,13 @@ except ImportError as _e:
 
 _BASELINE_MODE_CUPY: str = "gpu_baseline_cupy"
 
-# CuPy sparse SpGEMM on mid-range GPUs (4–8 GB VRAM) OOMs above this
-# input size before the VRAM-fraction guard can help — the intermediate
-# is materialized in a single allocation with no incremental fallback.
-_GPU_BASELINE_NNZ_HARD_CAP: int = 1_000_000
+# CuPy sparse SpGEMM materializes the intermediate M @ M in a single
+# allocation with no incremental fallback.  On mid-range GPUs (4–8 GB
+# VRAM) this OOMs well below the 1M-edge mark for MCL because the
+# matrix densifies across iterations before the prune stabilises —
+# same failure mode as cpu_multi.  Kept in line with cpu_multi so
+# benchmark reports are apples-to-apples.
+_GPU_BASELINE_NNZ_HARD_CAP: int = 500_000
 
 
 def _free_vram_bytes() -> int:

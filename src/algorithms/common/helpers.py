@@ -496,7 +496,10 @@ def _available_ram_bytes() -> int:
     """Best-effort available-RAM query using stdlib only.
 
     Windows: ``GlobalMemoryStatusEx`` via ctypes.
-    POSIX  : ``os.sysconf('SC_AVPHYS_PAGES') * SC_PAGE_SIZE`` where available.
+    Linux  : ``/proc/meminfo`` ``MemAvailable`` (more accurate than
+             ``SC_AVPHYS_PAGES`` because it accounts for reclaimable
+             cache).  Falls back to ``sysconf`` if the file is missing.
+    Other POSIX: ``os.sysconf('SC_AVPHYS_PAGES') * SC_PAGE_SIZE``.
     Fallback: 0 (caller should treat this as "unknown → skip guard").
     """
     try:
@@ -521,7 +524,19 @@ def _available_ram_bytes() -> int:
             if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
                 return int(ms.ullAvailPhys)
             return 0
-        # POSIX path
+        # Linux — prefer /proc/meminfo MemAvailable (matches `free -h`).
+        try:
+            with open("/proc/meminfo", "r") as fh:
+                for line in fh:
+                    if line.startswith("MemAvailable:"):
+                        parts = line.split()
+                        # "MemAvailable:    12345678 kB"
+                        return int(parts[1]) * 1024
+        except FileNotFoundError:
+            pass
+        except Exception:                                   # noqa: BLE001
+            pass
+        # Generic POSIX fallback
         if hasattr(os, "sysconf") and "SC_AVPHYS_PAGES" in os.sysconf_names:
             pages = os.sysconf("SC_AVPHYS_PAGES")
             page_size = os.sysconf("SC_PAGE_SIZE")
@@ -530,6 +545,39 @@ def _available_ram_bytes() -> int:
         return 0
     except Exception:                                       # noqa: BLE001
         return 0
+
+
+def _swap_used_bytes() -> int:
+    """Best-effort used-swap query using stdlib only.
+
+    A rising swap count means the OS has already started swapping — the
+    OOM killer is close.  Watchdog uses this to bail before RAM alone
+    would signal the problem.
+
+    Only implemented on Linux (``/proc/meminfo`` ``SwapTotal`` -
+    ``SwapFree``).  Windows PageFile has different semantics — it acts
+    as a commit-reserve backing whether or not pages are actually paged
+    out — so we return 0 there and let the RAM-floor check carry the
+    watchdog.  Returns 0 when unknown so callers can treat "no signal"
+    as "OK".
+    """
+    if os.name == "nt":
+        return 0
+    try:
+        with open("/proc/meminfo", "r") as fh:
+            total = free = None
+            for line in fh:
+                if line.startswith("SwapTotal:"):
+                    total = int(line.split()[1]) * 1024
+                elif line.startswith("SwapFree:"):
+                    free = int(line.split()[1]) * 1024
+                if total is not None and free is not None:
+                    return max(0, total - free)
+    except FileNotFoundError:
+        pass
+    except Exception:                                       # noqa: BLE001
+        pass
+    return 0
 
 
 def _estimate_mcl_peak_ram_bytes(
@@ -623,9 +671,12 @@ def _check_memory_or_raise(
     raise MemoryError(msg)
 
 
-# Below this floor we assume the OS is about to start killing processes.
-# 500 MB free is not a lot of headroom for scipy transient buffers.
-_RUNTIME_RAM_FLOOR_BYTES: int = 500 * 1024 * 1024
+# Runtime watchdog thresholds.  These are DELIBERATELY conservative:
+# by the time swap starts filling, the OS OOM killer is minutes away
+# from killing the Python process (and any IDE hosting it), so we bail
+# well before the RAM-only signal turns critical.
+_RUNTIME_RAM_FLOOR_BYTES:  int = 2 * 1024 * 1024 * 1024   # 2 GB
+_RUNTIME_SWAP_ALERT_BYTES: int = 512 * 1024 * 1024        # 512 MB
 
 
 def _check_runtime_ram_or_raise(
@@ -634,25 +685,46 @@ def _check_runtime_ram_or_raise(
     iteration: int,
     current_nnz: int,
     floor_bytes: int = _RUNTIME_RAM_FLOOR_BYTES,
+    swap_alert_bytes: int = _RUNTIME_SWAP_ALERT_BYTES,
 ) -> None:
-    """Per-iteration RAM watchdog for CPU MCL.
+    """Per-iteration RAM + swap watchdog for CPU MCL.
 
     Called at the top of each MCL iteration BEFORE the next ``M @ M``.
-    If free RAM has collapsed to less than ``floor_bytes``, raises
-    ``MemoryError`` so the loop bails out cleanly instead of letting the
-    next allocation trigger the OS OOM killer (which would kill the
-    Python process — and any IDE hosting it — without giving us a chance
-    to raise).
+    Raises ``MemoryError`` when EITHER:
 
-    ``available == 0`` (probe failed) disables the check; the pre-run
-    guard is the only safety net in that case.
+      1. free RAM has dropped below ``floor_bytes`` (default 2 GB), OR
+      2. used swap has grown past ``swap_alert_bytes`` (default 512 MB).
+
+    Both signals mean the OS OOM killer is close.  Bailing here lets the
+    runner surface a clean error instead of the interpreter (and any IDE
+    hosting it) getting terminated.
+
+    ``available == 0`` (probe failed) disables the RAM check; swap check
+    is likewise skipped when its probe returns 0.  The pre-run guard is
+    the only safety net when both probes fail.
     """
     available = _available_ram_bytes()
-    if available <= 0 or available >= floor_bytes:
+    swap_used = _swap_used_bytes()
+
+    ram_low   = available > 0 and available < floor_bytes
+    swap_hot  = swap_used > swap_alert_bytes
+
+    if not (ram_low or swap_hot):
         return
+
+    reasons: list[str] = []
+    if ram_low:
+        reasons.append(
+            f"free RAM {available/(1024*1024):.0f} MB < "
+            f"floor {floor_bytes/(1024*1024):.0f} MB"
+        )
+    if swap_hot:
+        reasons.append(
+            f"swap in use {swap_used/(1024*1024):.0f} MB > "
+            f"alert {swap_alert_bytes/(1024*1024):.0f} MB"
+        )
     raise MemoryError(
         f"MCL {backend}: aborting at iteration {iteration} "
-        f"(M.nnz={current_nnz}, only {available/(1024*1024):.0f} MB "
-        f"free — below {floor_bytes/(1024*1024):.0f} MB floor). "
+        f"(M.nnz={current_nnz}; {'; '.join(reasons)}). "
         f"Use mode=gpu (cuda_optimized) which scales to larger graphs."
     )

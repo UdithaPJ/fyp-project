@@ -41,10 +41,12 @@ from src.algorithms.common.helpers import (
     _extract_clusters,
 )
 
-# GraphBLAS FP32 is roughly 2× more memory-efficient than the float64
-# CPU path, but scaling still tapers past a couple of million edges on
-# typical workstations.  This hard cap keeps benchmarks predictable.
-_CPU_MULTI_NNZ_HARD_CAP: int = 2_000_000
+# Observed on a 16 GB Linux workstation running the benchmark suite:
+# BA(n=100k, m=~10) at 993k edges took cpu_multi's RAM to 16.6 GB used
+# and 5.1 GB swap, killing the IDE hosting the process.  Cap tightened
+# well below that threshold so ANY 1M+-edge benchmark refuses cpu_multi
+# and directs the user to mode=gpu (cuda_optimized).
+_CPU_MULTI_NNZ_HARD_CAP: int = 500_000
 from src.algorithms.cpu.multi_threaded._graphblas_utils import (
     _configure_threads,
     _from_scipy,
@@ -88,6 +90,17 @@ def mcl_cpu_multi(
     SuiteSparse; only the cheap Frobenius-norm convergence check and the
     final attractor cluster extraction run on scipy.
     """
+    # ---- Layer 1: hard nnz cap (evaluated BEFORE the graphblas import
+    # check so oversized inputs refuse deterministically even when the
+    # dep is missing) ----
+    if int(graph_csr.nnz) > _CPU_MULTI_NNZ_HARD_CAP:
+        raise MemoryError(
+            f"MCL cpu_multi: refusing to run — input has "
+            f"{graph_csr.nnz} edges, above the {_CPU_MULTI_NNZ_HARD_CAP} "
+            f"hard cap for the GraphBLAS CPU path.  "
+            f"Use mode=gpu (cuda_optimized) which scales to larger graphs."
+        )
+
     _require_graphblas()
     n_threads = _configure_threads(n_workers)
 
@@ -105,15 +118,6 @@ def mcl_cpu_multi(
             "iterations": 0, "converged": True,
             "note": "graphblas SuiteSparse (empty graph)",
         }
-
-    # ---- Layer 1: hard nnz cap ----
-    if int(graph_csr.nnz) > _CPU_MULTI_NNZ_HARD_CAP:
-        raise MemoryError(
-            f"MCL cpu_multi: refusing to run — input has "
-            f"{graph_csr.nnz} edges, above the {_CPU_MULTI_NNZ_HARD_CAP} "
-            f"hard cap for the GraphBLAS CPU path.  "
-            f"Use mode=gpu (cuda_optimized) which scales to larger graphs."
-        )
 
     # ---- Layer 2: RAM-vs-estimate check with post-symmetrize sizing ----
     _check_memory_or_raise(
