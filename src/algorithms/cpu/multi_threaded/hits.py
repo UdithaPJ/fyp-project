@@ -64,6 +64,12 @@ def hits_cpu_multi(
         return _pack_result(np.zeros(0, dtype=np.float32),
                             np.zeros(0, dtype=np.float32), 0, True)
 
+    # Scale-invariant (per-node RMS) convergence threshold — the L2-norm score
+    # change grows like sqrt(n) for a fixed per-node change, so scaling the
+    # threshold by sqrt(n) keeps `tolerance` meaning the same thing regardless
+    # of graph size.  Matches the GPU HITS and cuGraph's n-scaled definition.
+    conv_tol = tol * float(np.sqrt(n))
+
     A_gb  = _from_scipy(graph_csr, dtype=np.float32)
     A_T_gb = A_gb.T.new()
 
@@ -92,7 +98,7 @@ def hits_cpu_multi(
             h_new = h_new / norm_h
 
         if float(np.linalg.norm(h_new - h_old)
-                 + np.linalg.norm(a_new - a_old)) < tol:
+                 + np.linalg.norm(a_new - a_old)) < conv_tol:
             converged = True
             a, h = a_new, h_new
             break

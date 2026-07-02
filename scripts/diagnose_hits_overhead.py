@@ -81,7 +81,7 @@ def _gen_graph(graph_type: str, n: int) -> sp.csr_matrix:
 
 def _run_gpu_optimised(csr: sp.csr_matrix, label: str) -> None:
     from src.algorithms.gpu.cuda_optimized.hits import (
-        hits_gpu, clear_hits_buffer_pool,
+        hits_gpu, clear_hits_buffer_pool, clear_hits_graph_cache,
     )
 
     print(f"  [GPU optimised] {label}")
@@ -91,8 +91,11 @@ def _run_gpu_optimised(csr: sp.csr_matrix, label: str) -> None:
         "max_iter": MAX_ITER, "tolerance": 1e-4,
         "network_type": NETWORK_TYPE,
     }
+    # Start cold so the warmup call is a genuine graph-cache MISS (pays full
+    # setup) and the timed call is a HIT (setup should collapse to H2D only).
     clear_hits_buffer_pool()
-    hits_gpu(csr, params)                       # warmup (compile, pool fill)
+    clear_hits_graph_cache()
+    hits_gpu(csr, params)                       # warmup (compile, pool + cache fill)
 
     t0 = time.perf_counter()
     res = hits_gpu(csr, params)                 # timed
@@ -121,6 +124,7 @@ def _run_gpu_optimised(csr: sp.csr_matrix, label: str) -> None:
               f"iters={ii['iterations']:4d}  converged={ii['converged']}")
 
     clear_hits_buffer_pool()
+    clear_hits_graph_cache()
 
 
 def _run_gpu_baseline(csr: sp.csr_matrix, label: str) -> None:

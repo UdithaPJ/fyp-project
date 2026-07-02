@@ -74,6 +74,11 @@ def hits_cpu_single(graph_csr: sp.csr_matrix, params: dict) -> dict:
     tol      = float(p["tolerance"])
 
     N   = graph_csr.shape[0]
+    # Scale-invariant (per-node RMS) convergence threshold — the L2-norm score
+    # change grows like sqrt(N) for a fixed per-node change, so scaling the
+    # threshold by sqrt(N) keeps `tolerance` meaning the same thing regardless
+    # of graph size.  Matches the GPU HITS and cuGraph's n-scaled definition.
+    conv_tol = tol * float(np.sqrt(N))
     # MEMORY_FIX (M-8): FP32 throughout.  HITS uses L2-norm convergence,
     # which is well-behaved at FP32 for biological networks.  Saves
     # ~240 MB on 15 M-edge graphs (A + A^T).
@@ -90,7 +95,7 @@ def hits_cpu_single(graph_csr: sp.csr_matrix, params: dict) -> dict:
         a_new = _l2_normalize(A_T @ h_old)
         h_new = _l2_normalize(A   @ a_new)
 
-        if np.linalg.norm(h_new - h_old) + np.linalg.norm(a_new - a_old) < tol:
+        if np.linalg.norm(h_new - h_old) + np.linalg.norm(a_new - a_old) < conv_tol:
             converged = True
             a, h = a_new, h_new
             break
