@@ -33,7 +33,12 @@ from __future__ import annotations
 import numpy as np
 import scipy.sparse as sp
 
-from src.algorithms.common.helpers import _extract_clusters
+from src.algorithms.common.helpers import (
+    _available_ram_bytes,
+    _check_memory_or_raise,
+    _estimate_mcl_peak_ram_bytes,
+    _extract_clusters,
+)
 from src.algorithms.cpu.multi_threaded._graphblas_utils import (
     _configure_threads,
     _from_scipy,
@@ -95,6 +100,22 @@ def mcl_cpu_multi(
             "note": "graphblas SuiteSparse (empty graph)",
         }
 
+    # Memory guard: SuiteSparse SpGEMM is more memory-efficient than
+    # scipy, but M@M still requires the full output matrix in RAM.  Use
+    # float32 sizing (GraphBLAS backend runs FP32).  Raises early so the
+    # runner surfaces a clean failure.
+    _check_memory_or_raise(
+        _estimate_mcl_peak_ram_bytes(
+            graph_csr, expansion=e, dtype_bytes=4, index_bytes=4,
+        ),
+        _available_ram_bytes(),
+        backend="cpu_multi",
+        extra_hint=(
+            "Try mode=gpu (cuda_optimized) for larger graphs, "
+            "or raise prune_threshold / lower expansion."
+        ),
+    )
+
     # ---- Preprocess: symmetrize + binarize + self-loops + col-norm ------
     graph_sym = graph_csr + graph_csr.T
     graph_sym.data = np.ones_like(graph_sym.data, dtype=np.float32)
@@ -116,8 +137,16 @@ def mcl_cpu_multi(
         M_old_sp = _to_scipy(M_gb, "csr")
 
         # ---- Expansion: M = M^e via SuiteSparse SpGEMM ------------------
-        for _ in range(e - 1):
-            M_gb = M_gb.mxm(M_gb, gb.semiring.plus_times).new()
+        try:
+            for _ in range(e - 1):
+                M_gb = M_gb.mxm(M_gb, gb.semiring.plus_times).new()
+        except MemoryError as exc:
+            raise MemoryError(
+                f"MCL cpu_multi: RAM exhausted during expansion at "
+                f"iteration {iteration} (M.nnz={M_old_sp.nnz}). "
+                f"Try mode=gpu (cuda_optimized), raise prune_threshold, "
+                f"or lower expansion. Original: {exc}"
+            ) from exc
 
         # ---- Inflation: element-wise power ------------------------------
         M_gb = M_gb.apply(gb.binary.pow, right=r).new()

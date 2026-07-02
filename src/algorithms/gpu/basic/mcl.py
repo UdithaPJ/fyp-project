@@ -36,6 +36,11 @@ import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.csgraph as csgraph
 
+from src.algorithms.common.helpers import (
+    _check_memory_or_raise,
+    _estimate_mcl_peak_ram_bytes,
+)
+
 # Hard-fail: CuPy is required for MCL.  cuGraph has no MCL equivalent.
 try:
     import cupy as cp                         # noqa: F401
@@ -54,6 +59,20 @@ except ImportError as _e:
 # ---------------------------------------------------------------------------
 
 _BASELINE_MODE_CUPY: str = "gpu_baseline_cupy"
+
+
+def _free_vram_bytes() -> int:
+    """Live free-VRAM query via CuPy runtime; returns 0 on failure.
+
+    Zero means "unknown — skip the guard" for the shared
+    ``_check_memory_or_raise`` helper.
+    """
+    try:
+        import cupy as _cp
+        free, _total = _cp.cuda.runtime.memGetInfo()
+        return int(free)
+    except Exception:                                       # noqa: BLE001
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +190,22 @@ def _mcl_cupy(
     max_iter        = int(params["max_iter"])
     convergence_tol = float(params["convergence_tol"])
     nt              = str(params.get("network_type", "grn")).lower()
+
+    # VRAM guard: CuPy's SpGEMM materialises the full intermediate
+    # matrix, and there is no incremental fallback in this baseline.
+    # Refuse to start when M@M would blow the available VRAM budget.
+    # FP32 sizing (baseline runs in FP32) — same reuse path as CPU.
+    _check_memory_or_raise(
+        _estimate_mcl_peak_ram_bytes(
+            graph_csr, expansion=expansion, dtype_bytes=4, index_bytes=4,
+        ),
+        _free_vram_bytes(),
+        backend="gpu_baseline",
+        extra_hint=(
+            "Use mode=gpu (cuda_optimized) — it fuses threshold pruning "
+            "into SpGEMM and scales to larger graphs."
+        ),
+    )
 
     A_sym = _symmetrize_for(graph_csr, nt)
     M = _to_column_stochastic(A_sym)
