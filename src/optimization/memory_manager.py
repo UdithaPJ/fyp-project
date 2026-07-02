@@ -125,12 +125,19 @@ def estimate_algorithm_memory(
     """
     # Lazy import to avoid the gpu_config <-> memory_manager cycle.
     from src.optimization.gpu_config import (   # noqa: PLC0415
-        GraphProfiler, MemoryEstimator, get_gpu_config,
+        MemoryEstimator, get_cached_graph_profile, get_gpu_config,
     )
 
     cfg = get_gpu_config()
     try:
-        profile = GraphProfiler.profile(graph_csr)
+        # MEMORY_FIX: was calling GraphProfiler.profile(graph_csr) directly,
+        # bypassing _GRAPH_PROFILE_CACHE and recomputing the expensive
+        # A - A.T symmetry check + BFS-sampled bipartite check on EVERY
+        # apply_config() call regardless of graph size — multi-second cost
+        # on graphs with tens of millions of edges, paid on every algorithm
+        # invocation.  get_cached_graph_profile() reuses the same cache
+        # apply_config() itself already populates for this exact graph.
+        profile = get_cached_graph_profile(graph_csr)
     except Exception:                                   # noqa: BLE001
         # Non-CSR input — coarse hand-rolled estimate.
         try:

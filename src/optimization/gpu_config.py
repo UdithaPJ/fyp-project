@@ -673,6 +673,26 @@ class GraphProfiler:
         return True
 
 
+def get_cached_graph_profile(graph_csr) -> dict:
+    """Fingerprint + cache-or-compute a graph's structural profile.
+
+    ``GraphProfiler.profile()`` includes an ``A - A.T`` sparse
+    subtraction/transpose and a BFS-sampled bipartite check — genuinely
+    expensive (multi-second) on graphs with tens of millions of edges.
+    ``apply_config()`` was already memoizing this correctly via
+    ``_GRAPH_PROFILE_CACHE``, but ``memory_manager.estimate_algorithm_memory``
+    called ``GraphProfiler.profile()`` directly, bypassing the cache and
+    silently recomputing the full profile on EVERY algorithm invocation
+    regardless of the resident-graph / buffer caches an algorithm module
+    maintains on its own side.  All callers should go through this
+    function instead of calling ``GraphProfiler.profile()`` directly.
+    """
+    fingerprint = GraphProfiler.fingerprint(graph_csr)
+    if fingerprint not in _GRAPH_PROFILE_CACHE:
+        _GRAPH_PROFILE_CACHE[fingerprint] = GraphProfiler.profile(graph_csr)
+    return _GRAPH_PROFILE_CACHE[fingerprint]
+
+
 # ===========================================================================
 # MemoryEstimator — algorithm-aware VRAM pressure model
 # ===========================================================================
