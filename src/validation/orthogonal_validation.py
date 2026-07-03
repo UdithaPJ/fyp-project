@@ -66,7 +66,8 @@ from src.validation.metrics import normalized_mutual_info, adjusted_rand_index
 # Reuse the result-extraction helpers already written for the interaction
 # validator so the two validators stay consistent about result shapes.
 from src.validation.biological_validation import (
-    _extract_predicted, _extract_communities, _inner,
+    _extract_predicted, _extract_topk_predicted, _extract_communities,
+    _inner, _graph_universe,
 )
 
 _LOG = logging.getLogger(__name__)
@@ -145,8 +146,13 @@ class OrthogonalValidator:
         kinds: tuple[str, ...] = DEFAULT_KINDS,
         output_dir: Optional[Path] = None,
         reference_paths: Optional[dict[str, Path]] = None,
+        top_k: Optional[int] = None,
     ) -> None:
         self.kinds = tuple(kinds)
+        # When set (> 0), ranking algorithms are evaluated on their top-`top_k`
+        # nodes recomputed from the full score vector, rather than the small
+        # pre-baked top_nodes list.  Larger k → more statistical power.
+        self.top_k = int(top_k) if top_k and int(top_k) > 0 else None
 
         _root = Path(__file__).resolve().parents[2]
         self.output_dir = Path(output_dir) if output_dir else (
@@ -246,7 +252,13 @@ class OrthogonalValidator:
                 algo, ds, ref, kind, ref_name, background, result,
             )
 
-        predicted = _extract_predicted(algo, result, ds.node_index_map)
+        if self.top_k:
+            predicted = _extract_topk_predicted(
+                algo, result, ds.node_index_map, self.top_k,
+                network_type=ds.network_type, graph_csr=ds.graph_csr,
+            )
+        else:
+            predicted = _extract_predicted(algo, result, ds.node_index_map)
         if not predicted:
             return OrthogonalRecord(
                 algorithm=algo, dataset=ds.name,
@@ -254,8 +266,15 @@ class OrthogonalValidator:
                 note="no predicted nodes found in result", status="skipped",
             )
 
+        # Restrict the reference to genes present in the graph — a genome-wide
+        # gene set (e.g. 30k disease genes) larger than the graph inverts the
+        # Fisher table and forces p ≈ 1 even at precision 1.0.
+        universe = _graph_universe(ds.node_index_map)
+        ref_genes = (ref.genes & universe) if universe else ref.genes
+        bg = len(universe) if universe else background
+
         ov: OverlapResult = compute_overlap(
-            predicted, ref.genes, background_size=background,
+            predicted, ref_genes, background_size=bg,
         )
         return OrthogonalRecord(
             algorithm=algo, dataset=ds.name, network_type=ds.network_type,
@@ -263,7 +282,7 @@ class OrthogonalValidator:
             overlap_count=ov.overlap_count, predicted_size=ov.predicted_size,
             reference_size=ov.reference_size, precision=ov.precision,
             recall=ov.recall, jaccard=ov.jaccard, p_value=ov.p_value,
-            note="ranking-overlap vs orthogonal gene set", status="ok",
+            note="ranking-overlap vs in-graph orthogonal gene set", status="ok",
         )
 
     def _validate_communities(
@@ -278,8 +297,11 @@ class OrthogonalValidator:
                 note="no community structure found in result", status="skipped",
             )
 
+        universe = _graph_universe(ds.node_index_map)
+        ref_genes = (ref.genes & universe) if universe else ref.genes
+        bg = len(universe) if universe else background
         enriched: list[CommunityEnrichment] = enrich_communities(
-            communities, ref.genes, background_size=background,
+            communities, ref_genes, background_size=bg,
             top_k=len(communities),
         )
         total_size = sum(e.size for e in enriched) or 1

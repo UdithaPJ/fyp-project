@@ -157,6 +157,14 @@ def _parse_args() -> argparse.Namespace:
         "--holdout-fraction", type=float, default=0.2,
         help="Fraction of edges held out for the hold-out validator.",
     )
+    p.add_argument(
+        "--top-k", type=int, default=100,
+        help="Number of top-ranked nodes to evaluate for orthogonal / GO "
+             "enrichment of ranking algorithms (pagerank / hits / rwr).  "
+             "Recomputed from the full score vector, so it can exceed the "
+             "small pre-baked top_nodes list.  Larger k -> more statistical "
+             "power.  Set 0 to use the pre-baked top_nodes list instead.",
+    )
     # ── Label remapping (Ensembl protein id → gene symbol) ──
     p.add_argument(
         "--string-info-path", type=Path, default=None,
@@ -169,7 +177,7 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--no-remap", action="store_true",
-        help="Disable automatic Ensembl→symbol remapping even if a STRING "
+        help="Disable automatic Ensembl->symbol remapping even if a STRING "
              "info file is present.",
     )
     p.add_argument("--verbose", action="store_true")
@@ -377,6 +385,7 @@ def main() -> None:
         ortho = OrthogonalValidator(
             output_dir=args.output_dir,
             reference_paths=ref_paths or None,
+            top_k=args.top_k,
         )
         ortho.add_dataset(
             name=ds_name, graph_csr=graph_csr,
@@ -433,6 +442,7 @@ def main() -> None:
             output_dir=args.output_dir,
             reference_path=args.go_path,
             aspects=aspects,
+            top_k=args.top_k,
         )
         go.add_dataset(
             name=ds_name, graph_csr=graph_csr,

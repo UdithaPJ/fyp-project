@@ -57,7 +57,7 @@ from src.validation.reference_loader import (
 )
 from src.validation.overlap import fisher_exact_p
 from src.validation.biological_validation import (
-    _extract_predicted, _extract_communities,
+    _extract_predicted, _extract_topk_predicted, _extract_communities,
 )
 
 _LOG = logging.getLogger(__name__)
@@ -159,6 +159,7 @@ class GOEnrichmentValidator:
         output_dir: Optional[Path] = None,
         reference_path: Optional[Path] = None,
         aspects: Optional[set[str]] = None,
+        top_k: Optional[int] = None,
     ) -> None:
         _root = Path(__file__).resolve().parents[2]
         self.output_dir = Path(output_dir) if output_dir else (
@@ -166,6 +167,9 @@ class GOEnrichmentValidator:
         )
         (self.output_dir / "reports").mkdir(parents=True, exist_ok=True)
         (self.output_dir / "plots").mkdir(parents=True, exist_ok=True)
+        # Ranking algorithms are GO-enriched on their top-`top_k` nodes
+        # (recomputed from the score vector) when set (> 0).
+        self.top_k = int(top_k) if top_k and int(top_k) > 0 else None
 
         self._reference_path = reference_path
         self._aspects = aspects
@@ -250,7 +254,13 @@ class GOEnrichmentValidator:
             groups = [set(v) for v in communities.values() if v]
             note = f"GO enrichment over {len(groups)} communities"
         else:
-            predicted = _extract_predicted(algo, result, ds.node_index_map)
+            if self.top_k:
+                predicted = _extract_topk_predicted(
+                    algo, result, ds.node_index_map, self.top_k,
+                    network_type=ds.network_type, graph_csr=ds.graph_csr,
+                )
+            else:
+                predicted = _extract_predicted(algo, result, ds.node_index_map)
             groups = [set(predicted)] if predicted else []
             note = "GO enrichment of top-node set"
 

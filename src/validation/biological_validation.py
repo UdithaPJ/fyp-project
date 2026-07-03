@@ -228,6 +228,75 @@ def _extract_predicted(
     return []
 
 
+def _score_vector(algorithm: str, inner: dict) -> Optional["np.ndarray"]:
+    """Full-length node score vector used to rank nodes for top-k selection.
+
+    pagerank / rwr → ``scores``; hits → ``hub_scores + authority_scores``
+    (either alone if only one is present).  Returns None when no usable
+    vector exists.
+    """
+    if algorithm == "hits":
+        hub  = np.asarray(inner.get("hub_scores", []), dtype=np.float64)
+        auth = np.asarray(inner.get("authority_scores", []), dtype=np.float64)
+        if hub.size and auth.size and hub.size == auth.size:
+            return hub + auth
+        if hub.size:
+            return hub
+        return auth if auth.size else None
+    s = np.asarray(inner.get("scores", []), dtype=np.float64)
+    return s if s.size else None
+
+
+def _extract_topk_predicted(
+    algorithm: str,
+    result: dict,
+    node_index_map: Optional[dict],
+    k: int,
+    network_type: str = "ppi",
+    graph_csr=None,
+) -> list[str]:
+    """Return the top-``k`` node labels ranked by the algorithm's score vector.
+
+    Unlike :func:`_extract_predicted` (which reads the small pre-baked
+    ``top_nodes`` list), this recomputes the ranking from the full ``scores``
+    vector so an arbitrary ``k`` can be evaluated.  Falls back to
+    :func:`_extract_predicted` when no full score vector is available.
+
+    Network-type correctness: for GRN / miRNA PageRank, raw scores are
+    dominated by *target* genes (dangling sinks accumulate mass), so ranking
+    is restricted to nodes with out-degree > 0 (the regulators / miRNAs),
+    matching the ``top_regulators`` semantics.  PPI applies no restriction.
+    """
+    inner = _inner(result)
+    vec = _score_vector(algorithm, inner)
+    idx_to_label = _reverse_index_map(node_index_map)
+    if vec is None or idx_to_label is None or vec.size != len(idx_to_label):
+        # No aligned score vector → fall back to the pre-baked list.
+        return _extract_predicted(algorithm, result, node_index_map)
+
+    n = vec.size
+    eligible = np.ones(n, dtype=bool)
+    if (algorithm == "pagerank" and network_type in ("grn", "mirna")
+            and graph_csr is not None):
+        try:
+            outdeg = np.diff(graph_csr.tocsr().indptr)
+            if outdeg.size == n and np.any(outdeg > 0):
+                eligible = outdeg > 0
+        except Exception:
+            pass
+
+    idx = np.where(eligible)[0]
+    if idx.size == 0:
+        return _extract_predicted(algorithm, result, node_index_map)
+    top = idx[np.argsort(vec[idx])[::-1][:max(1, int(k))]]
+    out: list[str] = []
+    for i in top:
+        lbl = idx_to_label.get(int(i))
+        if lbl is not None:
+            out.append(str(lbl).strip().upper())
+    return out
+
+
 def _extract_communities(
     result: dict, node_index_map: dict,
 ) -> dict[int, list[str]]:
@@ -255,10 +324,9 @@ def _extract_communities(
                                 entry.get("cluster_id",
                                           entry.get("id", len(out)))))
             members = entry.get("member_nodes") or entry.get("members") or []
-            labels = _safe_labels(members)
-            if not labels and members:
-                labels = [idx_to_label.get(int(m), f"NODE_{m}")
-                          for m in members if isinstance(m, (int, np.integer))]
+            # Pass idx_to_label so plain-integer members resolve to real gene
+            # symbols instead of collapsing to unmatchable NODE_<idx> tokens.
+            labels = _safe_labels(members, idx_to_label)
             if labels:
                 out[cid] = labels
 
@@ -278,6 +346,18 @@ def _extract_communities(
                 idx_to_label.get(int(i), f"NODE_{i}")
             )
     return out
+
+
+def _graph_universe(node_index_map: dict) -> set[str]:
+    """Upper-cased set of every node label in the graph.
+
+    This is the correct statistical background for enrichment: only nodes
+    that exist in the graph can ever be predicted, so the reference set must
+    be intersected with this universe before a Fisher test.  Passing the raw
+    genome-wide reference (which can be *larger* than the graph) inverts the
+    contingency table and forces p ≈ 1 even at precision 1.0.
+    """
+    return {str(l).strip().upper() for l in (node_index_map or {})}
 
 
 _CIRCULARITY_THRESHOLD = 0.90   # >90% of graph nodes in ref → likely circular
@@ -505,6 +585,14 @@ class BiologicalValidator:
         else:
             ref_set = ref.all_nodes               # generic: any reference node
 
+        # Restrict the reference to genes that actually exist in this graph;
+        # otherwise a genome-wide reference larger than the graph inverts the
+        # Fisher table (p ≈ 1 even when every prediction is a hit).
+        universe = _graph_universe(ds.node_index_map)
+        if universe:
+            ref_set = ref_set & universe
+            background_size = len(universe)
+
         ov: OverlapResult = compute_overlap(
             predicted, ref_set, background_size=background_size,
         )
@@ -543,8 +631,13 @@ class BiologicalValidator:
                 status       = "skipped",
             )
 
-        # Enrichment of each community vs reference source set
+        # Enrichment of each community vs reference source set, restricted to
+        # the graph's own node universe (see _graph_universe).
         ref_set = ref.sources or ref.all_nodes
+        universe = _graph_universe(ds.node_index_map)
+        if universe:
+            ref_set = ref_set & universe
+            background_size = len(universe)
         enriched: list[CommunityEnrichment] = enrich_communities(
             communities, ref_set, background_size=background_size,
             top_k=len(communities),

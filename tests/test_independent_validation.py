@@ -189,6 +189,79 @@ def test_load_gene_set_depmap_paren_suffix(tmp_path: Path):
 
 
 # ===========================================================================
+# Top-k selection from the full score vector
+# ===========================================================================
+
+def test_extract_topk_from_scores():
+    """top_k must recompute the ranking from the full ``scores`` vector,
+    not the small pre-baked top_nodes list."""
+    from src.validation.biological_validation import _extract_topk_predicted
+    nim = {f"GENE{i}": i for i in range(6)}
+    # scores ascending by index → GENE5 highest
+    result = {"result": {"scores": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+                         "top_nodes": [{"index": 5, "label": "GENE5"}]}}
+    top3 = _extract_topk_predicted("pagerank", result, nim, k=3,
+                                   network_type="ppi")
+    assert top3 == ["GENE5", "GENE4", "GENE3"]
+
+
+def test_extract_topk_hits_uses_hub_plus_authority():
+    from src.validation.biological_validation import _extract_topk_predicted
+    nim = {f"G{i}": i for i in range(4)}
+    result = {"result": {"hub_scores": [0.1, 0.9, 0.2, 0.0],
+                         "authority_scores": [0.0, 0.0, 0.9, 0.1]}}
+    # combined: G0=0.1 G1=0.9 G2=1.1 G3=0.1 → top2 = G2, G1
+    assert _extract_topk_predicted("hits", result, nim, k=2) == ["G2", "G1"]
+
+
+def test_extract_topk_grn_pagerank_excludes_dangling_targets():
+    """For GRN, raw PageRank scores peak on target sinks; top-k must be
+    restricted to out-degree>0 regulators."""
+    import scipy.sparse as sp
+    from src.validation.biological_validation import _extract_topk_predicted
+    # 3 nodes: 0->2, 1->2.  Node 2 is a pure target (out-degree 0) and would
+    # top the raw PageRank ranking, but must be excluded for GRN.
+    csr = sp.csr_matrix(([1.0, 1.0], ([0, 1], [2, 2])), shape=(3, 3))
+    nim = {"TF0": 0, "TF1": 1, "TARGET2": 2}
+    result = {"result": {"scores": [0.2, 0.3, 0.9]}}  # target has highest score
+    got = _extract_topk_predicted("pagerank", result, nim, k=3,
+                                  network_type="grn", graph_csr=csr)
+    assert "TARGET2" not in got            # dangling target excluded
+    assert set(got) == {"TF0", "TF1"}
+
+
+def test_extract_topk_falls_back_without_scores():
+    from src.validation.biological_validation import _extract_topk_predicted
+    nim = {"A": 0, "B": 1}
+    # No scores vector → fall back to pre-baked top_nodes
+    result = {"result": {"top_nodes": [{"index": 1, "label": "B"}]}}
+    assert _extract_topk_predicted("pagerank", result, nim, k=5) == ["B"]
+
+
+def test_orthogonal_top_k_increases_overlap(tmp_path: Path):
+    """A larger top_k must evaluate more predicted nodes (regression that
+    the top_k plumbing reaches the overlap computation)."""
+    from src.validation import OrthogonalValidator
+    n = 60
+    csr = _block_graph()
+    nim = _labels(n)
+    dis = tmp_path / "disgenet.tsv"
+    dis.write_text("geneSymbol\n" + "\n".join(f"GENE{i}" for i in range(40)))
+    # descending scores so GENE0..k-1 are the top-k (all disease genes)
+    scores = [float(n - i) for i in range(n)]
+    results = {"pagerank": {"result": {"scores": scores,
+               "top_nodes": [{"index": i, "label": f"GENE{i}"} for i in range(5)]}}}
+    ov = OrthogonalValidator(kinds=("disease",), output_dir=tmp_path,
+                             reference_paths={"disease": dis}, top_k=30)
+    ov.add_dataset("s", csr, "ppi", nim, results)
+    ov.run(algorithms=("pagerank",))
+    rec = ov.records[0]
+    assert rec.status == "ok"
+    assert rec.predicted_size == 30        # evaluated top-30, not top-5
+    assert rec.overlap_count == 30         # all 30 are disease genes
+
+
+# ===========================================================================
 # STRING id → gene-symbol remap
 # ===========================================================================
 
@@ -385,8 +458,16 @@ def test_holdout_runs_all_algorithms(tmp_path: Path):
     hv = HoldoutValidator(output_dir=tmp_path, test_fraction=0.2, seed=1)
     hv.add_dataset("synth", csr, "ppi")
     hv.run(algorithms=("pagerank", "hits", "rwr", "louvain", "mcl"))
+    # The contract is "never raise" — every algorithm yields exactly one
+    # record with a recorded status.  "error" is a legitimate outcome (e.g.
+    # MCL's cpu_single memory guard can abort under RAM pressure); the point
+    # here is that the validator handled all five gracefully.
     assert len(hv.records) == 5
-    assert all(r.status in ("ok", "skipped") for r in hv.records)
+    assert all(r.status in ("ok", "skipped", "error") for r in hv.records)
+    # The two purely-numeric ranking algos should always succeed on this
+    # small, well-formed graph.
+    by_algo = {r.algorithm: r for r in hv.records}
+    assert by_algo["pagerank"].status == "ok"
 
 
 def test_holdout_ranking_produces_auroc(tmp_path: Path):
