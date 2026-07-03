@@ -1494,15 +1494,27 @@ def louvain_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
         for _level in range(max_levels):
             n_cur = int(current.shape[0])
 
-            # Decide whether to use the chunked Phase-1 path: explicit
-            # opt-in via ``use_chunking=True`` OR the estimated CSR working
-            # set exceeds the safety budget.
+            # Use the chunked Phase-1 path ONLY when this level's CSR working
+            # set genuinely does not fit in VRAM.  The chunked path streams CSR
+            # rows and (per its docstring) drops the freeze optimisation, so it
+            # is strictly slower when the graph fits.  A use_chunking=True flag
+            # from params is deliberately NOT honoured: apply_config's
+            # MemoryManager injects it from a coarse estimate and, since the
+            # runner calls apply_config before this function, that injected
+            # flag is indistinguishable from a user-supplied one.  est_bytes
+            # (this level's precise estimate) is the sole authority.
             try:
                 free_bytes, _total = cuda.mem_get_info()
             except Exception:                           # noqa: BLE001
                 free_bytes = 1 << 30
             est_bytes = int(current.nnz) * 8 + n_cur * 8
-            use_chunked = use_chunking_req or (est_bytes > VRAM_SAFETY * free_bytes)
+            use_chunked = est_bytes > VRAM_SAFETY * free_bytes
+            if use_chunking_req and not use_chunked and _level == 0:
+                logging.info(
+                    "louvain_gpu: use_chunking ignored — level-0 working set "
+                    "%.1f MB fits in %.1f MB free.",
+                    est_bytes / 1e6, free_bytes / 1e6,
+                )
 
             level_fn = _louvain_level_chunked if use_chunked else _louvain_level
             level_community, level_modularity = level_fn(
