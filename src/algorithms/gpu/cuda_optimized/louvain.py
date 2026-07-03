@@ -370,12 +370,27 @@ __global__ void compute_proposed_moves(
     if (threadIdx.x == 0) {
         float best_gain = 0.0f;
         int   best_comm = c_old;
-        const float leave = s_leave;
+        const float leave     = s_leave;
+        const float sigma_old = comm_degree_sum[c_old];
         for (int b = 0; b < SMEM_HASH_SIZE; ++b) {
             const int nc = smem_comm_keys[b];
             if (nc < 0 || nc == c_old) continue;
-            const float k_u_in    = smem_comm_wts[b];
             const float sigma_new = comm_degree_sum[nc];
+            // Anti-oscillation tie-break.  Bulk-synchronous parallel Phase 1
+            // otherwise lets two singleton communities SWAP labels every pass
+            // (u -> {v} while v -> {u}), so they never coalesce — the cause of
+            // the poor modularity + non-convergence on scale-free/random
+            // graphs.  Restrict moves to a community that is "at least as
+            // senior": strictly greater total degree, or equal degree with a
+            // lower id.  This makes any mutual pair asymmetric — exactly one
+            // moves, so communities MERGE instead of swapping — and biases
+            // toward absorbing into larger communities (standard Louvain
+            // behaviour).  Uses only comm_degree_sum, already resident: no new
+            // buffers or kernels.
+            const bool senior = (sigma_new > sigma_old) ||
+                                (sigma_new == sigma_old && nc < c_old);
+            if (!senior) continue;
+            const float k_u_in    = smem_comm_wts[b];
             const float join      = 2.0f * inv_2m * k_u_in
                                     - 2.0f * resolution * k_u * sigma_new
                                       * inv_2m * inv_2m;
