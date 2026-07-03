@@ -833,6 +833,7 @@ def _louvain_level(
     d_prev_comm = _to_gpu(community_h.copy())
     d_comm_degs = _to_gpu(comm_degsum_h)
     d_proposed  = _empty((n,), np.int32)
+    d_best_comm = _empty((n,), np.int32)   # best partition seen (Q-tracked)
     d_move_cnt  = _empty((1,), np.int32)
     d_freeze_ct = gpuarray.zeros((n,), np.int32)
     d_frozen    = gpuarray.zeros((n,), np.int32)
@@ -856,6 +857,22 @@ def _louvain_level(
         grid_n     = (n, 1, 1)
         block_256  = (BLOCK_SIZE, 1, 1)
         early_stop_threshold = max(1, int(n * float(early_stop_fraction)))
+        mod_grid = (mod_blocks, 1, 1)
+
+        # Objective-based convergence.  Bulk-synchronous parallel Phase 1
+        # OSCILLATES on scale-free / random graphs (adjacent nodes swap
+        # communities every pass), so ``move_count`` stays high and the loop
+        # burns all max_phase1_passes without the modularity improving — slow
+        # AND leaving a poor partition.  We therefore compute Q after every
+        # pass, KEEP THE BEST partition seen (parallel Phase 1 can overshoot a
+        # peak then degrade, so the last pass is not necessarily the best), and
+        # stop once Q fails to improve by min_delta_q for MOD_PATIENCE passes.
+        # This finally gives min_delta_q its proper role as a level-convergence
+        # tolerance (not a per-move gate — that is handled above via inv_2m).
+        MOD_PATIENCE = 3
+        best_Q      = -1.0e30
+        best_valid  = False
+        no_improve  = 0
 
         for _pass in range(max_phase1_passes):
             cuda.memset_d32(d_move_cnt.gpudata, 0, 1)
@@ -903,23 +920,41 @@ def _louvain_level(
                 stream=stream_compute,
             )
 
+            # Modularity of the partition AFTER this pass.
+            k_mod(
+                d_edge_src, d_col_idx, d_edge_wt,
+                d_community, d_degree, d_partial_Q,
+                np.float32(inv_2m), np.float32(resolution),
+                np.int32(nnz),
+                block=block_256, grid=mod_grid, stream=stream_compute,
+            )
+
             stream_compute.synchronize()
             move_count = int(d_move_cnt.get()[0])
-            if move_count < early_stop_threshold:
+            cur_Q = float(inv_2m * float(np.sum(d_partial_Q.get())))
+
+            gained = cur_Q - best_Q
+            if cur_Q > best_Q:
+                best_Q = cur_Q
+                cuda.memcpy_dtod_async(
+                    d_best_comm.gpudata, d_community.gpudata, n * 4,
+                    stream_compute,
+                )
+                best_valid = True
+            # Patience: a pass that improves Q by less than min_delta_q counts
+            # as "no meaningful progress".
+            no_improve = 0 if gained >= min_delta_q else no_improve + 1
+
+            if move_count < early_stop_threshold or no_improve >= MOD_PATIENCE:
                 break
 
-        mod_grid = (mod_blocks, 1, 1)
-        k_mod(
-            d_edge_src, d_col_idx, d_edge_wt,
-            d_community, d_degree, d_partial_Q,
-            np.float32(inv_2m), np.float32(resolution),
-            np.int32(nnz),
-            block=block_256, grid=mod_grid, stream=stream_compute,
-        )
         stream_compute.synchronize()
-
-        modularity = float(inv_2m * float(np.sum(d_partial_Q.get())))
-        community_out = d_community.get().astype(np.int32)
+        if best_valid:
+            community_out = d_best_comm.get().astype(np.int32)
+            modularity    = best_Q
+        else:
+            community_out = d_community.get().astype(np.int32)
+            modularity    = 0.0
         return community_out, modularity
 
     finally:
