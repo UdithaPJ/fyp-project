@@ -54,11 +54,21 @@ from src.validation import (                                    # noqa: E402
 
 
 def _load_graph(raw_path: Path, sample_rows: int | None,
-                mapping: dict[str, str] | None):
+                mapping: dict[str, str] | None,
+                min_edge_weight: float = 0.0):
     print(f"[validate] loading {raw_path} (sample_rows={sample_rows})")
     df = pd.read_csv(raw_path, sep=None, engine="python",
                      nrows=sample_rows, low_memory=True)
     print(f"[validate] rows loaded: {len(df):,}")
+
+    # Confidence filter — drop weak edges before graph construction so dense
+    # sources like STRING don't fuse into a single unclusterable hairball.
+    if min_edge_weight and mapping and mapping.get("weight") in df.columns:
+        wcol = mapping["weight"]
+        before = len(df)
+        df = df[pd.to_numeric(df[wcol], errors="coerce") >= min_edge_weight]
+        print(f"[validate] edge filter {wcol} >= {min_edge_weight:g}: "
+              f"{before:,} -> {len(df):,} rows")
 
     pipeline = PreprocessingPipeline()
     graph_data, report = pipeline.run_dataframe(
@@ -83,6 +93,23 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--sample-rows", type=int, default=50_000,
                    help="0 = load the whole file")
+    p.add_argument(
+        "--min-edge-weight", type=float, default=0.0,
+        help="Drop edges whose weight column is below this value BEFORE "
+             "building the graph.  Essential for STRING PPI: the raw file "
+             "includes very low-confidence edges (combined_score down to "
+             "~150) that fuse the graph into one hairball with no cluster "
+             "structure.  Recommended 700 (high confidence) — lifts Louvain "
+             "modularity from ~0.38 to ~0.80.  0 = no filter (default).",
+    )
+    p.add_argument(
+        "--mcl-inflation", type=float, default=2.5,
+        help="MCL inflation parameter (default 2.5).  Higher = more, tighter "
+             "clusters.  Note: on very dense graphs (unfiltered STRING) MCL "
+             "may still collapse into one giant cluster regardless — filter "
+             "with --min-edge-weight and/or prefer Louvain for community "
+             "validation.",
+    )
     p.add_argument("--network-type",
                    choices=["grn", "ppi", "mirna"], default="ppi")
     p.add_argument(
@@ -104,8 +131,13 @@ def _parse_args() -> argparse.Namespace:
         help="BFS source node index (default 0)",
     )
     p.add_argument(
-        "--rwr-seeds", type=str, default="0",
-        help="comma-separated RWR seed node indices",
+        "--rwr-seeds", type=str, default="",
+        help="Comma-separated RWR seed node indices.  EMPTY (default) runs "
+             "GLOBAL RWR (uniform restart, PageRank-like centrality) — the "
+             "right choice for topology-importance validation.  Seeding at a "
+             "single arbitrary node (the old default '0') makes RWR reflect "
+             "proximity to that one protein, not global importance.  For a "
+             "guilt-by-association test, seed with known reference genes.",
     )
     p.add_argument(
         "--biological", action="store_true",
@@ -264,6 +296,7 @@ def main() -> None:
             "target": args.target_col,
             "weight": args.weight_col,
         },
+        min_edge_weight=args.min_edge_weight,
     )
 
     # ── Ensembl protein id → gene symbol remapping ──
@@ -287,10 +320,16 @@ def main() -> None:
     ds_name = args.dataset_name or args.raw_path.stem
 
     rwr_seeds = [int(s) for s in str(args.rwr_seeds).split(",") if s.strip()]
+    # Empty seeds → global (uniform-restart) RWR; do NOT force [0].
     params_override = {
         "bfs": {"source": int(args.source_node)},
-        "rwr": {"seed_nodes": rwr_seeds or [0]},
+        "rwr": {"seed_nodes": rwr_seeds},
+        "mcl": {"inflation": float(args.mcl_inflation)},
     }
+    if rwr_seeds:
+        print(f"[validate] RWR seeded at nodes {rwr_seeds}")
+    else:
+        print("[validate] RWR running GLOBAL (empty seeds, uniform restart)")
 
     if args.algorithms.lower() == "all":
         algos = list(ALGORITHMS)
