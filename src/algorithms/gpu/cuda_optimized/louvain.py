@@ -240,7 +240,6 @@ __global__ void compute_proposed_moves(
     const int                  n)
 {
     __shared__ float smem_f[BLOCK_SIZE];
-    __shared__ int   smem_i[BLOCK_SIZE];
     __shared__ float s_leave;
     __shared__ float s_k_self;
     __shared__ int   s_proposed;
