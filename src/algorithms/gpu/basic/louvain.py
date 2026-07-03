@@ -96,8 +96,14 @@ def _louvain_cugraph(
 
     kwargs: dict[str, Any] = {}
     if "resolution" in accepted: kwargs["resolution"] = float(params["resolution"])
-    if "max_iter"   in accepted: kwargs["max_iter"]   = 100
-    if "max_level"  in accepted: kwargs["max_level"]  = int(params["max_levels"])
+    # Prefer the modern ``max_level`` and NEVER pass both: current RAPIDS
+    # deprecated ``max_iter`` and raises "Cannot specify both max_iter and
+    # max_level" if both are given.  Only fall back to ``max_iter`` on old
+    # releases that lack ``max_level``.
+    if "max_level" in accepted:
+        kwargs["max_level"] = int(params["max_levels"])
+    elif "max_iter" in accepted:
+        kwargs["max_iter"] = int(params["max_levels"])
 
     res = louvain(G, **kwargs)
     if isinstance(res, tuple) and len(res) == 2:

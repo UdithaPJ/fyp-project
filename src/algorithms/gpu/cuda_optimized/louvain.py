@@ -872,7 +872,15 @@ def _louvain_level(
                 d_community, d_comm_degs, d_degree,
                 d_frozen,                                # NEW: frozen mask
                 d_proposed,
-                np.float32(min_delta_q),
+                # Per-move acceptance threshold.  A single node's modularity
+                # gain scales as ~1/(2m), so a fixed absolute threshold (the
+                # old default min_delta_q=1e-4) rejects EVERY move on any graph
+                # with more than a few thousand edges — leaving every node in
+                # its own community (num_communities == n, modularity == 0).
+                # Scaling by inv_2m makes the threshold track the natural gain
+                # magnitude, so min_delta_q stays a meaningful tuning knob while
+                # actually accepting improving moves at any graph size.
+                np.float32(min_delta_q * inv_2m),
                 np.float32(inv_2m),
                 np.float32(resolution),
                 np.int32(n),
@@ -1058,7 +1066,8 @@ def _louvain_level_chunked(
                     d_community, d_comm_degs, d_degree,
                     np.intp(0),                          # NULL frozen ptr
                     d_proposed_local,
-                    np.float32(min_delta_q),
+                    # Scale-invariant per-move threshold — see _louvain_level.
+                    np.float32(min_delta_q * inv_2m),
                     np.float32(inv_2m),
                     np.float32(resolution),
                     np.int32(cs),
