@@ -1358,6 +1358,7 @@ def pagerank_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
         prof.end()
 
         # Chunk ONLY when the graph genuinely does not fit in VRAM.
+        auto_chunk = est_bytes > chunk_vram_pct * free_bytes
         #
         # The chunked path re-streams the ENTIRE CSR host→device every
         # iteration (see _transfer_chunk_async inside the iteration loop) —
