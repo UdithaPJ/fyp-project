@@ -94,6 +94,21 @@ def _run_cpu_single(csr: sp.csr_matrix, label: str) -> None:
     print(f"  [CPU single]    {label}: wall={wall:8.2f} ms  num_comm={nc}")
 
 
+def _run_cpu_multi(csr: sp.csr_matrix, label: str) -> None:
+    from src.algorithms.cpu.multi_threaded.louvain import (
+        _NETWORKIT_AVAILABLE, louvain_cpu_multi,
+    )
+    t0 = time.perf_counter()
+    res = louvain_cpu_multi(csr, PARAMS)
+    wall = (time.perf_counter() - t0) * 1000.0
+    nc = res.get("num_communities", res.get("result", {}).get("num_communities"))
+    mod = res.get("modularity", res.get("result", {}).get("modularity"))
+    backend = "networkit" if _NETWORKIT_AVAILABLE else "scipy_fallback"
+    mod_str = f"{mod:.4f}" if isinstance(mod, (int, float)) else str(mod)
+    print(f"  [CPU multi]     {label}: wall={wall:8.2f} ms  num_comm={nc}  "
+          f"modularity={mod_str}  backend={backend}")
+
+
 def _run_gpu_baseline(csr: sp.csr_matrix, label: str) -> None:
     try:
         from src.algorithms.gpu.basic.louvain import louvain_gpu_baseline
@@ -130,6 +145,7 @@ def main() -> None:
             label = f"{gt} n={csr.shape[0]:,} m={csr.nnz:,}"
             _run_gpu_optimised(csr, label)
             _run_cpu_single(csr, label)
+            _run_cpu_multi(csr, label)
             _run_gpu_baseline(csr, label)
 
 
