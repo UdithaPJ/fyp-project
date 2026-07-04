@@ -41,6 +41,18 @@ from src.benchmarking.runtime_benchmark    import RuntimeBenchmarker      # noqa
 from src.benchmarking.scalability_benchmark import ScalabilityBenchmarker  # noqa: E402
 
 
+# Force UTF-8 stdout/stderr so benchmark prints (which contain em-dash, ×, …)
+# never raise UnicodeEncodeError under an ascii / narrow-codec locale.
+for _stream in (sys.stdout, sys.stderr):
+    _rc = getattr(_stream, "reconfigure", None)
+    if _rc is not None and (getattr(_stream, "encoding", "") or "").lower() \
+            not in ("utf-8", "utf8"):
+        try:
+            _rc(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------

@@ -77,6 +77,35 @@ if _ROOT not in sys.path:
 from src.optimization.gpu_config import apply_config, print_gpu_summary
 
 
+def _force_utf8_streams() -> None:
+    """Make stdout/stderr encode UTF-8 so benchmark prints never crash.
+
+    Result notes and progress messages contain non-ASCII characters
+    (em-dash, ``×``, ``…``, ``Aᵀ``).  When the interpreter's stdout uses a
+    narrow codec — ``ascii`` under a C/POSIX locale, or when output is piped
+    on some Windows setups — ``print()`` raises ``UnicodeEncodeError``.
+    Reconfiguring to UTF-8 (with ``errors="replace"`` as a final safety net)
+    fixes every such character at once.  No-op on interpreters without
+    ``TextIOWrapper.reconfigure`` (pre-3.7) or already-UTF-8 streams.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        enc = (getattr(stream, "encoding", "") or "").lower()
+        if enc in ("utf-8", "utf8"):
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+# Force UTF-8 output BEFORE the first print (print_gpu_summary below prints
+# a banner at import time).
+_force_utf8_streams()
+
+
 # Print the detected GPU configuration once, at runner startup.
 # Cached at module level so subsequent apply_config() calls are free.
 print_gpu_summary()
