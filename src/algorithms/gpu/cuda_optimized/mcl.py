@@ -205,7 +205,8 @@ __global__ void spgemm_hash_row(
     int*         __restrict__ C_nnz,
     const int                  num_rows_in_list,
     const int                  hash_size,
-    const int                  max_C_nnz)
+    const int                  max_C_nnz,
+    const float                prune_threshold)
 {
     extern __shared__ int smem[];
     int*   hash_keys = smem;
@@ -257,10 +258,13 @@ __global__ void spgemm_hash_row(
     __syncthreads();
 
     // --- Flush non-empty hash buckets to COO output ---------------------
+    // Threshold pruning is fused here (O1): entries below prune_threshold
+    // are never written, so max_C_nnz can be sized against the post-prune
+    // survivor count instead of the raw hash-accumulator output.
     for (int b = threadIdx.x; b < hash_size; b += blockDim.x) {
         const int   key = hash_keys[b];
         const float val = hash_vals[b];
-        if (key >= 0 && val > 0.0f) {
+        if (key >= 0 && val >= prune_threshold) {
             const int pos = atomicAdd(C_nnz, 1);
             if (pos < max_C_nnz) {
                 C_row[pos] = row_i;
@@ -294,7 +298,8 @@ __global__ void spgemm_row_chunk(
     int*         __restrict__ C_nnz,
     const int                  num_rows_in_list,
     const int                  n,
-    const int                  max_C_nnz)
+    const int                  max_C_nnz,
+    const float                prune_threshold)
 {
     if (blockIdx.x >= num_rows_in_list) return;
     const int row = row_list[blockIdx.x];
@@ -323,7 +328,8 @@ __global__ void spgemm_row_chunk(
                 ++bi;
             }
         }
-        if (dot > 0.0f) {
+        // Threshold pruning fused (O1) — see spgemm_hash_row.
+        if (dot >= prune_threshold) {
             const int pos = atomicAdd(C_nnz, 1);
             if (pos < max_C_nnz) {
                 C_row[pos] = row;
@@ -879,40 +885,94 @@ def _next_pow2(x: int) -> int:
 
 def _estimate_spgemm_output_size(
     M_csr: sp.csr_matrix,
-    safety_factor: float = 3.0,
+    safety_factor: float = 1.5,
 ) -> int:
-    """Estimate the output nnz of ``M @ M`` with hub-node correction.
+    """Estimate the output nnz of ``M @ M``.
 
-    The naive estimate (nnz * avg_row) consistently underestimates for
-    power-law biological networks because the top few hub rows generate
-    disproportionate fill-in.  We correct for this by weighting the
-    estimate by the ratio of the 95th-percentile row length to the
-    average row length.
+    With threshold pruning fused into the SpGEMM hash flush (O1), the
+    per-row output is bounded by the number of hash buckets whose value
+    survived ``prune_threshold`` — typically 10–30 % of the raw
+    accumulator entries.  The old hub-correction factor was compensating
+    for the fact that ALL accumulator entries had to be materialized;
+    with fusion, hub rows still expand but overwhelmingly into
+    below-threshold noise that never gets written.
+
+    The estimator therefore no longer applies a p95/avg hub correction
+    and defaults to a modest ``safety_factor=1.5`` (O13).  The floor is
+    ``nnz // 4`` rather than ``nnz`` because after pruning the output
+    can be significantly smaller than the input.
 
     Parameters
     ----------
     M_csr : sp.csr_matrix
         Input matrix (will be squared).
     safety_factor : float
-        Multiplier applied to the corrected estimate.  Default 3.0 gives
-        a comfortable margin without requiring a full worst-case allocation.
+        Multiplier applied to the estimate.  Default 1.5.
 
     Returns
     -------
     int
-        Estimated output nnz, at minimum equal to ``M_csr.nnz``.
+        Estimated output nnz.
     """
     n   = int(M_csr.shape[0])
     nnz = int(M_csr.nnz)
     if nnz == 0 or n == 0:
         return 0
-    row_lens = np.diff(M_csr.indptr).astype(np.float64)
-    avg_row  = max(1.0, float(nnz) / max(1, n))
-    # Hub correction: top-5% rows inflate fill-in non-linearly.
-    p95_row  = float(np.percentile(row_lens, 95)) if n > 1 else avg_row
-    hub_correction = max(1.0, p95_row / max(1.0, avg_row))
-    est = int(nnz * avg_row * hub_correction * safety_factor)
-    return max(est, nnz)
+    avg_row = max(1.0, float(nnz) / max(1, n))
+    est = int(nnz * avg_row * safety_factor)
+    return max(est, nnz // 4)
+
+
+# ---------------------------------------------------------------------------
+# O11: adaptive prune threshold under VRAM pressure
+# ---------------------------------------------------------------------------
+
+def _adaptive_prune_threshold(
+    M: sp.csr_matrix,
+    base_threshold: float,
+    max_multiplier: float = 32.0,
+) -> tuple[float, str]:
+    """Bump ``prune_threshold`` when estimated SpGEMM output exceeds safe VRAM.
+
+    Called at the top of every MCL iteration.  Compares the projected
+    SpGEMM output footprint (COO bytes) against a fraction of currently
+    free VRAM.  If the estimate exceeds the budget, doubles the
+    threshold until the estimate fits or ``max_multiplier`` is reached.
+
+    Returns
+    -------
+    (adjusted_threshold, note)
+        ``note`` is an empty string when no adjustment was needed.
+    """
+    if not PYCUDA_AVAILABLE:
+        return base_threshold, ""
+    try:
+        free_bytes, _ = cuda.mem_get_info()
+    except Exception:                                   # noqa: BLE001
+        return base_threshold, ""
+
+    est_nnz   = _estimate_spgemm_output_size(M)
+    est_bytes = est_nnz * COO_BYTES_PER_ENTRY
+    budget    = max(1, int(free_bytes * VRAM_BUDGET_FRACTION))
+    if est_bytes <= budget:
+        return base_threshold, ""
+
+    pressure_ratio = est_bytes / float(budget)
+    # Each doubling of the threshold roughly halves survivors on the
+    # power-law degree distribution typical of biological networks.
+    steps = int(math.ceil(math.log2(pressure_ratio)))
+    steps = max(1, min(steps, int(math.log2(max_multiplier))))
+    # Never bump ABOVE 1.0 — that would prune everything.
+    ceiling = min(1.0, max(base_threshold, 1e-6) * max_multiplier)
+    new_threshold = max(base_threshold, 1e-6) * (2.0 ** steps)
+    new_threshold = min(new_threshold, ceiling)
+
+    note = (
+        f"adaptive prune @nnz={M.nnz}: threshold "
+        f"{base_threshold:g} -> {new_threshold:g} "
+        f"(est {est_bytes/1e6:.0f}MB vs budget {budget/1e6:.0f}MB)"
+    )
+    return new_threshold, note
 
 
 # ---------------------------------------------------------------------------
@@ -1127,11 +1187,12 @@ def _spgemm_gpu(
         except Exception:                               # noqa: BLE001
             free_bytes = 1 << 30
         vram_budget   = int(free_bytes * VRAM_BUDGET_FRACTION)
-        cap_estimate  = _estimate_spgemm_output_size(M_csr, safety_factor=3.0)
+        cap_estimate  = _estimate_spgemm_output_size(M_csr)
         max_cap       = max(1024, vram_budget // COO_BYTES_PER_ENTRY)
         capacity      = int(min(cap_estimate, max_cap))
-        # Always allocate at least as many slots as the input has nonzeros.
-        capacity      = max(capacity, nnz)
+        # Floor at nnz // 4 (post-prune output can shrink well below nnz);
+        # overflow recovery below handles the rare underestimate.
+        capacity      = max(capacity, max(1024, nnz // 4))
 
         d_C_row = _empty((capacity,), np.int32)
         d_C_col = _empty((capacity,), np.int32)
@@ -1162,6 +1223,8 @@ def _spgemm_gpu(
         k_inner = kernels["spgemm"]
 
         # --- Hash kernel for medium rows ------------------------------
+        # prune_threshold is fused (O1): buckets < threshold are never
+        # written to the COO output, shrinking peak capacity.
         if medium.size > 0:
             d_list = gpuarray.to_gpu(medium)
             d_local.append(d_list)
@@ -1174,6 +1237,7 @@ def _spgemm_gpu(
                 np.int32(medium.size),
                 np.int32(hash_size_medium),
                 np.int32(capacity),
+                np.float32(prune_threshold),
                 block=(block_size, 1, 1),
                 grid=(medium.size, 1, 1),
                 shared=smem_bytes,
@@ -1193,6 +1257,7 @@ def _spgemm_gpu(
                 np.int32(light.size),
                 np.int32(hash_size_light),
                 np.int32(capacity),
+                np.float32(prune_threshold),
                 block=(block_size, 1, 1),
                 grid=(light.size, 1, 1),
                 shared=smem_bytes,
@@ -1229,6 +1294,7 @@ def _spgemm_gpu(
                 np.int32(heavy.size),
                 np.int32(n),
                 np.int32(capacity),
+                np.float32(prune_threshold),
                 block=(block_size, 1, 1),
                 grid=(heavy.size, 1, 1),
                 stream=stream_compute,
@@ -1594,7 +1660,14 @@ def _frobenius_diff_gpu(
 # ---------------------------------------------------------------------------
 
 def _extract_clusters(M: sp.csr_matrix) -> np.ndarray:
-    """Extract cluster labels from a converged MCL matrix."""
+    """Extract cluster labels from a converged MCL matrix.
+
+    Attractor method: each node j is assigned to the attractor row i
+    (i.e. `M[i,i] > 0`) whose `M[i, j]` value is largest.  Iterates the
+    CSC representation column-by-column so we never densify — the old
+    ``todense()`` path allocated `n_attractors × n` floats which OOM'd
+    on graphs with >10k attractors.
+    """
     n = M.shape[0]
     M_csr = M.tocsr()
     diag = np.asarray(M_csr.diagonal()).flatten()
@@ -1606,12 +1679,38 @@ def _extract_clusters(M: sp.csr_matrix) -> np.ndarray:
         )
         return labels.astype(np.int32)
 
-    M_att_rows = M_csr[attractors, :].tocsc()
-    dense_att = np.asarray(M_att_rows.todense())
-    if dense_att.size == 0:
-        return np.zeros(n, dtype=np.int32)
-    best_local = np.argmax(dense_att, axis=0).flatten()
-    return attractors[best_local].astype(np.int32)
+    # Sparse per-column argmax over the attractor rows only.
+    # `attr_rank[i] = k` iff row i is the k-th attractor; other rows -1.
+    attr_rank = np.full(n, -1, dtype=np.int64)
+    attr_rank[attractors] = np.arange(attractors.size, dtype=np.int64)
+
+    M_csc  = M_csr.tocsc()
+    indptr = M_csc.indptr
+    idx    = M_csc.indices
+    data   = M_csc.data
+
+    labels = np.empty(n, dtype=np.int32)
+    for j in range(n):
+        s, e = int(indptr[j]), int(indptr[j + 1])
+        if e == s:
+            # No incoming flow — fall back to nearest attractor by index.
+            labels[j] = int(attractors[0])
+            continue
+        col_rows = idx[s:e]
+        col_vals = data[s:e]
+        # Restrict to entries whose row is an attractor.
+        rank = attr_rank[col_rows]
+        keep = rank >= 0
+        if keep.any():
+            kept_vals = col_vals[keep]
+            kept_rows = col_rows[keep]
+            labels[j] = int(kept_rows[int(np.argmax(kept_vals))])
+        else:
+            # No attractor row hit this column; assign the overall
+            # column-maximum row and rely on the cluster renumbering
+            # to fold it in.
+            labels[j] = int(col_rows[int(np.argmax(col_vals))])
+    return labels
 
 
 def _renumber_clusters(labels: np.ndarray) -> np.ndarray:
@@ -1713,6 +1812,8 @@ def mcl_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
 
         # Fix 5: track SpGEMM overflow warnings across iterations.
         overflow_warning: str = ""
+        # O11: track adaptive-threshold decisions across iterations.
+        adaptive_notes: list[str] = []
 
         # ---- Main iteration loop --------------------------------------
         converged = False
@@ -1721,14 +1822,24 @@ def mcl_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
             iterations = it + 1
             M_old = M
 
-            # Fix 3: Pre-SpGEMM pruning — when M is already dense, reduce
-            # its nnz before squaring to limit output fill-in and prevent
-            # buffer overflow on highly connected biological networks.
+            # O11: raise prune_threshold this iteration if the current M
+            # would blow the SpGEMM VRAM budget.  Reset every iteration so
+            # a shrinking M can return to the user's threshold.
+            iter_threshold, adapt_note = _adaptive_prune_threshold(
+                M, prune_threshold
+            )
+            if adapt_note:
+                adaptive_notes.append(f"iter {iterations}: {adapt_note}")
+
+            # Fix 3 (tightened, O14): Pre-SpGEMM pruning when M is already
+            # dense.  Lowered trigger from n*10 to n*5 so we prune earlier
+            # on power-law biological networks, keeping the SpGEMM output
+            # buffer allocation small.
             M_new = M
-            if M_new.nnz > n_original * 10:
+            if M_new.nnz > n_original * 5:
                 M_new = _prune_gpu(
                     M_new, kernels,
-                    prune_threshold=prune_threshold,
+                    prune_threshold=iter_threshold,
                     top_k=top_k,
                     block_size=block_size,
                     stream_compute=stream_compute,
@@ -1739,13 +1850,15 @@ def mcl_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
             # For e=2 this is one SpGEMM; e>2 chains successive squares.
             # Buffer capacity is recalculated from current nnz each call
             # (Fix 4 — dynamic per-iteration sizing via _spgemm_gpu).
+            # O1: threshold pruning is fused into the SpGEMM hash flush,
+            # so iter_threshold directly shrinks the output buffer.
             for _ in range(expansion - 1):
                 M_new, ow = _spgemm_gpu(
                     M_new, kernels, block_size,
                     stream_compute=stream_compute,
                     stream_transfer=stream_transfer,
                     shared_mem_per_block=shared_mem_per_block,
-                    prune_threshold=prune_threshold,
+                    prune_threshold=iter_threshold,
                 )
                 if ow:
                     overflow_warning = ow   # keep last non-empty message
@@ -1753,7 +1866,7 @@ def mcl_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
             # ---- Prune (threshold + top-k) ----
             M_new = _prune_gpu(
                 M_new, kernels,
-                prune_threshold=prune_threshold,
+                prune_threshold=iter_threshold,
                 top_k=top_k,
                 block_size=block_size,
                 stream_compute=stream_compute,
@@ -1790,13 +1903,21 @@ def mcl_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
             int(max(cluster_assignments) + 1) if cluster_assignments else 0
         )
 
+        adaptive_summary = ""
+        if adaptive_notes:
+            adaptive_summary = (
+                f" Adaptive prune fired on {len(adaptive_notes)} iteration(s): "
+                f"last='{adaptive_notes[-1]}'."
+            )
         note = (
             f"Graph symmetrised for MCL ({sym_note}). "
             f"Column-stochastic normalisation applied. "
             f"Pruning: threshold={prune_threshold:g}, top_k={top_k}. "
             f"Precision: FP32 computation, FP64 convergence check. "
-            f"GPU pipeline: hash SpGEMM + GPU-native compaction + "
-            f"bitonic top-k (arch {kernels.get('_arch_flag', '?')})."
+            f"GPU pipeline: threshold-fused hash SpGEMM + GPU-native "
+            f"compaction + bitonic top-k "
+            f"(arch {kernels.get('_arch_flag', '?')})."
+            f"{adaptive_summary}"
         )
 
         return {
@@ -1814,6 +1935,8 @@ def mcl_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
                 "note":                note,
                 # Fix 5: user-visible overflow guidance (empty string = clean run).
                 "overflow_warning":    overflow_warning,
+                # O11: per-iteration adaptive-prune events (empty if none).
+                "adaptive_prune_events": adaptive_notes,
             },
         }
 

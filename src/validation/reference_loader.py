@@ -80,6 +80,29 @@ _PATTERNS: dict[str, tuple[str, ...]] = {
     "trrust":     ("trrust", "trrust_rawdata", "trrust.human"),
     "biogrid":    ("biogrid", "biogrid-all", "biogrid_human"),
     "mirtarbase": ("mirtarbase", "mirtar", "hsa_mti"),
+    # Orthogonal gene-set references (evidence unrelated to network topology).
+    # Multiple filename patterns per kind so the loader auto-discovers any of
+    # several equivalent public databases the user might have on hand:
+    #   disease     – DisGeNET, DISEASES (Jensen Lab), GWAS Catalog
+    #   essential   – DEG, OGEE, DepMap CRISPR common essentials,
+    #                 HART lab CEG core-essential gene lists
+    #   drug_target – DrugBank, Therapeutic Target Database (TTD),
+    #                 Guide to Pharmacology (IUPHAR)
+    "disgenet":   ("disgenet", "gene_disease", "curated_gene_disease",
+                   "all_gene_disease",
+                   "human_disease_integrated", "diseases_integrated",
+                   "gwas_catalog", "gwas-associations"),
+    "deg":        ("deg", "ogee", "essential",
+                   "common_essentials", "commonessentials",
+                   "cegv2", "ceg2", "hart_essential"),
+    "drugbank":   ("drugbank", "drug_target", "drug-target",
+                   "all_target_polypeptide",
+                   "ttd_target", "ttd-target", "target_information",
+                   "targets_and_families", "iuphar", "guidetopharmacology"),
+    # Gene Ontology annotations (GAF 2.x)
+    "go":         ("goa_human", "goa", "gene_association", ".gaf"),
+    # STRING protein-info map (Ensembl protein id → gene symbol)
+    "string_info": ("protein.info", "protein_info", "string.info"),
 }
 
 
@@ -161,10 +184,26 @@ def _iter_table(path: Path, sep_candidates: tuple[str, ...] = ("\t", ",", ";", "
         if not buf_lines:
             return
 
-        # Try DictReader (header) first
+        # Try DictReader (header) first.
+        # Row is treated as a header only when EVERY non-empty cell looks
+        # like a column name — i.e. contains letters, is not a plain number,
+        # and does NOT start with a biological identifier prefix such as
+        # ENSP / ENSG / HGNC:.  Files like DISEASES whose first data row
+        # begins with an Ensembl id are correctly recognised as header-less.
         first = buf_lines[0].rstrip("\n\r").split(chosen_sep)
-        has_header = any(any(c.isalpha() for c in cell) and not cell.replace(".", "").replace("-", "").isdigit()
-                          for cell in first)
+        non_empty = [c for c in first if c.strip()]
+        def _looks_like_header_cell(c: str) -> bool:
+            c = c.strip()
+            if not any(ch.isalpha() for ch in c):
+                return False
+            if c.replace(".", "").replace("-", "").isdigit():
+                return False
+            if c.upper().startswith(_IDENTIFIER_PREFIXES):
+                return False
+            return True
+        has_header = bool(non_empty) and all(
+            _looks_like_header_cell(c) for c in non_empty
+        )
 
         if has_header:
             reader = csv.DictReader(buf_lines, delimiter=chosen_sep)
@@ -348,6 +387,287 @@ def load_mirtarbase(path: Optional[Path] = None) -> Optional[ReferenceSet]:
     return rs if rs.n_records > 0 else None
 
 
+# ===========================================================================
+# Orthogonal gene-set references (disease / essential / drug-target / GO)
+# ===========================================================================
+#
+# Unlike TRRUST / BioGRID / miRTarBase (which are *interaction* databases and
+# therefore share evidence type with the input network), these references
+# carry evidence that is INDEPENDENT of network topology:
+#
+#     disease genes   – clinical / genetic association  (DisGeNET)
+#     essential genes – experimental gene-knockout       (DEG / OGEE)
+#     drug targets    – pharmacological evidence          (DrugBank)
+#     GO terms        – functional annotation             (Gene Ontology)
+#
+# A gene-set reference is a flat ``set[str]`` of gene symbols — no edges,
+# no source/target split — because "importance" here is defined outside the
+# graph.  GO additionally carries a gene → {term} mapping for enrichment.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class GeneSetReference:
+    """A flat gene-set reference, normalised to upper-case symbols.
+
+    ``genes`` is the membership set (e.g. all disease-associated genes).
+    ``gene_terms`` / ``term_genes`` are only populated for GO annotations
+    and hold the gene ↔ GO-term bipartite mapping used by GO enrichment.
+    """
+
+    name:        str
+    kind:        str                          # "disease"|"essential"|"drug_target"|"go"
+    genes:       set[str] = field(default_factory=set)
+    gene_terms:  dict[str, set[str]] = field(default_factory=dict)
+    term_genes:  dict[str, set[str]] = field(default_factory=dict)
+    n_records:   int = 0
+    source_path: Optional[Path] = None
+
+    def is_empty(self) -> bool:
+        return not self.genes
+
+
+# Candidate gene-symbol column names per gene-set kind.  First present
+# column wins; positional fallback uses the first alphabetic column.
+_GENE_SET_COLUMNS: dict[str, tuple[str, ...]] = {
+    # DisGeNET → "geneSymbol"; DISEASES/Jensen → col2 = "Gene symbol";
+    # GWAS Catalog → "MAPPED_GENE" (may be multi-valued, best-effort);
+    # fall through to the first alphabetic cell for header-less files.
+    "disgenet": ("geneSymbol", "gene_symbol", "genesymbol", "symbol",
+                 "gene", "gene_name", "Gene symbol", "MAPPED_GENE",
+                 "REPORTED GENE(S)"),
+    # DEG/OGEE → "gene_symbol"; DepMap Common Essentials → "gene" or
+    # "Gene" (values like "TP53 (7157)" — the loader keeps them, matching
+    # trims to the parenthesised suffix — see column-hint doc);
+    # HART CEGv2.txt → "GENE" (single column, one gene per line).
+    "deg":      ("gene_symbol", "symbol", "gene", "gene_name", "locus",
+                 "genename", "Gene", "GENE"),
+    # DrugBank → "Gene Name"; TTD → "TARGETID" is a code, "TARGNAME"
+    # is descriptive — the useful column is "GENENAME" or "UNIPROID";
+    # IUPHAR Targets and Families → "HGNC symbol" or "Human Ensembl Gene".
+    "drugbank": ("Gene Name", "gene_name", "gene", "genename", "symbol",
+                 "HGNC", "hgnc_symbol", "GENENAME", "TARGET_NAME",
+                 "HGNC symbol", "Human Ensembl Gene", "Target Gene Symbol"),
+}
+
+
+_IDENTIFIER_PREFIXES = ("ENSP", "ENSG", "ENST", "HGNC:", "UNIPROT:",
+                        "UNIPROTKB:", "NCBI:", "ENTREZ:")
+
+
+def _first_alpha_value(row: dict) -> Optional[str]:
+    """First value that looks like a gene symbol.
+
+    Skips cells that are pure identifiers (Ensembl/UniProt/HGNC) so files
+    like DISEASES (col 1 = Ensembl id, col 2 = gene symbol) fall through
+    to the correct column.
+    """
+    for v in row.values():
+        if v is None:
+            continue
+        s = str(v).strip()
+        if not s or not any(c.isalpha() for c in s):
+            continue
+        if s.upper().startswith(_IDENTIFIER_PREFIXES):
+            continue
+        return s
+    return None
+
+
+def _clean_symbol(raw: str) -> str:
+    """Normalise a gene-symbol cell.
+
+    Handles the common source-specific quirks:
+      * DepMap  – ``"TP53 (7157)"``  → ``"TP53"``   (strip Entrez suffix)
+      * GWAS    – ``"TP53, MYC"``    → ``"TP53"``   (first gene of a list;
+                                                     GWAS-style multi-gene
+                                                     rows are common)
+      * IUPHAR  – ``"HGNC:11998"``   → ``""``       (drop identifier-only)
+    """
+    s = str(raw).strip()
+    # DepMap "SYM (12345)" — cut at the space before the paren
+    if " (" in s and s.endswith(")"):
+        s = s.split(" (", 1)[0].strip()
+    # multi-gene rows: take the first entry
+    for sep in (",", " - ", ";", "|"):
+        if sep in s:
+            s = s.split(sep, 1)[0].strip()
+            break
+    # drop pure-identifier rows
+    if s.upper().startswith(("HGNC:", "UNIPROT:", "ENSG", "ENSP")):
+        return ""
+    return s
+
+
+def _is_ttd_flat_format(path: Path) -> bool:
+    """Sniff whether ``path`` is TTD's ``<target_id>\\t<field>\\t<value>``
+    long-format record file (not a table).  Detects by scanning up to the
+    first 200 non-blank lines for ``T<digits>\\tGENENAME\\t*`` rows.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            checked = 0
+            for line in f:
+                line = line.rstrip("\n\r")
+                if not line or line.startswith("-"):
+                    continue
+                parts = line.split("\t")
+                if (len(parts) >= 3
+                        and parts[0].startswith("T")
+                        and parts[0][1:].isdigit()
+                        and parts[1].strip() == "GENENAME"):
+                    return True
+                checked += 1
+                if checked > 200:
+                    return False
+    except Exception:
+        return False
+    return False
+
+
+def _load_ttd_flat(path: Path, name: str) -> GeneSetReference:
+    """Parse TTD's flat record file — extract every ``GENENAME`` value."""
+    rs = GeneSetReference(name=name, kind="drug_target", source_path=path)
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            parts = line.rstrip("\n\r").split("\t")
+            if len(parts) < 3 or parts[1].strip() != "GENENAME":
+                continue
+            gene = _clean_symbol(parts[2])
+            if not gene:
+                continue
+            rs.genes.add(_norm(gene))
+            rs.n_records += 1
+    return rs
+
+
+def _load_gene_set(kind: str, name: str,
+                   path: Optional[Path] = None) -> Optional[GeneSetReference]:
+    """Generic loader for a single-column-ish gene-set file.
+
+    Extracts one gene symbol per row using the candidate columns for
+    ``kind`` (positional fallback: first alphabetic cell).  Never raises;
+    returns ``None`` when the file is missing or yields no symbols.
+
+    Special-cased formats:
+      * TTD (drug_target) — detected by ``_is_ttd_flat_format``, parsed
+        via :func:`_load_ttd_flat` (long-format records rather than a table).
+
+    Source-specific cell formats (DepMap ``"SYM (id)"``, GWAS multi-gene
+    lists, IUPHAR pure identifiers) are normalised by :func:`_clean_symbol`.
+    """
+    p = _find_file(kind, path)
+    if p is None:
+        _LOG.info("%s reference not found — orthogonal %s validation skipped.",
+                  name, kind)
+        return None
+
+    # TTD-specific fast path
+    if kind == "drugbank" and _is_ttd_flat_format(p):
+        rs = _load_ttd_flat(p, name="TTD")
+        _LOG.info("%s (TTD flat) loaded: %d rows, %d unique genes",
+                  name, rs.n_records, len(rs.genes))
+        return rs if rs.genes else None
+
+    rs = GeneSetReference(name=name, kind={
+        "disgenet": "disease",
+        "deg":      "essential",
+        "drugbank": "drug_target",
+    }.get(kind, kind), source_path=p)
+
+    candidates = _GENE_SET_COLUMNS.get(kind, ("gene", "symbol"))
+    for row in _iter_table(p):
+        if not row:
+            continue
+        gene = None
+        for col in candidates:
+            if col in row and row[col] is not None and str(row[col]).strip():
+                gene = str(row[col]).strip()
+                break
+        if gene is None:
+            gene = _first_alpha_value(row)
+        if not gene:
+            continue
+        gene = _clean_symbol(gene)
+        if not gene:
+            continue
+        g = _norm(gene)
+        # Skip obvious header echoes
+        if g in {c.upper() for c in candidates} or g in {"GENE", "SYMBOL"}:
+            continue
+        if g:
+            rs.genes.add(g)
+            rs.n_records += 1
+
+    _LOG.info("%s loaded: %d rows, %d unique genes",
+              name, rs.n_records, len(rs.genes))
+    return rs if rs.genes else None
+
+
+def load_disgenet(path: Optional[Path] = None) -> Optional[GeneSetReference]:
+    """Load DisGeNET disease-associated gene symbols."""
+    return _load_gene_set("disgenet", "DisGeNET", path)
+
+
+def load_deg(path: Optional[Path] = None) -> Optional[GeneSetReference]:
+    """Load essential-gene symbols (DEG / OGEE)."""
+    return _load_gene_set("deg", "DEG/OGEE", path)
+
+
+def load_drugbank(path: Optional[Path] = None) -> Optional[GeneSetReference]:
+    """Load DrugBank drug-target gene symbols."""
+    return _load_gene_set("drugbank", "DrugBank", path)
+
+
+def load_go_annotations(
+    path: Optional[Path] = None,
+    aspects: Optional[set[str]] = None,
+) -> Optional[GeneSetReference]:
+    """Load a GO annotation file (GAF 2.x) into a gene ↔ term mapping.
+
+    GAF columns (1-indexed, tab-separated):
+        3  DB Object Symbol   → gene symbol
+        5  GO ID              → term (e.g. GO:0008150)
+        9  Aspect             → P (process) | F (function) | C (component)
+
+    ``aspects`` filters by the single-letter aspect code; ``None`` keeps
+    all three.  Comment lines (starting with ``!``) are skipped.  Never
+    raises; returns ``None`` when the file is missing or empty.
+    """
+    p = _find_file("go", path)
+    if p is None:
+        _LOG.info("GO annotation file not found — GO enrichment skipped.")
+        return None
+
+    rs = GeneSetReference(name="GeneOntology", kind="go", source_path=p)
+    try:
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if not line or line.startswith("!"):
+                    continue
+                cols = line.rstrip("\n\r").split("\t")
+                if len(cols) < 9:
+                    continue
+                symbol = _norm(cols[2])
+                term   = cols[4].strip()
+                aspect = cols[8].strip().upper() if len(cols) > 8 else ""
+                if not symbol or not term:
+                    continue
+                if aspects and aspect not in aspects:
+                    continue
+                rs.genes.add(symbol)
+                rs.gene_terms.setdefault(symbol, set()).add(term)
+                rs.term_genes.setdefault(term, set()).add(symbol)
+                rs.n_records += 1
+    except Exception as exc:
+        _LOG.warning("Failed to read GO annotations %s: %s", p, exc)
+        return None
+
+    _LOG.info("GO loaded: %d annotations, %d genes, %d terms",
+              rs.n_records, len(rs.genes), len(rs.term_genes))
+    return rs if rs.genes else None
+
+
 # ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
@@ -357,6 +677,139 @@ _LOADERS = {
     "ppi":   load_biogrid,
     "mirna": load_mirtarbase,
 }
+
+# Orthogonal gene-set loaders, keyed by evidence kind (network-type agnostic).
+_GENE_SET_LOADERS = {
+    "disease":     load_disgenet,
+    "essential":   load_deg,
+    "drug_target": load_drugbank,
+}
+
+
+# ---------------------------------------------------------------------------
+# STRING protein-id → gene-symbol map + node_index_map remap helper
+# ---------------------------------------------------------------------------
+#
+# The bundled STRING file (``9606.protein.links.v12.0.txt``) uses Ensembl
+# protein ids (``9606.ENSP00000000233``).  Every biological reference
+# (TRRUST / BioGRID / miRTarBase / DisGeNET / DEG / DrugBank / GO) uses
+# HGNC gene symbols (``TP53``).  Without a translation step every overlap
+# is zero and validation silently reports ``status=skipped``.
+#
+# STRING publishes the mapping in ``9606.protein.info.v12.0.txt``:
+#
+#     #string_protein_id  preferred_name  protein_size  annotation
+#     9606.ENSP00000000233  ARF5           180           ADP-ribosylation…
+#
+# ``load_string_id_map`` returns ``{ensembl_id: gene_symbol}``.
+# ``remap_node_index_map`` produces a new ``{gene_symbol: index}`` dict for
+# the downstream validators; labels not present in the map are kept
+# unchanged so partial mappings still work.
+
+def load_string_id_map(path: Optional[Path] = None) -> dict[str, str]:
+    """Load a STRING ``protein.info`` file into ``{protein_id → gene_symbol}``.
+
+    Auto-discovers via the ``string_info`` pattern (``protein.info`` /
+    ``string.info``) when ``path`` is not provided.  Returns ``{}`` when the
+    file is missing or unreadable — never raises.
+    """
+    p = _find_file("string_info", path)
+    if p is None:
+        _LOG.info(
+            "STRING protein-info file not found — Ensembl→symbol mapping "
+            "unavailable; validators will only match on the raw labels.",
+        )
+        return {}
+
+    out: dict[str, str] = {}
+    try:
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if not line or line.startswith("#"):
+                    continue
+                cols = line.rstrip("\n\r").split("\t")
+                if len(cols) < 2:
+                    continue
+                pid = cols[0].strip()
+                sym = cols[1].strip()
+                if pid and sym:
+                    out[pid] = sym.upper()
+    except Exception as exc:
+        _LOG.warning("Failed to read STRING info %s: %s", p, exc)
+        return {}
+    _LOG.info("STRING id map loaded: %d entries from %s", len(out), p)
+    return out
+
+
+def remap_node_index_map(
+    node_index_map: dict[str, int],
+    id_map: dict[str, str],
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Translate ``node_index_map`` labels through an id → symbol dict.
+
+    Parameters
+    ----------
+    node_index_map : dict[str, int]
+        Original ``{label: node_index}`` produced by ``graphdata_to_csr``.
+    id_map : dict[str, str]
+        Mapping from raw label (e.g. ``9606.ENSP00000000233``) to gene
+        symbol (e.g. ``ARF5``).
+
+    Returns
+    -------
+    (remapped, stats)
+        ``remapped`` is a new ``{symbol_or_original_label: index}`` dict.
+        Labels not present in ``id_map`` are kept unchanged so the returned
+        map still covers every original node.  When two source labels
+        translate to the same symbol only the first wins (isoform
+        collisions); the loser stays under its original label so its index
+        can still be reached.  ``stats`` reports ``{"mapped", "unchanged",
+        "collisions"}`` counts for logging / driver output.
+    """
+    if not id_map:
+        return dict(node_index_map), {"mapped": 0, "unchanged": len(node_index_map),
+                                       "collisions": 0}
+
+    remapped: dict[str, int] = {}
+    mapped = unchanged = collisions = 0
+    for label, idx in node_index_map.items():
+        new_label = id_map.get(label)
+        if new_label is None:
+            new_label = label
+            unchanged += 1
+        else:
+            mapped += 1
+        if new_label in remapped:
+            collisions += 1
+            # keep the loser reachable under its original label
+            if label not in remapped:
+                remapped[label] = idx
+        else:
+            remapped[new_label] = idx
+    _LOG.info(
+        "remap_node_index_map: mapped=%d unchanged=%d collisions=%d",
+        mapped, unchanged, collisions,
+    )
+    return remapped, {"mapped": mapped, "unchanged": unchanged,
+                      "collisions": collisions}
+
+
+def load_gene_set(kind: str,
+                  path: Optional[Path] = None) -> Optional[GeneSetReference]:
+    """Load an orthogonal gene-set reference by evidence kind.
+
+    ``kind`` ∈ {"disease", "essential", "drug_target"}.  Returns ``None``
+    for unknown kinds or missing files (never raises).
+    """
+    fn = _GENE_SET_LOADERS.get(kind)
+    if fn is None:
+        _LOG.warning("No gene-set loader for kind=%r", kind)
+        return None
+    try:
+        return fn(path)
+    except Exception as exc:
+        _LOG.warning("Gene-set loader for %s raised %s — skipping.", kind, exc)
+        return None
 
 
 def load_reference(network_type: str,

@@ -495,3 +495,251 @@ def _extract_clusters(M: sp.csr_matrix) -> np.ndarray:
         # Index of max value within the kept subset → attractor index.
         assignments[i] = int(sub_ranks[int(np.argmax(vals))])
     return assignments
+
+
+# ===========================================================================
+# Memory-guard helpers
+# ===========================================================================
+#
+# Used by the non-GPU-optimized MCL variants (cpu_single, cpu_multi,
+# gpu_baseline) to refuse work that would blow up RAM or VRAM instead of
+# crashing the whole application.  The GPU-optimized MCL keeps its own
+# adaptive-threshold path and does NOT use these — it is expected to
+# handle graphs that would trip these guards.
+
+def _available_ram_bytes() -> int:
+    """Best-effort available-RAM query using stdlib only.
+
+    Windows: ``GlobalMemoryStatusEx`` via ctypes.
+    Linux  : ``/proc/meminfo`` ``MemAvailable`` (more accurate than
+             ``SC_AVPHYS_PAGES`` because it accounts for reclaimable
+             cache).  Falls back to ``sysconf`` if the file is missing.
+    Other POSIX: ``os.sysconf('SC_AVPHYS_PAGES') * SC_PAGE_SIZE``.
+    Fallback: 0 (caller should treat this as "unknown → skip guard").
+    """
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            class _MemStatusEx(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength",             ctypes.c_ulong),
+                    ("dwMemoryLoad",         ctypes.c_ulong),
+                    ("ullTotalPhys",         ctypes.c_ulonglong),
+                    ("ullAvailPhys",         ctypes.c_ulonglong),
+                    ("ullTotalPageFile",     ctypes.c_ulonglong),
+                    ("ullAvailPageFile",     ctypes.c_ulonglong),
+                    ("ullTotalVirtual",      ctypes.c_ulonglong),
+                    ("ullAvailVirtual",      ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            ms = _MemStatusEx()
+            ms.dwLength = ctypes.sizeof(_MemStatusEx)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
+                return int(ms.ullAvailPhys)
+            return 0
+        # Linux — prefer /proc/meminfo MemAvailable (matches `free -h`).
+        try:
+            with open("/proc/meminfo", "r") as fh:
+                for line in fh:
+                    if line.startswith("MemAvailable:"):
+                        parts = line.split()
+                        # "MemAvailable:    12345678 kB"
+                        return int(parts[1]) * 1024
+        except FileNotFoundError:
+            pass
+        except Exception:                                   # noqa: BLE001
+            pass
+        # Generic POSIX fallback
+        if hasattr(os, "sysconf") and "SC_AVPHYS_PAGES" in os.sysconf_names:
+            pages = os.sysconf("SC_AVPHYS_PAGES")
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            if pages > 0 and page_size > 0:
+                return int(pages) * int(page_size)
+        return 0
+    except Exception:                                       # noqa: BLE001
+        return 0
+
+
+def _swap_used_bytes() -> int:
+    """Best-effort used-swap query using stdlib only.
+
+    A rising swap count means the OS has already started swapping — the
+    OOM killer is close.  Watchdog uses this to bail before RAM alone
+    would signal the problem.
+
+    Only implemented on Linux (``/proc/meminfo`` ``SwapTotal`` -
+    ``SwapFree``).  Windows PageFile has different semantics — it acts
+    as a commit-reserve backing whether or not pages are actually paged
+    out — so we return 0 there and let the RAM-floor check carry the
+    watchdog.  Returns 0 when unknown so callers can treat "no signal"
+    as "OK".
+    """
+    if os.name == "nt":
+        return 0
+    try:
+        with open("/proc/meminfo", "r") as fh:
+            total = free = None
+            for line in fh:
+                if line.startswith("SwapTotal:"):
+                    total = int(line.split()[1]) * 1024
+                elif line.startswith("SwapFree:"):
+                    free = int(line.split()[1]) * 1024
+                if total is not None and free is not None:
+                    return max(0, total - free)
+    except FileNotFoundError:
+        pass
+    except Exception:                                       # noqa: BLE001
+        pass
+    return 0
+
+
+def _estimate_mcl_peak_ram_bytes(
+    graph_csr: sp.csr_matrix,
+    expansion: int = 2,
+    dtype_bytes: int = 4,
+    index_bytes: int = 4,
+    safety_factor: float = 5.0,
+) -> int:
+    """Estimate the peak RAM footprint of a scipy MCL iteration.
+
+    Peak is dominated by ``M @ M`` (expansion) which materialises an
+    intermediate whose nnz ~ ``nnz(M) * avg_row_len``.  Sizing is done
+    against the POST-SYMMETRIZATION matrix that actually enters the
+    iteration loop (``2 * nnz + n`` — the symmetrize adds the transpose,
+    self-loops add n more) because raw-input sizing under-predicts by
+    ~2× for typical biological networks.
+
+    ``safety_factor`` (default 5.0) covers:
+      - scipy's transient buffers during CSR ``@`` (~2× output).
+      - the ``M_old = M.copy()`` snapshot kept for the Frobenius diff.
+      - M growing denser across iterations before the prune stabilises.
+      - allocator fragmentation on repeated iteration allocations.
+
+    Returns an integer number of bytes; callers should compare against
+    a fraction of available RAM.  Returns 0 for an empty graph.
+    """
+    n       = int(graph_csr.shape[0])
+    raw_nnz = int(graph_csr.nnz)
+    if n == 0 or raw_nnz == 0:
+        return 0
+    # After symmetrize + self-loops M has ~2 * raw_nnz + n entries.
+    effective_nnz = 2 * raw_nnz + n
+    avg_row = max(1.0, float(effective_nnz) / max(1, n))
+    est_out_nnz = min(
+        int(effective_nnz * avg_row * safety_factor), n * n
+    )
+    entry_bytes = dtype_bytes + index_bytes
+    peak = est_out_nnz * entry_bytes
+    # Chained expansion (e > 2) squares repeatedly; each square inflates
+    # the intermediate again.  Multiply by (expansion - 1) as a bound.
+    return int(peak * max(1, expansion - 1))
+
+
+def _check_memory_or_raise(
+    estimated_bytes: int,
+    available_bytes: int,
+    *,
+    backend: str,
+    budget_fraction: float = 0.7,
+    extra_hint: str = "",
+) -> None:
+    """Raise ``MemoryError`` early if ``estimated_bytes`` exceeds budget.
+
+    ``available_bytes == 0`` disables the guard (the probe returned
+    "unknown", so we defer to the OS/runtime).
+
+    Parameters
+    ----------
+    estimated_bytes : int
+        Projected peak allocation.
+    available_bytes : int
+        Live free RAM or VRAM.  ``0`` disables the guard.
+    backend : str
+        Human-readable label ("cpu_single", "cpu_multi", "gpu_baseline")
+        used in the error message.
+    budget_fraction : float
+        Safe fraction of ``available_bytes`` we allow the algorithm to
+        consume.  Default 0.7 leaves headroom for OS overhead and the
+        result envelope.
+    extra_hint : str
+        Extra guidance appended to the message (e.g. specific fallback
+        suggestion).
+    """
+    if available_bytes <= 0:
+        return
+    budget = int(available_bytes * budget_fraction)
+    if estimated_bytes <= budget:
+        return
+    est_mb    = estimated_bytes / (1024 * 1024)
+    avail_mb  = available_bytes  / (1024 * 1024)
+    budget_mb = budget           / (1024 * 1024)
+    msg = (
+        f"MCL {backend}: refusing to run — estimated peak memory "
+        f"{est_mb:.0f} MB exceeds safe budget "
+        f"({budget_mb:.0f} MB = {budget_fraction:.0%} of {avail_mb:.0f} MB free). "
+        f"Use mode=gpu (cuda_optimized) which scales to larger graphs."
+    )
+    if extra_hint:
+        msg = f"{msg} {extra_hint}"
+    raise MemoryError(msg)
+
+
+# Runtime watchdog thresholds.  These are DELIBERATELY conservative:
+# by the time swap starts filling, the OS OOM killer is minutes away
+# from killing the Python process (and any IDE hosting it), so we bail
+# well before the RAM-only signal turns critical.
+_RUNTIME_RAM_FLOOR_BYTES:  int = 2 * 1024 * 1024 * 1024   # 2 GB
+_RUNTIME_SWAP_ALERT_BYTES: int = 512 * 1024 * 1024        # 512 MB
+
+
+def _check_runtime_ram_or_raise(
+    *,
+    backend: str,
+    iteration: int,
+    current_nnz: int,
+    floor_bytes: int = _RUNTIME_RAM_FLOOR_BYTES,
+    swap_alert_bytes: int = _RUNTIME_SWAP_ALERT_BYTES,
+) -> None:
+    """Per-iteration RAM + swap watchdog for CPU MCL.
+
+    Called at the top of each MCL iteration BEFORE the next ``M @ M``.
+    Raises ``MemoryError`` when EITHER:
+
+      1. free RAM has dropped below ``floor_bytes`` (default 2 GB), OR
+      2. used swap has grown past ``swap_alert_bytes`` (default 512 MB).
+
+    Both signals mean the OS OOM killer is close.  Bailing here lets the
+    runner surface a clean error instead of the interpreter (and any IDE
+    hosting it) getting terminated.
+
+    ``available == 0`` (probe failed) disables the RAM check; swap check
+    is likewise skipped when its probe returns 0.  The pre-run guard is
+    the only safety net when both probes fail.
+    """
+    available = _available_ram_bytes()
+    swap_used = _swap_used_bytes()
+
+    ram_low   = available > 0 and available < floor_bytes
+    swap_hot  = swap_used > swap_alert_bytes
+
+    if not (ram_low or swap_hot):
+        return
+
+    reasons: list[str] = []
+    if ram_low:
+        reasons.append(
+            f"free RAM {available/(1024*1024):.0f} MB < "
+            f"floor {floor_bytes/(1024*1024):.0f} MB"
+        )
+    if swap_hot:
+        reasons.append(
+            f"swap in use {swap_used/(1024*1024):.0f} MB > "
+            f"alert {swap_alert_bytes/(1024*1024):.0f} MB"
+        )
+    raise MemoryError(
+        f"MCL {backend}: aborting at iteration {iteration} "
+        f"(M.nnz={current_nnz}; {'; '.join(reasons)}). "
+        f"Use mode=gpu (cuda_optimized) which scales to larger graphs."
+    )

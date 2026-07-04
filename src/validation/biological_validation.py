@@ -43,13 +43,26 @@ Outputs
         enrichment_heatmap.png    – precision/recall/jaccard heatmap
         community_validation.png  – NMI / ARI per (algorithm, dataset)
 
+Circularity guard
+-----------------
+These three references are *interaction* databases, so validating a graph
+that was itself built from one of them is circular.  Each record now carries
+a ``circularity_risk`` field = the fraction of graph nodes already present in
+the reference; when it exceeds 0.90 a warning is logged and appended to the
+record ``note``.  For truly independent evidence use the sibling validators:
+
+    * :mod:`src.validation.orthogonal_validation` — DisGeNET / DEG / DrugBank
+    * :mod:`src.validation.holdout_validation`    — edge hold-out (no files)
+    * :mod:`src.validation.go_enrichment`         — Gene Ontology terms
+
 Rules
 -----
 * NEVER raises — all failures are recorded with ``status='error'`` and
   ``note=<error string>``.
 * Skips gracefully when the reference database is not available.
-* Uses ONLY the three project-aligned databases (TRRUST / BioGRID /
-  miRTarBase).  No KEGG, no GO, no external network calls.
+* This module uses ONLY the interaction databases (TRRUST / BioGRID /
+  miRTarBase) and makes no external network calls; GO / disease / drug
+  references live in the sibling validators above.
 """
 
 from __future__ import annotations
@@ -122,6 +135,7 @@ class BioValidationRecord:
     p_value:        float          = float("nan")
     nmi:            float          = float("nan")
     ari:            float          = float("nan")
+    circularity_risk: float        = float("nan")  # frac graph nodes in ref
     note:           str            = ""
     status:         str            = "ok"   # ok | skipped | error
 
@@ -139,12 +153,16 @@ class _BioDataset:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _safe_labels(items: Any) -> list[str]:
+def _safe_labels(items: Any,
+                 idx_to_label: Optional[dict[int, str]] = None) -> list[str]:
     """
     Convert a result list (either ``[idx, idx, ...]`` or
     ``[{"index": int, "label": str}, ...]``) into a list of label strings.
 
-    Falls back to ``"node_<idx>"`` when no label is attached.
+    When ``idx_to_label`` is supplied, plain integers and label-less dicts
+    are looked up in it (the reverse of ``node_index_map``); otherwise the
+    fallback is ``"NODE_<idx>"``, which will never match any biological
+    reference.
     """
     out: list[str] = []
     if not items:
@@ -152,13 +170,21 @@ def _safe_labels(items: Any) -> list[str]:
     for it in items:
         if isinstance(it, dict):
             lbl = it.get("label")
+            if lbl is None and "index" in it and idx_to_label is not None:
+                lbl = idx_to_label.get(int(it["index"]))
             if lbl is None and "index" in it:
-                lbl = f"node_{it['index']}"
+                lbl = f"NODE_{it['index']}"
             if lbl is not None:
                 out.append(str(lbl).strip().upper())
         else:
-            # Plain integer index — no label info available
-            out.append(f"NODE_{it}")
+            try:
+                idx = int(it)
+            except (TypeError, ValueError):
+                continue
+            if idx_to_label is not None and idx in idx_to_label:
+                out.append(str(idx_to_label[idx]).strip().upper())
+            else:
+                out.append(f"NODE_{idx}")
     return out
 
 
@@ -172,14 +198,103 @@ def _inner(result: Any) -> dict:
     return result
 
 
-def _extract_predicted(algorithm: str, result: dict) -> list[str]:
-    """Return labels for the predicted set of the given algorithm."""
+def _reverse_index_map(
+    node_index_map: Optional[dict],
+) -> Optional[dict[int, str]]:
+    """Build ``{int_index: label}`` from a ``{label: int_index}`` map."""
+    if not node_index_map:
+        return None
+    return {int(v): str(k) for k, v in node_index_map.items()}
+
+
+def _extract_predicted(
+    algorithm: str,
+    result: dict,
+    node_index_map: Optional[dict] = None,
+) -> list[str]:
+    """Return labels for the predicted set of the given algorithm.
+
+    ``node_index_map`` (``{label: int_index}``) is used to translate plain
+    integer top-node lists into gene-symbol labels — without it, cpu_single
+    / cpu_multi results (whose ``top_nodes`` are ``list[int]``) collapse to
+    synthetic ``NODE_<idx>`` strings that match no biological reference.
+    """
     inner = _inner(result)
+    idx_to_label = _reverse_index_map(node_index_map)
     fields = _PREDICTED_FIELDS.get(algorithm, ())
     for f in fields:
         if f in inner and isinstance(inner[f], list) and inner[f]:
-            return _safe_labels(inner[f])
+            return _safe_labels(inner[f], idx_to_label)
     return []
+
+
+def _score_vector(algorithm: str, inner: dict) -> Optional["np.ndarray"]:
+    """Full-length node score vector used to rank nodes for top-k selection.
+
+    pagerank / rwr → ``scores``; hits → ``hub_scores + authority_scores``
+    (either alone if only one is present).  Returns None when no usable
+    vector exists.
+    """
+    if algorithm == "hits":
+        hub  = np.asarray(inner.get("hub_scores", []), dtype=np.float64)
+        auth = np.asarray(inner.get("authority_scores", []), dtype=np.float64)
+        if hub.size and auth.size and hub.size == auth.size:
+            return hub + auth
+        if hub.size:
+            return hub
+        return auth if auth.size else None
+    s = np.asarray(inner.get("scores", []), dtype=np.float64)
+    return s if s.size else None
+
+
+def _extract_topk_predicted(
+    algorithm: str,
+    result: dict,
+    node_index_map: Optional[dict],
+    k: int,
+    network_type: str = "ppi",
+    graph_csr=None,
+) -> list[str]:
+    """Return the top-``k`` node labels ranked by the algorithm's score vector.
+
+    Unlike :func:`_extract_predicted` (which reads the small pre-baked
+    ``top_nodes`` list), this recomputes the ranking from the full ``scores``
+    vector so an arbitrary ``k`` can be evaluated.  Falls back to
+    :func:`_extract_predicted` when no full score vector is available.
+
+    Network-type correctness: for GRN / miRNA PageRank, raw scores are
+    dominated by *target* genes (dangling sinks accumulate mass), so ranking
+    is restricted to nodes with out-degree > 0 (the regulators / miRNAs),
+    matching the ``top_regulators`` semantics.  PPI applies no restriction.
+    """
+    inner = _inner(result)
+    vec = _score_vector(algorithm, inner)
+    idx_to_label = _reverse_index_map(node_index_map)
+    if vec is None or idx_to_label is None or vec.size != len(idx_to_label):
+        # No aligned score vector → fall back to the pre-baked list.
+        return _extract_predicted(algorithm, result, node_index_map)
+
+    n = vec.size
+    eligible = np.ones(n, dtype=bool)
+    if (algorithm == "pagerank" and network_type in ("grn", "mirna")
+            and graph_csr is not None):
+        try:
+            outdeg = np.diff(graph_csr.tocsr().indptr)
+            if outdeg.size == n and np.any(outdeg > 0):
+                eligible = outdeg > 0
+        except Exception:
+            pass
+
+    idx = np.where(eligible)[0]
+    if idx.size == 0:
+        return _extract_predicted(algorithm, result, node_index_map)
+    top = idx[np.argsort(vec[idx])[::-1][:max(1, int(k))]]
+    out: list[str] = []
+    for i in top:
+        lbl = idx_to_label.get(int(i))
+        if lbl is not None:
+            out.append(str(lbl).strip().upper())
+    return out
 
 
 def _extract_communities(
@@ -209,10 +324,9 @@ def _extract_communities(
                                 entry.get("cluster_id",
                                           entry.get("id", len(out)))))
             members = entry.get("member_nodes") or entry.get("members") or []
-            labels = _safe_labels(members)
-            if not labels and members:
-                labels = [idx_to_label.get(int(m), f"NODE_{m}")
-                          for m in members if isinstance(m, (int, np.integer))]
+            # Pass idx_to_label so plain-integer members resolve to real gene
+            # symbols instead of collapsing to unmatchable NODE_<idx> tokens.
+            labels = _safe_labels(members, idx_to_label)
             if labels:
                 out[cid] = labels
 
@@ -232,6 +346,40 @@ def _extract_communities(
                 idx_to_label.get(int(i), f"NODE_{i}")
             )
     return out
+
+
+def _graph_universe(node_index_map: dict) -> set[str]:
+    """Upper-cased set of every node label in the graph.
+
+    This is the correct statistical background for enrichment: only nodes
+    that exist in the graph can ever be predicted, so the reference set must
+    be intersected with this universe before a Fisher test.  Passing the raw
+    genome-wide reference (which can be *larger* than the graph) inverts the
+    contingency table and forces p ≈ 1 even at precision 1.0.
+    """
+    return {str(l).strip().upper() for l in (node_index_map or {})}
+
+
+_CIRCULARITY_THRESHOLD = 0.90   # >90% of graph nodes in ref → likely circular
+
+
+def _circularity_fraction(node_index_map: dict,
+                          ref: ReferenceSet) -> float:
+    """Fraction of graph node labels that also appear in the reference.
+
+    When this is near 1.0 the input graph and the reference almost certainly
+    derive from the SAME database, so the overlap p-value is circular (the
+    algorithm is being scored against the very data it was built from).
+    Returns NaN when the fraction cannot be computed.
+    """
+    if not node_index_map or ref is None or ref.is_empty():
+        return float("nan")
+    ref_nodes = ref.all_nodes
+    labels = [str(l).strip().upper() for l in node_index_map]
+    if not labels:
+        return float("nan")
+    in_ref = sum(1 for l in labels if l in ref_nodes)
+    return in_ref / len(labels)
 
 
 def _reference_partition(node_index_map: dict,
@@ -343,6 +491,14 @@ class BiologicalValidator:
             ref = self._get_reference(ds.network_type)
             ref_name = _REFERENCE_BY_NETWORK.get(ds.network_type, "?")
             background_size = ds.graph_csr.shape[0]
+            circ = _circularity_fraction(ds.node_index_map, ref)
+            if math.isfinite(circ) and circ >= _CIRCULARITY_THRESHOLD:
+                _LOG.warning(
+                    "CIRCULARITY: %.0f%% of %s nodes are already in %s — "
+                    "overlap p-values against %s are not independent evidence. "
+                    "Prefer orthogonal / hold-out / GO validation.",
+                    100 * circ, ds.name, ref_name, ref_name,
+                )
 
             for algo in algos:
                 if algo not in ds.result_by_algo:
@@ -380,6 +536,12 @@ class BiologicalValidator:
                         note         = str(exc)[:200],
                         status       = "error",
                     )
+                rec.circularity_risk = circ
+                if (math.isfinite(circ) and circ >= _CIRCULARITY_THRESHOLD
+                        and rec.status == "ok"):
+                    warn = (f"CIRCULAR: {circ:.0%} of graph nodes are in "
+                            f"{ref_name} — not independent evidence")
+                    rec.note = f"{rec.note}; {warn}" if rec.note else warn
                 self.records.append(rec)
 
     # ------------------------------------------------------------------
@@ -402,7 +564,7 @@ class BiologicalValidator:
             )
 
         # ── Ranking algorithms (pagerank/hits/rwr) ──
-        predicted = _extract_predicted(algo, result)
+        predicted = _extract_predicted(algo, result, ds.node_index_map)
         if not predicted:
             return BioValidationRecord(
                 algorithm    = algo,
@@ -422,6 +584,14 @@ class BiologicalValidator:
             ref_set = ref.sources                 # top_mirnas ≈ miRNAs
         else:
             ref_set = ref.all_nodes               # generic: any reference node
+
+        # Restrict the reference to genes that actually exist in this graph;
+        # otherwise a genome-wide reference larger than the graph inverts the
+        # Fisher table (p ≈ 1 even when every prediction is a hit).
+        universe = _graph_universe(ds.node_index_map)
+        if universe:
+            ref_set = ref_set & universe
+            background_size = len(universe)
 
         ov: OverlapResult = compute_overlap(
             predicted, ref_set, background_size=background_size,
@@ -461,8 +631,13 @@ class BiologicalValidator:
                 status       = "skipped",
             )
 
-        # Enrichment of each community vs reference source set
+        # Enrichment of each community vs reference source set, restricted to
+        # the graph's own node universe (see _graph_universe).
         ref_set = ref.sources or ref.all_nodes
+        universe = _graph_universe(ds.node_index_map)
+        if universe:
+            ref_set = ref_set & universe
+            background_size = len(universe)
         enriched: list[CommunityEnrichment] = enrich_communities(
             communities, ref_set, background_size=background_size,
             top_k=len(communities),
@@ -556,7 +731,7 @@ class BiologicalValidator:
             "algorithm", "dataset", "network_type", "reference",
             "overlap_count", "predicted_size", "reference_size",
             "precision", "recall", "jaccard", "p_value",
-            "nmi", "ari", "note", "status",
+            "nmi", "ari", "circularity_risk", "note", "status",
         ]
         with open(path, "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=fields)
@@ -576,6 +751,7 @@ class BiologicalValidator:
                     "p_value":        _fmt(r.p_value),
                     "nmi":            _fmt(r.nmi),
                     "ari":            _fmt(r.ari),
+                    "circularity_risk": _fmt(r.circularity_risk),
                     "note":           r.note,
                     "status":         r.status,
                 })

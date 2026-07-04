@@ -30,7 +30,11 @@ import scipy.sparse as sp
 
 from src.algorithms.common.helpers import (
     _add_self_loops,
+    _available_ram_bytes,
+    _check_memory_or_raise,
+    _check_runtime_ram_or_raise,
     _col_normalize,
+    _estimate_mcl_peak_ram_bytes,
     _expand,
     _extract_clusters,
     _frobenius_diff,
@@ -118,6 +122,19 @@ def mcl_cpu_single(graph_csr: sp.csr_matrix, params: dict) -> dict:
     cap = int(p["max_iter"])
     tol = float(p["convergence_tol"])
 
+    # ---- Layer 1: RAM-vs-estimate check with post-symmetrize sizing ----
+    _check_memory_or_raise(
+        _estimate_mcl_peak_ram_bytes(
+            graph_csr, expansion=e, dtype_bytes=8, index_bytes=4,
+        ),
+        _available_ram_bytes(),
+        backend="cpu_single",
+        extra_hint=(
+            "Try mode=gpu (cuda_optimized) for larger graphs, "
+            "or raise prune_threshold / lower expansion."
+        ),
+    )
+
     graph_sym = graph_csr + graph_csr.T
     graph_sym.data = np.ones_like(graph_sym.data)
 
@@ -126,10 +143,32 @@ def mcl_cpu_single(graph_csr: sp.csr_matrix, params: dict) -> dict:
 
     converged = False
     for iteration in range(1, cap + 1):
+        # ---- Layer 2: per-iteration runtime watchdog ----
+        # Bail out before the next M @ M when free RAM has collapsed —
+        # letting the next allocation run risks the OS OOM killer taking
+        # the process (and the IDE hosting it) down.
+        _check_runtime_ram_or_raise(
+            backend="cpu_single",
+            iteration=iteration,
+            current_nnz=int(M.nnz),
+        )
+
         M_old = M.copy()
-        M = _expand(M, e)
-        M = _inflate_serial(M, r)
-        M = _prune(M, thr)
+        try:
+            M = _expand(M, e)
+            M = _inflate_serial(M, r)
+            M = _prune(M, thr)
+        except MemoryError as exc:
+            # Second-line defence: the pre-run estimate can under-predict
+            # for very dense biological networks whose M grows across
+            # iterations.  Convert into a MemoryError with actionable text
+            # rather than an interpreter abort.
+            raise MemoryError(
+                f"MCL cpu_single: RAM exhausted during iteration {iteration} "
+                f"(M.nnz={M_old.nnz}).  "
+                f"Try mode=gpu (cuda_optimized), raise prune_threshold, "
+                f"or lower expansion. Original: {exc}"
+            ) from exc
 
         if _frobenius_diff(M, M_old) < tol:
             converged = True

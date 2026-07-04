@@ -33,7 +33,14 @@ from __future__ import annotations
 import numpy as np
 import scipy.sparse as sp
 
-from src.algorithms.common.helpers import _extract_clusters
+from src.algorithms.common.helpers import (
+    _available_ram_bytes,
+    _check_memory_or_raise,
+    _check_runtime_ram_or_raise,
+    _estimate_mcl_peak_ram_bytes,
+    _extract_clusters,
+)
+
 from src.algorithms.cpu.multi_threaded._graphblas_utils import (
     _configure_threads,
     _from_scipy,
@@ -95,6 +102,19 @@ def mcl_cpu_multi(
             "note": "graphblas SuiteSparse (empty graph)",
         }
 
+    # ---- Layer 1: RAM-vs-estimate check with post-symmetrize sizing ----
+    _check_memory_or_raise(
+        _estimate_mcl_peak_ram_bytes(
+            graph_csr, expansion=e, dtype_bytes=4, index_bytes=4,
+        ),
+        _available_ram_bytes(),
+        backend="cpu_multi",
+        extra_hint=(
+            "Try mode=gpu (cuda_optimized) for larger graphs, "
+            "or raise prune_threshold / lower expansion."
+        ),
+    )
+
     # ---- Preprocess: symmetrize + binarize + self-loops + col-norm ------
     graph_sym = graph_csr + graph_csr.T
     graph_sym.data = np.ones_like(graph_sym.data, dtype=np.float32)
@@ -115,9 +135,24 @@ def mcl_cpu_multi(
         # the previous-iter matrix should we early-exit).
         M_old_sp = _to_scipy(M_gb, "csr")
 
+        # ---- Layer 2: per-iteration runtime watchdog ----
+        _check_runtime_ram_or_raise(
+            backend="cpu_multi",
+            iteration=iteration,
+            current_nnz=int(M_old_sp.nnz),
+        )
+
         # ---- Expansion: M = M^e via SuiteSparse SpGEMM ------------------
-        for _ in range(e - 1):
-            M_gb = M_gb.mxm(M_gb, gb.semiring.plus_times).new()
+        try:
+            for _ in range(e - 1):
+                M_gb = M_gb.mxm(M_gb, gb.semiring.plus_times).new()
+        except MemoryError as exc:
+            raise MemoryError(
+                f"MCL cpu_multi: RAM exhausted during expansion at "
+                f"iteration {iteration} (M.nnz={M_old_sp.nnz}). "
+                f"Try mode=gpu (cuda_optimized), raise prune_threshold, "
+                f"or lower expansion. Original: {exc}"
+            ) from exc
 
         # ---- Inflation: element-wise power ------------------------------
         M_gb = M_gb.apply(gb.binary.pow, right=r).new()

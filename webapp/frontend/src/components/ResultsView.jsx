@@ -48,6 +48,14 @@ function ResultsView({ jobId, result, algorithmName, onBack, onContinue }) {
   );
   const [topK, setTopK] = useState(null);
 
+  useEffect(() => {
+    setActiveTab(defaultTabForAlgo(algorithmName));
+  }, [algorithmName, jobId]);
+
+  useEffect(() => {
+    setTopK(null);
+  }, [jobId]);
+
   // Fetch the full payload (result + chart_data + table_data + graph_viz)
   useEffect(() => {
     if (!jobId) return undefined;
