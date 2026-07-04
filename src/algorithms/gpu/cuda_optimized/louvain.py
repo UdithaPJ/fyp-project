@@ -724,8 +724,20 @@ def _symmetrize(
     """
     nt = str(network_type).lower()
     if nt == "ppi":
-        A = graph_csr.astype(np.float32).tocsr()
-        A.sum_duplicates()
+        # Avoid a full copy when the input is already a canonical float32 CSR
+        # (the usual case): ``astype`` + ``tocsr`` + ``sum_duplicates`` each
+        # rewrite the arrays even when they are already clean.  Only copy when
+        # a conversion/dedup is genuinely required, and never mutate the
+        # caller's matrix in place.
+        A = graph_csr
+        if A.format != "csr":
+            A = A.tocsr()
+        if A.dtype != np.float32:
+            A = A.astype(np.float32)
+        if not A.has_canonical_format:
+            if A is graph_csr:
+                A = A.copy()
+            A.sum_duplicates()
         return A, "PPI: graph used as-is (already undirected)"
     # grn / mirna / anything else -> symmetrise
     A = (graph_csr + graph_csr.T).astype(np.float32).tocsr()
@@ -740,6 +752,12 @@ def _remove_self_loops(csr: sp.csr_matrix) -> sp.csr_matrix:
     Louvain at level 0.  They will be regenerated correctly at higher
     levels as collapsed intra-community weight by :func:`_build_coarsened_graph`.
     """
+    # Fast path: skip the full CSR copy + structural setdiag when the
+    # diagonal is already empty (the common case for PPI and the synthetic
+    # benchmark graphs).  ``diagonal()`` is O(n); the copy it avoids is
+    # O(nnz) plus scipy's expensive in-place structural rewrite.
+    if not csr.diagonal().any():
+        return csr
     csr = csr.copy()
     csr.setdiag(0)
     csr.eliminate_zeros()
@@ -1527,7 +1545,11 @@ def louvain_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
         # ---- CPU preprocessing ----------------------------------------
         A_sym, sym_note = _symmetrize(graph_csr, network_type)
         A_sym           = _remove_self_loops(A_sym)
-        A_sym, _isolated = _handle_isolated_nodes(A_sym)
+        # _handle_isolated_nodes intentionally NOT called here: its returned
+        # isolated-node list was discarded, so the full O(nnz) degree
+        # reduction it performed was pure setup overhead counted in the timed
+        # region.  Isolated nodes correctly stay in singleton communities via
+        # compute_proposed_moves (proposed == current when degree == 0).
         A_sym           = _normalize_weights(A_sym)
 
         # Ensure float32 throughout the GPU pipeline.
