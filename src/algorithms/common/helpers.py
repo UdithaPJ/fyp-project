@@ -363,11 +363,26 @@ def _run_louvain(
 
         changed  = True
         pass_num = 0
+        prev_Q   = None
         while changed and pass_num < max_phase1_passes:
             communities, changed = phase1_fn(
                 current_adj, communities, degrees, current_m, resolution, min_delta_q
             )
             pass_num += 1
+
+            # Modularity-delta convergence.  Q is bounded in ~[-0.5, 1], so an
+            # absolute ``min_delta_q`` threshold on the realized ΔQ is
+            # scale-robust — unlike a per-move or summed-gain threshold, whose
+            # fixed value is swamped by the many tiny per-node gains a large
+            # graph accumulates.  Phase 1's move-count flag has a very long,
+            # low-yield tail (a 100k graph keeps moving 1-3 % of nodes for 100+
+            # passes while Q barely changes); stopping when a pass improves Q
+            # by less than min_delta_q cuts dozens of those passes with no
+            # meaningful loss of partition quality.
+            Q = _compute_modularity(current_adj, communities, current_m, resolution)
+            if prev_Q is not None and (Q - prev_Q) < min_delta_q:
+                break
+            prev_Q = Q
 
         level_comms = communities[node_to_super]
         _, level_renumbered = np.unique(level_comms, return_inverse=True)

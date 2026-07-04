@@ -71,7 +71,7 @@ def _phase1_single(
     One complete sequential pass of Louvain Phase 1.
 
     For each node, computes ΔQ for moving to each neighbour community and
-    performs the best greedy move if ΔQ > min_delta_q.
+    performs the best greedy move if ΔQ > 0.
 
     ΔQ (move i from c_old to c_new) =
         (k_{i,c_new} - k_{i,c_old}) / m
@@ -79,57 +79,101 @@ def _phase1_single(
 
     where Σ_tot_c is the sum of degrees of nodes in c (after removing i).
 
+    Performance
+    -----------
+    The neighbour-community weights ``k_{i,c}`` are accumulated with a
+    persistent scratch array (``wtc``) that is cleared per node via a
+    ``touched`` list.  This replaces the previous per-node
+    ``np.unique`` + ``np.add.at`` + boolean-mask ``.sum()`` — three numpy
+    calls whose ~38 µs fixed overhead on ~12-element neighbour arrays
+    dominated the runtime (profiled: ``np.unique`` alone was ~48 % of
+    total).  Hot arrays are materialised as Python lists so the inner
+    scan is pure list indexing with no numpy scalar-access overhead.
+
+    Convergence
+    -----------
+    ``improved`` reports whether any node changed community — the true
+    Phase-1 fixed point.  The *practical* early stop is the
+    modularity-delta check in :func:`_run_louvain` (stop when a pass raises
+    Q by less than ``min_delta_q``); that is where ``min_delta_q`` is
+    consumed.  It is deliberately NOT used as a per-move acceptance
+    threshold here: the natural per-move gain magnitude is ~1/(2m), so any
+    fixed absolute value would reject every move once the graph has more
+    than a few thousand edges.  The per-move criterion is simply ΔQ > 0.
+
     Returns (communities, improved).
     """
-    N      = len(communities)
+    N       = len(communities)
     n_slots = int(communities.max()) + 1
-    comm_degsums = np.zeros(n_slots, dtype=np.float64)
-    np.add.at(comm_degsums, communities, degrees)
 
-    improved = False
+    comm_degsums_np = np.zeros(n_slots, dtype=np.float64)
+    np.add.at(comm_degsums_np, communities, degrees)
+
+    # Python lists for the hot read/update paths — list indexing is ~5× the
+    # throughput of numpy scalar indexing inside this Python-level loop.
+    comm_degsums = comm_degsums_np.tolist()
+    deg_list     = degrees.tolist()
+    wtc          = [0.0] * n_slots          # scratch: weight from i to comm c
+
+    indptr  = adj_csr.indptr
+    indices = adj_csr.indices
+    data    = adj_csr.data
+
+    inv_m   = 1.0 / m
+    inv_2m2 = 1.0 / (2.0 * m * m)
+
+    moves = 0
 
     for i in range(N):
-        ki    = degrees[i]
+        ki    = deg_list[i]
         c_old = int(communities[i])
 
         comm_degsums[c_old] -= ki
 
-        s = int(adj_csr.indptr[i])
-        e = int(adj_csr.indptr[i + 1])
+        s = int(indptr[i])
+        e = int(indptr[i + 1])
         if s == e:
             comm_degsums[c_old] += ki
             continue
 
-        nb_indices = adj_csr.indices[s:e]
-        nb_weights = adj_csr.data[s:e].astype(np.float64)
-        nb_comms   = communities[nb_indices].astype(np.int32)
+        # One vectorised gather each, then a pure-Python accumulation scan.
+        nbr_comms = communities[indices[s:e]].tolist()
+        nbr_wts   = data[s:e].tolist()
 
-        unique_comms, inverse = np.unique(nb_comms, return_inverse=True)
-        k_i_c = np.zeros(len(unique_comms), dtype=np.float64)
-        np.add.at(k_i_c, inverse, nb_weights)
+        touched = []
+        for c, w in zip(nbr_comms, nbr_wts):
+            prev = wtc[c]
+            if prev == 0.0:
+                touched.append(c)
+            wtc[c] = prev + w
 
-        k_i_c_old = k_i_c[unique_comms == c_old].sum()
+        k_i_c_old = wtc[c_old]          # 0.0 if no neighbour in c_old
+        cds_old   = comm_degsums[c_old]
+        res_ki    = resolution * ki
 
-        best_dq   = 0.0
+        best_gain = 0.0
         best_comm = c_old
-
-        for idx, c_new in enumerate(unique_comms):
+        for c_new in touched:
             if c_new == c_old:
                 continue
-            dq = (
-                (k_i_c[idx] - k_i_c_old) / m
-                - resolution * ki * (comm_degsums[c_new] - comm_degsums[c_old])
-                / (2.0 * m * m)
+            gain = (
+                (wtc[c_new] - k_i_c_old) * inv_m
+                - res_ki * (comm_degsums[c_new] - cds_old) * inv_2m2
             )
-            if dq > best_dq:
-                best_dq   = dq
-                best_comm = int(c_new)
+            if gain > best_gain:
+                best_gain = gain
+                best_comm = c_new
+
+        # Clear only the touched slots so the scratch array stays reusable.
+        for c in touched:
+            wtc[c] = 0.0
 
         communities[i] = best_comm
         comm_degsums[best_comm] += ki
         if best_comm != c_old:
-            improved = True
+            moves += 1
 
+    improved = moves > 0
     return communities, improved
 
 

@@ -39,8 +39,22 @@ src/algorithms/cpu/single_threaded/         ← used by CPU benchmarking only
   Never imported by webapp code.
 
 src/algorithms/cpu/multi_threaded/          ← used by CPU benchmarking only
-  Multi-process CPU implementations (cpu_multi only). No _gpu function.
+  Multi-threaded CPU implementations (cpu_multi only). No _gpu function.
   Never imported by webapp code.
+  Backend: SuiteSparse:GraphBLAS (python-graphblas) for pagerank, bfs, rwr,
+    hits, mcl — OpenMP threads inside SuiteSparse C kernels.
+  Exception — louvain: GraphBLAS has no Louvain primitive.  cpu_multi
+    Louvain uses NetworKit's PLM / PLMR (Parallel Louvain Method) instead,
+    run in an isolated subprocess launched by absolute file path
+    (`multi_threaded/_networkit_worker.py`).  Isolation is REQUIRED, not
+    optional: importing anything under `src.algorithms` forces a live CUDA
+    context (`src/benchmarking/benchmark.py` calls `cupy.zeros(1)` at
+    import time), and NetworKit's bundled OpenMP/TBB runtime cannot share
+    a process with an already-initialized CUDA context — confirmed to
+    abort with `malloc(): mismatching next->prev_size` (glibc heap
+    corruption) when run in-process.  `_networkit_worker.py` MUST NOT
+    import anything from `src.*`.  If NetworKit is not installed,
+    `louvain_cpu_multi` falls back to `louvain_cpu_single` with a warning.
 ```
 
 Convenience imports from `src/algorithms/cpu/` (re-exports both sub-packages):
