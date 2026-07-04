@@ -420,6 +420,58 @@ __global__ void rwr_spmv_warp_per_node(
 
 
 // =========================================================================
+// KERNEL: rwr_spmv_tprN  (FP32, adaptive vector width = N threads per row)
+//
+// Sub-warp "CSR-vector" SpMV: N contiguous lanes cooperate on one row, so
+// BLOCK_SIZE / N rows are processed per 256-thread block.  For the low-
+// average-degree biological / random graphs (avg degree ~6) a full 32-lane
+// warp per row leaves ~26 lanes idle every iteration; matching the vector
+// width to the degree (N ~ next_pow2(avg_degree)) packs several rows into
+// each warp and lifts useful-lane occupancy several-fold.  Only wired up
+// for network_type == "mirna" (grn / ppi keep the warp-per-node kernel).
+//
+// Boundary safety: threads whose row is out of range do NOT early-return;
+// they participate in the shuffle with partial = 0 so the full-warp mask
+// 0xffffffff stays valid on Volta+ (no inactive-lane shuffle UB).
+// Reduction correctness: N divides 32 and the N lanes of a group are
+// contiguous, so __shfl_down_sync offsets < N never cross a group boundary
+// for lane 0 of the group, which alone writes the result.
+// =========================================================================
+#define RWR_SPMV_TPR_KERNEL(NAME, TPR)                                        \
+__global__ void NAME(                                                         \
+    const int*   __restrict__ row_ptr,                                        \
+    const int*   __restrict__ col_idx,                                        \
+    const float* __restrict__ w_values,                                       \
+    const float* __restrict__ p,                                              \
+    const float* __restrict__ p0,                                             \
+    float*       __restrict__ p_new,                                          \
+    const float                one_minus_r,                                   \
+    const float                r,                                             \
+    const int                  n)                                             \
+{                                                                             \
+    const int rows_per_block = BLOCK_SIZE / (TPR);                            \
+    const int local_row = threadIdx.x / (TPR);                                \
+    const int sub_lane  = threadIdx.x % (TPR);                                \
+    const int node_i    = (int)blockIdx.x * rows_per_block + local_row;       \
+    const bool active   = (node_i < n);                                       \
+    const int row_start = active ? row_ptr[node_i]     : 0;                   \
+    const int row_end   = active ? row_ptr[node_i + 1] : 0;                   \
+    float partial = 0.0f;                                                     \
+    for (int j = row_start + sub_lane; j < row_end; j += (TPR))               \
+        partial += w_values[j] * __ldg(&p[col_idx[j]]);                       \
+    for (int off = (TPR) >> 1; off > 0; off >>= 1)                            \
+        partial += __shfl_down_sync(0xffffffffu, partial, off);               \
+    if (active && sub_lane == 0)                                              \
+        p_new[node_i] = one_minus_r * partial + r * p0[node_i];               \
+}
+
+RWR_SPMV_TPR_KERNEL(rwr_spmv_tpr2,  2)
+RWR_SPMV_TPR_KERNEL(rwr_spmv_tpr4,  4)
+RWR_SPMV_TPR_KERNEL(rwr_spmv_tpr8,  8)
+RWR_SPMV_TPR_KERNEL(rwr_spmv_tpr16, 16)
+
+
+// =========================================================================
 // KERNEL: rwr_spmv_warp_per_node_fp16w  (FP16 weights, FP32 accum)
 //
 // Identical warp-per-node structure; reads w_values as FP16 bit patterns
@@ -584,6 +636,11 @@ def _get_kernels() -> dict[str, Any]:
             "spmv_restart_fp16w":   mod.get_function("rwr_spmv_warp_per_node_fp16w"),
             "l1_conv":              mod.get_function("l1_convergence_rwr"),
             "spmv_restart_batched": mod.get_function("rwr_spmv_warp_per_node_batched"),
+            # Adaptive vector-width SpMV (mirna only — see dispatch below).
+            "spmv_tpr2":            mod.get_function("rwr_spmv_tpr2"),
+            "spmv_tpr4":            mod.get_function("rwr_spmv_tpr4"),
+            "spmv_tpr8":            mod.get_function("rwr_spmv_tpr8"),
+            "spmv_tpr16":           mod.get_function("rwr_spmv_tpr16"),
             "_arch_flag":           arch_flag,
         }
     return _kernel_cache["rwr"]
@@ -677,6 +734,25 @@ def _build_p0(seed_nodes, n: int, network_type: str) -> np.ndarray:
 def _fp32_to_fp16_bits(values: np.ndarray) -> np.ndarray:
     """Convert FP32 array to FP16 bit pattern stored as uint16."""
     return values.astype(np.float16).view(np.uint16).astype(np.uint16)
+
+
+def _choose_tpr(avg_degree: float) -> int:
+    """Pick threads-per-row (power of 2 in [2, 32]) ~ next_pow2(avg_degree).
+
+    A full 32-lane warp per row wastes lanes when rows are short; matching
+    the vector width to the average degree packs BLOCK_SIZE / tpr rows into
+    each block and raises useful-lane occupancy.  ``32`` means "use the
+    original warp-per-node kernel" (no change).
+    """
+    if avg_degree <= 2.0:
+        return 2
+    if avg_degree <= 4.0:
+        return 4
+    if avg_degree <= 8.0:
+        return 8
+    if avg_degree <= 16.0:
+        return 16
+    return 32
 
 
 def _estimate_rwr_vram(n: int, nnz: int, batch_size: int = 1,
@@ -995,7 +1071,20 @@ def rwr_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
     try:
         # ---- Parameter merging -------------------------------------------
         p = _merge_params(params)
-        if _GPU_CONFIG_AVAILABLE:
+
+        # apply_config() is ALREADY run by algorithm_runner.run_algorithm()
+        # before this function is called, and every key it injects for RWR
+        # (spmv_mode, reorder_nodes, execution_mode, chunk_size, …) is ignored
+        # below — rwr_gpu re-derives its own VRAM / chunking decision and
+        # honours user-supplied max_iter / tolerance regardless.  For the
+        # mirna network type we therefore skip this SECOND, redundant
+        # apply_config() so its CPU graph-profiling and live mem_get_info()
+        # VRAM queries are not charged to the CUDA-event-timed region (the
+        # runner times the whole _gpu() call, and its start event fires before
+        # this line).  grn / ppi keep the original path so their tuning and
+        # results stay byte-identical.
+        _nt_raw = str(p.get("network_type", "grn")).lower()
+        if _GPU_CONFIG_AVAILABLE and _nt_raw != "mirna":
             p = apply_config("rwr", graph_csr, p) or p
             for k, v in _DEFAULT_PARAMS.items():
                 p.setdefault(k, v)
@@ -1141,8 +1230,28 @@ def rwr_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
             d_w_values = gpuarray.to_gpu_async(h_w_values, stream=stream_transfer)
             _GPU_CSR_CACHE.store(gpu_cache_key, d_row_ptr, d_col_idx, d_w_values)
 
-        # ---- Select SpMV kernel ------------------------------------------
-        k_spmv   = kernels["spmv_restart_fp16w"] if fp16_weights else kernels["spmv_restart"]
+        # ---- Select SpMV kernel + launch grid ----------------------------
+        # Default (grn / ppi, or FP16 weights): warp-per-node, 8 rows/block.
+        #
+        # mirna (FP32, non-batched): degree-adaptive sub-warp SpMV.  Match the
+        # threads-per-row to the average degree so short rows do not each
+        # occupy a full 32-lane warp — packs BLOCK_SIZE / tpr rows per block.
+        # tpr == 32 falls back to the identical warp-per-node kernel/grid, so
+        # this is a no-op for high-degree mirna graphs.
+        spmv_grid = (n_spmv_blocks, 1, 1)
+        if fp16_weights:
+            k_spmv = kernels["spmv_restart_fp16w"]
+        elif network_type.lower() == "mirna":
+            avg_deg = float(W.nnz) / max(1, n)
+            tpr = _choose_tpr(avg_deg)
+            if tpr >= 32:
+                k_spmv = kernels["spmv_restart"]
+            else:
+                k_spmv = kernels[f"spmv_tpr{tpr}"]
+                rows_per_block = BLOCK_SIZE // tpr
+                spmv_grid = ((n + rows_per_block - 1) // rows_per_block, 1, 1)
+        else:
+            k_spmv = kernels["spmv_restart"]
         k_l1     = kernels["l1_conv"]
         k_reduce = kernels["reduce_scalar"]
 
@@ -1328,13 +1437,13 @@ def rwr_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
                 if enable_profiling:
                     _es = cuda.Event(); _es.record(stream_compute)
 
-                # Warp-per-node SpMV (improvement 4)
+                # SpMV: warp-per-node (grn/ppi/fp16) or adaptive tpr (mirna)
                 k_spmv(
                     d_row_ptr, d_col_idx, d_w_values,
                     d_p, d_p0, d_pn,
                     one_minus_r, r_val, np.int32(n),
                     block=(BLOCK_SIZE, 1, 1),
-                    grid=(n_spmv_blocks, 1, 1),
+                    grid=spmv_grid,
                     stream=stream_compute,
                 )
 
