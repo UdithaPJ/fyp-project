@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import warnings
 from pathlib import Path
@@ -49,7 +50,12 @@ class PreprocessingService:
     async def upload_file(self, filename: str, content: bytes) -> UploadResponse:
         """Load, store, and preview an uploaded dataset."""
 
-        dataframe = self.file_loader.load_bytes(filename, content)
+        # OPTIMIZED (upload-time): parsing is CPU-bound (pandas read_csv);
+        # running it off the event loop thread keeps the server responsive
+        # to other requests while a large file is being parsed.
+        dataframe = await asyncio.to_thread(
+            self.file_loader.load_bytes, filename, content
+        )
         record = dataset_store.save(filename=filename, dataframe=dataframe)
         return UploadResponse(
             upload_id=record.upload_id,
@@ -189,6 +195,10 @@ class PreprocessingService:
         preview = dataframe.head(limit)
         return self._records_to_json_safe(preview.to_dict(orient="records"))
 
+    # OPTIMIZED (upload-time): see FileLoader._MEMORY_SCAN_ROW_FLOOR for the
+    # rationale — skip the expensive deep memory scan below this row count.
+    _MEMORY_SCAN_ROW_FLOOR = 100_000
+
     def _warn_if_large(self, dataframe: pd.DataFrame, context: str) -> None:
         """Raise a warning when a dataset is likely to be memory-intensive."""
 
@@ -196,6 +206,9 @@ class PreprocessingService:
             return
 
         row_count = len(dataframe)
+        if row_count < self._MEMORY_SCAN_ROW_FLOOR < self.LARGE_DATASET_ROW_THRESHOLD:
+            return
+
         memory_bytes = int(dataframe.memory_usage(index=True, deep=True).sum())
         if (
             row_count >= self.LARGE_DATASET_ROW_THRESHOLD

@@ -36,13 +36,10 @@ except ImportError:  # pragma: no cover - fallback for running from backend dire
     from models.responses import GraphStatsResponse, NodeListResponse, NodeEntry
     from services.dataset_store import dataset_store
 
-from src.preprocessing.pipeline import PreprocessingPipeline
-from src.graph.converter import get_graph_stats, graphdata_to_csr
+from src.graph.converter import get_graph_stats
 
 
 router = APIRouter(prefix="/graph", tags=["graph"])
-
-_pipeline = PreprocessingPipeline()
 
 
 # ---------------------------------------------------------------------------
@@ -50,24 +47,43 @@ _pipeline = PreprocessingPipeline()
 # ---------------------------------------------------------------------------
 
 def _get_csr_for_upload(upload_id: str):
-    """Retrieve dataset → rebuild GraphData → return (csr, node_index_map)."""
+    """Return the cached ``(graph_csr, node_index_map)`` for an upload.
+
+    FIX (upload-time / correctness): this used to call
+    ``PreprocessingPipeline.run_dataframe(record.dataframe, ...)`` on every
+    request — re-running schema detection/cleaning/dedup/graph-building
+    from scratch, with a hardcoded ``user_override=None,
+    duplicate_strategy="mean"`` that silently ignored whatever mapping or
+    duplicate strategy the user actually confirmed in ``/preprocess``. It
+    also crashed outright once ``/preprocess`` had run, because
+    ``preprocessing_service._store_graph_artefacts`` nulls
+    ``record.dataframe`` right after building the CSR (see
+    ``dataset_store.py`` MEMORY_FIX C-2) — so every call here after that
+    point raised ``AttributeError: 'NoneType' object has no attribute
+    'empty'``, breaking the BFS/RWR node-search typeahead
+    (``GET /graph/nodes``) in practice.
+
+    The pipeline already runs exactly once, in ``/preprocess`` — this now
+    reads the ``graph_csr``/``node_index_map`` it already cached, exactly
+    like ``algorithm_service.py`` does, instead of re-deriving (and
+    potentially mismatching) the graph.
+    """
     try:
         record = dataset_store.get(upload_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    try:
-        graph_data, _ = _pipeline.run_dataframe(
-            raw_dataframe=record.dataframe,
-            user_override=None,
-            duplicate_strategy="mean",
-        )
-        return graphdata_to_csr(graph_data)
-    except Exception as exc:
+    graph_csr = getattr(record, "graph_csr", None)
+    node_index_map = getattr(record, "node_index_map", None)
+    if graph_csr is None or node_index_map is None:
         raise HTTPException(
-            status_code=500,
-            detail=f"Graph conversion failed: {exc}",
-        ) from exc
+            status_code=400,
+            detail=(
+                "Graph has not been preprocessed yet. "
+                "Call /preprocess (or /preprocess/stream) for this upload_id first."
+            ),
+        )
+    return graph_csr, node_index_map
 
 
 # ---------------------------------------------------------------------------

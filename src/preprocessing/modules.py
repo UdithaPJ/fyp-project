@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import io
 import json
 import re
@@ -35,6 +36,40 @@ class FileLoader:
     # memory bounded by the chunk-aggregated cleaned frame rather than a
     # full single-shot read.
     LARGE_FILE_SIZE_THRESHOLD_BYTES = 500 * 1024 * 1024
+
+    # OPTIMIZED (upload-time): candidate separators considered when
+    # sniffing an unknown (.txt/.tab) delimiter from a small sample,
+    # instead of parsing the whole file with the slow python engine.
+    _SNIFF_SAMPLE_BYTES = 8192
+    _CANDIDATE_DELIMITERS = ["\t", ",", ";", "|"]
+
+    @classmethod
+    def _sniff_delimiter(cls, sample: str) -> str:
+        """Detect a delimiter from a small text sample, not the whole file.
+
+        ``pd.read_csv(sep=None, engine="python")`` auto-detects the
+        delimiter but forces the pure-Python parser across the *entire*
+        file, which is 10-20x slower than the C engine on large files.
+        Sniffing a small sample lets the fast C engine handle the actual
+        parse for the common case (tab/comma/semicolon/pipe-separated
+        edge lists).
+        """
+
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters="\t,;|")
+            return dialect.delimiter
+        except csv.Error:
+            pass
+
+        lines = [line for line in sample.splitlines() if line.strip()][:5]
+        if not lines:
+            return ","
+        counts = {
+            delimiter: min(line.count(delimiter) for line in lines)
+            for delimiter in cls._CANDIDATE_DELIMITERS
+        }
+        best_delimiter, best_count = max(counts.items(), key=lambda kv: kv[1])
+        return best_delimiter if best_count > 0 else ","
 
     def load(self, file_path: str | Path) -> pd.DataFrame:
         """Load a CSV, TSV, TXT, Excel, or JSON file."""
@@ -116,13 +151,24 @@ class FileLoader:
         if suffix == ".tsv":
             return pd.read_csv(path, sep="\t", chunksize=chunksize, low_memory=True)
         if suffix in {".txt", ".tab"}:
-            return pd.read_csv(
-                path,
-                sep=None,
-                engine="python",
-                chunksize=chunksize,
-                low_memory=True,
-            )
+            with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+                sample = handle.read(self._SNIFF_SAMPLE_BYTES)
+            if not sample.strip():
+                return iter(())
+            detected_sep = self._sniff_delimiter(sample)
+            try:
+                return pd.read_csv(
+                    path, sep=detected_sep, chunksize=chunksize, low_memory=True
+                )
+            except Exception:
+                # Fall back to the slow-but-robust auto-detecting parser.
+                return pd.read_csv(
+                    path,
+                    sep=None,
+                    engine="python",
+                    chunksize=chunksize,
+                    low_memory=True,
+                )
 
         raise ValueError(
             "Chunk loading is supported for delimited text files only: "
@@ -134,8 +180,18 @@ class FileLoader:
 
         try:
             if sep is None:
-                # OPTIMIZED: delimiter sniffing needs the Python engine here.
-                return pd.read_csv(path, sep=None, engine="python", low_memory=True)
+                # OPTIMIZED (upload-time): sniff the delimiter from a small
+                # sample and parse with the fast C engine, instead of
+                # forcing the slow python engine across the whole file.
+                with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+                    sample = handle.read(self._SNIFF_SAMPLE_BYTES)
+                if not sample.strip():
+                    return pd.DataFrame()
+                detected_sep = self._sniff_delimiter(sample)
+                try:
+                    return pd.read_csv(path, sep=detected_sep, low_memory=True)
+                except Exception:
+                    return pd.read_csv(path, sep=None, engine="python", low_memory=True)
             # OPTIMIZED: keep the default fast CSV engine for known delimiters.
             return pd.read_csv(path, sep=sep, low_memory=True)
         except pd.errors.EmptyDataError:
@@ -147,13 +203,25 @@ class FileLoader:
         if not content.strip():
             return pd.DataFrame()
 
-        buffer = io.BytesIO(content)
         try:
             if sep is None:
-                # OPTIMIZED: delimiter sniffing needs the Python engine here.
-                return pd.read_csv(buffer, sep=None, engine="python", low_memory=True)
+                # OPTIMIZED (upload-time): sniff the delimiter from a small
+                # sample and parse with the fast C engine, instead of
+                # forcing the slow python engine across the whole payload.
+                sample = content[: self._SNIFF_SAMPLE_BYTES].decode(
+                    "utf-8", errors="ignore"
+                )
+                detected_sep = self._sniff_delimiter(sample)
+                try:
+                    return pd.read_csv(
+                        io.BytesIO(content), sep=detected_sep, low_memory=True
+                    )
+                except Exception:
+                    return pd.read_csv(
+                        io.BytesIO(content), sep=None, engine="python", low_memory=True
+                    )
             # OPTIMIZED: keep the default fast CSV engine for known delimiters.
-            return pd.read_csv(buffer, sep=sep, low_memory=True)
+            return pd.read_csv(io.BytesIO(content), sep=sep, low_memory=True)
         except pd.errors.EmptyDataError:
             return pd.DataFrame()
 
@@ -195,6 +263,12 @@ class FileLoader:
 
         return pd.DataFrame({"value": [payload]})
 
+    # OPTIMIZED (upload-time): below this row count, hitting the memory
+    # threshold would require ~2.5 KB/row across all columns combined —
+    # unrealistic for short gene/protein/TF identifier columns, so the
+    # expensive deep memory scan is skipped entirely in that regime.
+    _MEMORY_SCAN_ROW_FLOOR = 100_000
+
     def _warn_if_large(self, dataframe: pd.DataFrame, context: str) -> None:
         """Raise a warning when a loaded dataset is likely to be memory-intensive."""
 
@@ -202,6 +276,12 @@ class FileLoader:
             return
 
         row_count = len(dataframe)
+        if row_count < self._MEMORY_SCAN_ROW_FLOOR < self.LARGE_DATASET_ROW_THRESHOLD:
+            return
+
+        # OPTIMIZED: memory_usage(deep=True) walks every object-dtype cell
+        # to size its Python string individually — real cost on large
+        # frames. Only paid once row_count already suggests it's needed.
         memory_bytes = int(dataframe.memory_usage(index=True, deep=True).sum())
         if (
             row_count >= self.LARGE_DATASET_ROW_THRESHOLD
