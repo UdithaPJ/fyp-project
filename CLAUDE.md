@@ -910,87 +910,168 @@ Target: adaptive (RTX 20-series Turing by default), `BLOCK_SIZE = 256`,
 
 ## RWR GPU implementation (optimised)
 
-Custom PyCUDA kernels — no CuPy dependency.  Hybrid CSR + ELLPACK
-storage; SMEM-cached p for small graphs; optional FP16 weights;
-single CPU-GPU sync per iteration; chunked execution for VRAM-bound
-graphs.
+Custom PyCUDA kernels — no CuPy dependency.  Warp-per-node SpMV (default,
+grn/ppi/fp16); degree-adaptive sub-warp SpMV (mirna only, see below);
+optional FP16 weights; convergence checked every N iterations (single
+sync per check); chunked execution for VRAM-bound graphs.
 
 Key optimisations over the initial implementation:
   1. **GPU-side scalar reductions** (`reduce_to_scalar_f32`):
      Block-partial L1 from `l1_convergence_rwr` is reduced to a single
      FP32 scalar on the GPU.  Only that one float crosses PCIe per
-     iteration (vs. the full partial-sum array before).  Exactly ONE
-     `stream_compute.synchronize()` per iteration.
-  2. **Hub-row ELLPACK for memory coalescing**
-     (`rwr_spmv_ellpack_hubs`):
-     Rows with `degree >= hub_threshold` are repacked into padded
-     ELLPACK (predictable stride, no `row_ptr` indirection).  Adaptive
-     hub threshold at the 95th degree percentile, clamped to
-     `[WARP_SIZE, max_degree]` and snapped to a power of 2.  Remaining
-     rows continue to use CSR with the existing three-tier dispatch.
-     One block per hub row writes `p_new[node_i]` directly (no atomic).
-  3. **SMEM-cached p for small graphs** (`rwr_spmv_smem_p`):
-     When `n <= SMEM_P_LIMIT` (default 4096), the entire previous-
-     iteration `p` vector is cached in shared memory once per block.
-     Eliminates the gmem reads of `p` during SpMV gather — the main
-     bandwidth-bound step for power-law biological networks.  Auto-
-     selected only when there are no hubs and FP32 (mixed precision
-     paths skip this optimisation).
-  4. **Optional mixed precision** (`precision_mode = "mixed"`):
+     convergence check (vs. the full partial-sum array before).
+  2. **Convergence checked every N iterations** (`conv_check_interval`,
+     default 10): SpMV kernels queue continuously; the sync + scalar
+     read happen only every N iterations (final iteration always
+     checks) — eliminates ~90 % of CPU-GPU sync stalls vs. checking
+     every iteration.
+  3. **Warp-per-node SpMV** (`rwr_spmv_warp_per_node` /
+     `_fp16w` / `_batched`): one 256-thread block processes
+     `NODES_PER_BLOCK = 8` nodes at a time; each 32-lane warp handles
+     exactly one node via warp-shuffle reduction (no SMEM, no
+     `__syncthreads`).  8× fewer blocks than one-block-per-node, all
+     warps in a block doing useful work simultaneously.
+  4. **Persistent GPU working buffers** (`_WorkingBufferCache`):
+     `d_p / d_pn / d_p0 / d_partial / d_l1_scalar` allocated once per
+     graph size (`n`) and reused across repeated calls — no
+     `gpuarray.empty()` / `.free()` churn per run.
+  5. **Cached transition matrix + device CSR arrays**: the CPU-side
+     column-stochastic `W` (`_W_CACHE`) and the uploaded device CSR
+     (`_GPU_CSR_CACHE`) are recomputed / re-uploaded only when the
+     graph object, `network_type`, or `precision_mode` changes.
+  6. **Optional mixed precision** (`precision_mode = "mixed"`):
      Transition weights stored as FP16 (`unsigned short` half-bit
      pattern); `p / p_new / p₀` remain FP32; accumulation is FP32.
-     Halves the w_values bandwidth at negligible accuracy cost.
-     Kernel: `rwr_spmv_restart_fp16w` (uses `__half2float` to decode
-     each weight at use time).
-  5. **Multi-stream async overlap**:
-     `stream_compute` runs SpMV + convergence; `stream_transfer`
-     handles async H2D during setup AND the chunked-path double-buffer
-     pipeline.  `cuda.Event` between streams orders launches without a
-     host sync between them.
-  6. **Chunked execution** (`_rwr_gpu_chunked` + `_ChunkBuffer`):
+     Halves the w_values bandwidth.  Kernel:
+     `rwr_spmv_warp_per_node_fp16w` (`__half2float` decode at use time).
+  7. **Batched execution** (`rwr_spmv_warp_per_node_batched`) for
+     `1 < B <= MAX_BATCH = 4` seed sets; `p / p₀ / p_new` stored as
+     `[n × B]` row-major flat arrays, `gridDim = (blocks, B, 1)`.
+  8. **Chunked execution** (`_rwr_gpu_chunked` + `_ChunkBuffer`):
      `p / p_new / p₀ / partial-sum buffers` stay full-size on the
      device throughout.  CSR rows stream in chunks via a pre-allocated
-     GPU ping-pong pair (`_ChunkBuffer`); `stream_transfer` pre-loads
-     chunk i+1 while `stream_compute` runs chunk i SpMV (uses the
-     `rwr_spmv_restart_chunk` kernel — same three-tier dispatch but
-     reads `chunk_node_ids[local_i]` to write back into the global
-     `p_new`).  Auto-triggered when estimated VRAM > 80 % of free VRAM
-     or `use_chunking=True` from `apply_config`.
+     GPU ping-pong pair; `stream_transfer` pre-loads chunk i+1 while
+     `stream_compute` runs chunk i SpMV (`rwr_spmv_warp_per_node_chunk`
+     — same warp-per-node layout, reads `chunk_node_ids[local_i]` to
+     write back into the global `p_new`).  Auto-triggered only when
+     the working set genuinely exceeds `VRAM_BUDGET_FRACTION = 0.80`
+     of free VRAM — a `use_chunking=True` param from `apply_config`'s
+     coarse estimate is deliberately NOT honoured on its own, since the
+     chunked path re-streams the entire `W` CSR host→device every
+     iteration (catastrophic for a graph that actually fits).
+  9. **CUDA-event profiling** (`enable_profiling=True`): per-run
+     breakdown of SpMV / convergence / H2D-transfer / total time,
+     attached at `result["result"]["profiling"]`.  Zero overhead when
+     disabled.
+
+Removed optimisations (introduced more overhead than benefit on these
+graphs — see module docstring): hub-row ELLPACK, SMEM-cached p vector,
+node reordering.  Do not reintroduce without re-benchmarking.
+
+### mirna-only degree-adaptive SpMV (throughput fix)
+
+**Problem observed**: on the RTX 2060 scalability benchmark
+(barabasi_albert / erdos_renyi / watts_strogatz, avg degree ≈ 6),
+`mode=gpu` RWR was slower than both `cpu_multi` (GraphBLAS) and
+`gpu_baseline` (cuGraph) at every graph size, for all three network
+types.  Root-caused to two issues, both fixed for `network_type ==
+"mirna"` only (grn/ppi keep the original path byte-identical, per
+existing benchmark expectations for those two types):
+
+  1. **Redundant `apply_config()` call inside the timed region.**
+     `algorithm_runner.run_algorithm()` already calls `apply_config()`
+     once, before starting the CUDA-event timer, and passes the tuned
+     params into `rwr_gpu()`.  `rwr_gpu()` was calling `apply_config()`
+     a *second* time internally — and every key that second call
+     injects (`spmv_mode`, `reorder_nodes`, `chunk_size`,
+     `execution_mode`, …) is ignored by this file's own VRAM/chunking
+     logic and param handling (the source of the runner's "ignoring
+     unknown param keys" warning).  That second call's CPU graph
+     profiling + live `cuda.mem_get_info()` query ran *after* the
+     runner's CUDA start-event fired, so its cost was billed to the
+     optimised-GPU timer at every graph size — explaining the
+     across-the-board slowdown, not just at scale.  For
+     `network_type == "mirna"` this second `apply_config()` call is
+     now skipped entirely; results are unaffected since nothing
+     downstream consumed its output.
+  2. **Warp-per-node wastes lanes on low-average-degree graphs.**
+     `rwr_spmv_warp_per_node` gives every node a full 32-lane warp.
+     At avg degree ≈ 6 (BA/ER/WS test graphs), ~26 of 32 lanes sit
+     idle every iteration — cuGraph's load-balanced SpMV does not pay
+     this cost.  Fixed with a degree-adaptive sub-warp SpMV.
+
+New kernels: `rwr_spmv_tpr2` / `_tpr4` / `_tpr8` / `_tpr16` — a macro-
+generated family (`RWR_SPMV_TPR_KERNEL`) where `tpr` (threads-per-row)
+contiguous lanes cooperate on one row, packing `BLOCK_SIZE / tpr` rows
+per block instead of `NODES_PER_BLOCK = 8`.  Threads whose row is out
+of range do NOT early-return (they participate with `partial = 0` so
+the full-warp shuffle mask `0xffffffff` stays valid); only lane 0 of
+each `tpr`-wide group writes `p_new`.  `tpr` divides 32 and groups are
+lane-contiguous, so the sub-group `__shfl_down_sync` reduction never
+crosses a group boundary.
+
+`_choose_tpr(avg_degree)` picks `tpr ∈ {2, 4, 8, 16, 32}` as the
+smallest power of 2 that is `>= avg_degree` (capped at 32); `tpr == 32`
+is a no-op — it dispatches to the original `rwr_spmv_warp_per_node`
+kernel and grid, so high-average-degree mirna graphs are unaffected.
+Dispatch (serial single-seed FP32 path only — batched and FP16 keep
+warp-per-node):
+```python
+if fp16_weights:                       # fp16 always uses warp-per-node
+    k_spmv = spmv_restart_fp16w
+elif network_type == "mirna":
+    tpr = _choose_tpr(W.nnz / n)
+    k_spmv = spmv_restart if tpr >= 32 else kernels[f"spmv_tpr{tpr}"]
+    grid   = (n_spmv_blocks, 1, 1) if tpr >= 32 else \
+             (ceil(n / (BLOCK_SIZE // tpr)), 1, 1)
+else:                                   # grn / ppi — unchanged
+    k_spmv = spmv_restart
+```
+**Verification note**: since mirna and grn build the identical
+transition matrix on these synthetic graphs (`_build_transition_matrix`
+has one shared branch for both — see below), the mirna GPU
+`top_nodes`/`scores` on a given graph must match the grn GPU run on
+the same graph.  Use this as the correctness check for the adaptive
+kernel before trusting new benchmark numbers.
+
+**Confirmed on RTX 2060** (`scalability` benchmark, `--network-type
+mirna`, edge targets 1M–50M, barabasi_albert / erdos_renyi /
+watts_strogatz): GPU Optimised (`mode=gpu`) now runs below both CPU
+GraphBLAS (`cpu_multi`) and GPU Baseline (`gpu_baseline`) at every
+tested size across all three graph families — the regression described
+above is resolved.  grn / ppi results are unaffected (unchanged code
+path).
 
 Kernels (compiled once, cached in `_kernel_cache["rwr"]`):
   - `reduce_to_scalar_f32` — strided load + SMEM tree → single FP32
     scalar at `scalar_output[0]`.  Reused for L1 convergence.
-  - `rwr_spmv_restart` — FP32 fused SpMV + restart.  Three-tier:
-      LOW  (deg < 32)         : thread 0 only, serial scan
-      MED  (32 ≤ deg < 256)   : first warp, stride-32 + `__shfl_down_sync`
-      HIGH (deg ≥ 256)        : full block, stride-256 + SMEM tree
-    Restart term added by **thread 0 only** after the reduction; uses
-    `__ldg(&p[col])` on p reads for read-only texture cache routing.
-  - `rwr_spmv_restart_fp16w` — same dispatch, FP16 weight reads via
-    `__half2float`.  Selected when `precision_mode == "mixed"`.
-  - `rwr_spmv_smem_p` — cooperative load of full `p` into SMEM at the
-    start, then the same three-tier dispatch reading `p_cache[]`.
-    Dynamic SMEM size = `n * sizeof(float)`.  Selected when
-    `n <= SMEM_P_LIMIT` and no hubs and FP32.
-  - `rwr_spmv_ellpack_hubs` — one block per hub row; padded ELLPACK
-    with `col_idx == -1` skipped.  Always FP32 (hub weights are a
-    small fraction of total bytes).
+  - `rwr_spmv_warp_per_node` — FP32 SpMV + restart, warp-per-node
+    (default for grn/ppi).  `__ldg(&p[col_idx[j]])` for read-only
+    cache routing; 5 unrolled `__shfl_down_sync` for the warp
+    reduction; lane 0 writes `p_new[node_i]`.
+  - `rwr_spmv_warp_per_node_fp16w` — same layout, FP16 weight reads
+    via `__half2float`.  Selected when `precision_mode == "mixed"`.
+  - `rwr_spmv_tpr2` / `_tpr4` / `_tpr8` / `_tpr16` — degree-adaptive
+    sub-warp SpMV, mirna-only (see above).
   - `l1_convergence_rwr` — `Σ |p_new[i] − p[i]|` per block via warp
     shuffles + final 8-lane warp reduction in SMEM (FP32).
-  - `rwr_spmv_restart_batched` — multi-seed batched kernel.
-    `gridDim = (n, B, 1)`; one block per `(node_i, seed_b)` pair;
-    `p / p₀ / p_new` stored as `[n × B]` row-major flat arrays.
-    Used only when `1 < B <= MAX_BATCH = 4`.
-  - `rwr_spmv_restart_chunk` (separate `_CHUNK_KERNEL_SOURCE` module)
-    — chunked CSR variant; `chunk_node_ids[local_i]` translates
-    block-local row → global node id for writeback to `p_new`.
+  - `rwr_spmv_warp_per_node_batched` — multi-seed batched kernel.
+    `gridDim = (ceil(n / NODES_PER_BLOCK), B, 1)`; one warp per
+    `(node_i, seed_b)` pair; `p / p₀ / p_new` stored as `[n × B]`
+    row-major flat arrays.  Used only when `1 < B <= MAX_BATCH = 4`.
+  - `rwr_spmv_warp_per_node_chunk` (separate `_CHUNK_KERNEL_SOURCE`
+    module) — chunked CSR variant; `chunk_node_ids[local_i]`
+    translates chunk-local row → global node id for writeback to
+    `p_new`.
 
-Transition matrix W construction (CPU, network-type aware):
-  - GRN   : directed CSR as-is; `W = (D⁻¹ · A).T`.  Dangling columns
-            (`out_degree == 0`) get a self-loop `W[j,j] = 1`.
+Transition matrix W construction (CPU, network-type aware,
+`_build_transition_matrix` in `src/algorithms/gpu/cuda_optimized/rwr.py`):
+  - GRN / miRNA : directed CSR as-is (one shared code branch — miRNA
+            gets no special-case treatment); `W = (D⁻¹ · A).T`.
+            Dangling columns (`out_degree == 0`) get a self-loop
+            `W[j,j] = 1`.
   - PPI   : `A_sym = A + Aᵀ`, binarised, then column-normalise + the
             dangling-column self-loop fix.
-  - miRNA : directed bipartite CSR; same treatment as GRN.
 
 p₀ construction:
   - Non-empty seeds : `p0[seed] = 1 / |seeds|`, zero elsewhere.
@@ -1003,22 +1084,19 @@ Multi-seed-set handling:
   - `B > MAX_BATCH`                  → serial-per-seed-set loop
   Per-node scores are averaged; `batch_results` field carries
   per-seed-set scores / iterations / converged when `B > 1`.
-  Note: chunked + batched is not supported in this pass; if both are
-  requested the batched path runs on the full graph (may OOM).
-
-Optional node reordering (`reorder_nodes=False` by default):
-  CPU permutes W rows/cols by ascending degree → similar-degree nodes
-  adjacent in CSR → reduced warp divergence.  Seed indices and final
-  scores are remapped via the inverse permutation.
+  Note: chunked + batched is not supported; if both are requested the
+  batched path runs on the full graph (may OOM).
 
 Result keys: `scores`, `top_nodes` (top-20), `top_seeds` (top-10
   among the union of seed indices, or `top_nodes[:10]` if no seeds),
   `iterations`, `converged`, `note`, and `batch_results` when `B > 1`.
+  `note` also carries the transition-matrix construction note and a
+  GPU-pipeline summary (precision, chunked, arch, sync cadence).
 
-Iteration structure (single-seed, regular path):
-  spmv_csr_or_smem_or_fp16w → spmv_ellpack_hubs (if any) →
+Iteration structure (single-seed, serial path):
+  spmv (warp_per_node / tpr-adaptive / fp16w) → [every N iters:
   l1_convergence → reduce_to_scalar → stream_compute.synchronize() →
-  d_l1_scalar.get()[0] → pointer swap p/p_new.
+  d_l1_scalar.get()[0]] → pointer swap p/p_new.
 
 CUDA streams:
   - `stream_compute`  — kernel execution (SpMV + L1 + reduction)
@@ -1030,9 +1108,9 @@ Context handling: same pattern as HITS / Louvain / MCL / PageRank —
 
 VRAM check: `_estimate_rwr_vram` (accounts for FP16 weights when
   `precision_mode == "mixed"`).  If estimated working set exceeds
-  free VRAM AND chunked is not requested/feasible → raises
-  `MemoryError`.  Chunked path auto-activates to avoid OOM for
-  single-seed runs.
+  free VRAM AND chunked is not needed → raises `MemoryError`.  Chunked
+  path auto-activates only when the working set exceeds
+  `VRAM_BUDGET_FRACTION = 0.80` of free VRAM.
 
 Compilation: **adaptive** — `_detect_arch_flag()` queries
   `cuda.Device(0).compute_capability()` and builds with
@@ -1046,7 +1124,7 @@ Does NOT silently fall back to CPU — raises `RuntimeError` /
   separate package (`src.algorithms.cpu.single_threaded.rwr` and
   `src.algorithms.cpu.multi_threaded.rwr`) selected by the runner.
 Target: adaptive (RTX 20-series Turing by default), `BLOCK_SIZE = 256`,
-  `MAX_BATCH = 4`, `SMEM_P_LIMIT = 4096`.
+  `NODES_PER_BLOCK = 8`, `MAX_BATCH = 4`.
 
 ---
 

@@ -655,6 +655,73 @@ __global__ void reduce_f64_to_scalar(
         scalar_out[0] = sqrt(smem[0]);
 }
 
+
+// =========================================================================
+// ACTIVE KERNEL 8: spmv_warp_centric_tprN  (mirna-only, adaptive vector width)
+//
+// Degree-adaptive variant of spmv_warp_centric.  Instead of one full 32-lane
+// warp per node, TPR contiguous lanes cooperate on one node, so BLOCK_SIZE/TPR
+// nodes are processed per 256-thread block.  For the low-average-degree
+// biological / random graphs (avg degree ~6) a full warp per node leaves
+// ~26 of 32 lanes idle; choosing TPR ~ next_pow2(avg_degree) packs several
+// nodes per warp and lifts useful-lane occupancy several-fold.  Only wired up
+// for network_type == "mirna" (grn / ppi keep spmv_warp_centric).
+//
+// Same block-level partial-norm contract as spmv_warp_centric: one float per
+// block written to partial_norm_blocks[block_offset + blockIdx.x], summed
+// over the BLOCK_SIZE/TPR per-node squared norms in sq_smem.
+//
+// Boundary safety: sub-groups whose node is out of range do NOT early-return;
+// they participate in the shuffle with partial = 0 so the full-warp mask
+// 0xffffffff stays valid on Volta+.  TPR divides 32 and groups are lane-
+// contiguous, so the sub-group __shfl_down_sync reduction (used only by
+// sub_lane 0) never pulls a value from an adjacent group.
+// =========================================================================
+#define HITS_SPMV_TPR_KERNEL(NAME, TPR)                                       \
+__global__ void NAME(                                                         \
+    const int*   __restrict__ row_ptr,                                        \
+    const int*   __restrict__ col_idx,                                        \
+    const float* __restrict__ values,                                        \
+    const float* __restrict__ x,                                             \
+    float*       __restrict__ y,                                             \
+    float*       __restrict__ partial_norm_blocks,                          \
+    const int*   __restrict__ node_ids,                                     \
+    const int                  num_nodes,                                   \
+    const int                  block_offset)                                \
+{                                                                            \
+    const int ROWS_PB = BLOCK_SIZE / (TPR);                                 \
+    __shared__ float sq_smem[BLOCK_SIZE / (TPR)];                           \
+    const int sub_group  = threadIdx.x / (TPR);                             \
+    const int sub_lane   = threadIdx.x % (TPR);                             \
+    const int global_idx = blockIdx.x * ROWS_PB + sub_group;                \
+    if (sub_lane == 0) sq_smem[sub_group] = 0.0f;                           \
+    __syncthreads();                                                        \
+    const bool active = (global_idx < num_nodes);                          \
+    int rs = 0, re = 0, u = 0;                                              \
+    if (active) { u = node_ids[global_idx]; rs = row_ptr[u]; re = row_ptr[u + 1]; } \
+    float partial = 0.0f;                                                   \
+    for (int j = rs + sub_lane; j < re; j += (TPR))                         \
+        partial += values[j] * x[col_idx[j]];                              \
+    for (int off = (TPR) >> 1; off > 0; off >>= 1)                          \
+        partial += __shfl_down_sync(0xffffffffu, partial, off);            \
+    if (active && sub_lane == 0) {                                          \
+        y[u]               = partial;                                      \
+        sq_smem[sub_group] = partial * partial;                            \
+    }                                                                       \
+    __syncthreads();                                                       \
+    if (threadIdx.x == 0) {                                                 \
+        float block_sq = 0.0f;                                             \
+        for (int i = 0; i < ROWS_PB; ++i)                                  \
+            block_sq += sq_smem[i];                                        \
+        partial_norm_blocks[block_offset + blockIdx.x] = block_sq;         \
+    }                                                                       \
+}
+
+HITS_SPMV_TPR_KERNEL(spmv_warp_centric_tpr2,  2)
+HITS_SPMV_TPR_KERNEL(spmv_warp_centric_tpr4,  4)
+HITS_SPMV_TPR_KERNEL(spmv_warp_centric_tpr8,  8)
+HITS_SPMV_TPR_KERNEL(spmv_warp_centric_tpr16, 16)
+
 }  // extern "C"
 """
 
@@ -702,6 +769,11 @@ def _get_kernels() -> dict[str, Any]:
             "spmv_warp":     mod.get_function("spmv_warp_centric"),
             "spmv_high":     mod.get_function("spmv_high_block"),
             "spmv_super":    mod.get_function("spmv_super_block"),
+            # Adaptive vector-width warp-centric SpMV (mirna only — see dispatch).
+            "spmv_warp_tpr2":  mod.get_function("spmv_warp_centric_tpr2"),
+            "spmv_warp_tpr4":  mod.get_function("spmv_warp_centric_tpr4"),
+            "spmv_warp_tpr8":  mod.get_function("spmv_warp_centric_tpr8"),
+            "spmv_warp_tpr16": mod.get_function("spmv_warp_centric_tpr16"),
             "reduce_blocks": mod.get_function("reduce_blocks_to_scalar"),
             "norm_div":      mod.get_function("normalize_inplace"),
             "conv_partial":  mod.get_function("compute_convergence_partial"),
@@ -850,6 +922,25 @@ def _evict_hits_graph_cache_if_full() -> None:
 
 def _merge_params(user_params: dict | None) -> dict:
     return {**_DEFAULT_PARAMS, **(user_params or {})}
+
+
+def _choose_tpr(avg_degree: float) -> int:
+    """Pick threads-per-row (power of 2 in [2, 32]) ~ next_pow2(avg_degree).
+
+    A full 32-lane warp per node wastes lanes when rows are short; matching
+    the vector width to the average degree packs BLOCK_SIZE / tpr nodes into
+    each warp-centric block.  ``32`` means "use the original spmv_warp_centric
+    kernel" (BLOCK_SIZE / 32 == NODES_PER_BLOCK == 8 rows per block — no change).
+    """
+    if avg_degree <= 2.0:
+        return 2
+    if avg_degree <= 4.0:
+        return 4
+    if avg_degree <= 8.0:
+        return 8
+    if avg_degree <= 16.0:
+        return 16
+    return 32
 
 
 def _top_k(scores: np.ndarray, k: int = _TOP_K) -> list[int]:
@@ -1072,15 +1163,28 @@ def hits_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
                                               len(high_ids_AT),
                                               len(super_ids_AT))
 
+        # ── mirna-only adaptive vector width for the warp tier ─────────────
+        # Match threads-per-row to the average degree so short rows do not each
+        # occupy a full 32-lane warp.  warp_tpr == 32 → warp_rows_per_block == 8
+        # == NODES_PER_BLOCK, i.e. the original spmv_warp_centric kernel/layout,
+        # so grn / ppi are unaffected.  For mirna at avg degree ~6 this picks
+        # tpr == 8 → 32 warp-tier nodes per block instead of 8.
+        if str(network_type).lower() == "mirna":
+            _avg_deg = float(graph_csr.nnz) / max(1, n)
+            warp_tpr = _choose_tpr(_avg_deg)
+        else:
+            warp_tpr = 32
+        warp_rows_per_block = BLOCK_SIZE // warp_tpr   # 8 when warp_tpr == 32
+
         # ── Opt 1: block-level partial norm array sizing ───────────────────
-        # Each spmv_warp_centric block writes ONE float (for NODES_PER_BLOCK nodes).
+        # Each warp-tier block writes ONE float (for warp_rows_per_block nodes).
         # Each spmv_high_block  block writes ONE float (for 1 node).
         # Each spmv_super_block block writes ONE float (for 1 node).
         # The unified d_pnorm_blocks array holds them all; tier kernels write
         # to contiguous ranges determined by block_offset arguments.
 
         def _pnorm_layout(nw, nh, ns):
-            num_warp_blocks  = (nw + NODES_PER_BLOCK - 1) // NODES_PER_BLOCK if nw else 0
+            num_warp_blocks  = (nw + warp_rows_per_block - 1) // warp_rows_per_block if nw else 0
             num_high_blocks  = nh
             num_super_blocks = ns
             total            = num_warp_blocks + num_high_blocks + num_super_blocks
@@ -1128,7 +1232,13 @@ def hits_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
 
         # ── Kernel compilation ─────────────────────────────────────────────
         kernels       = _get_kernels()
-        k_spmv_warp   = kernels["spmv_warp"]
+        # Warp-tier kernel: original for grn/ppi (warp_tpr==32), degree-adaptive
+        # sub-warp variant for mirna (warp_tpr in {2,4,8,16}).  Same signature
+        # and same block-level partial-norm contract, so only the binding and
+        # the block-count (warp_rows_per_block, already folded into the grid via
+        # n_wb_*) differ.
+        k_spmv_warp   = (kernels["spmv_warp"] if warp_tpr >= 32
+                         else kernels[f"spmv_warp_tpr{warp_tpr}"])
         k_spmv_high   = kernels["spmv_high"]
         k_spmv_super  = kernels["spmv_super"]
         k_reduce_blks = kernels["reduce_blocks"]
@@ -1204,7 +1314,8 @@ def hits_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
             norm_full_grid = (max(1, (n + BLOCK_SIZE - 1) // BLOCK_SIZE), 1, 1)
             conv_grid      = (norm_blocks, 1, 1)
 
-            # Warp-centric: one block per NODES_PER_BLOCK nodes
+            # Warp-centric: one block per warp_rows_per_block nodes
+            # (8 for grn/ppi; BLOCK_SIZE/warp_tpr for mirna adaptive width)
             warp_A_grid   = (max(1, n_wb_A),          1, 1)
             warp_AT_grid  = (max(1, n_wb_AT),         1, 1)
             # High: one block per node

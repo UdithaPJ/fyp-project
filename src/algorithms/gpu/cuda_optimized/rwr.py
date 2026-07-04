@@ -1146,7 +1146,7 @@ def rwr_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
         # est_bytes (RWR's own precise estimate) is the sole authority.
         use_chunking = est_bytes > VRAM_BUDGET_FRACTION * free_bytes
         if use_chunking_req and not use_chunking:
-            logging.info(
+            logging.debug(
                 "rwr_gpu: use_chunking ignored — working set %.1f MB fits in "
                 "%.1f MB free (chunking would re-stream W every iteration).",
                 est_bytes / 1e6, free_bytes / 1e6,
