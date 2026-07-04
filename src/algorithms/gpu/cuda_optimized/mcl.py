@@ -976,6 +976,55 @@ def _adaptive_prune_threshold(
 
 
 # ---------------------------------------------------------------------------
+# Out-of-core Stage A: size-adaptive top-k working-set cap
+# ---------------------------------------------------------------------------
+
+# Bytes held per surviving matrix entry across the SpGEMM working set:
+# the pruned M is uploaded as CSR (int32 col + float32 val = 8 B) and, when
+# heavy rows are present, transposed to CSC (another 8 B), so ~16 B/entry
+# must fit alongside the output buffer.  Conservative — undercounting would
+# defeat the guard.
+_WORKING_BYTES_PER_ENTRY: int = 16
+
+
+def _adaptive_top_k(
+    n: int,
+    user_top_k: int,
+    free_bytes: int,
+    vram_fraction: float = 0.35,
+    bytes_per_entry: int = _WORKING_BYTES_PER_ENTRY,
+) -> tuple[int, str]:
+    """Cap ``top_k`` so the pruned working set fits a fraction of free VRAM.
+
+    MCL keeps every iteration's matrix bounded by top-k-per-column: after
+    pruning, ``nnz(M) <= n * top_k``.  That bound is what dictates the SpGEMM
+    input (CSR + optional CSC) footprint next iteration.  On very large
+    graphs a fixed ``top_k`` (default 50) makes the working set exceed VRAM
+    before the SpGEMM even starts — the ``cuMemAlloc failed`` seen on the
+    multi-million-node scalability graphs.  Shrinking ``top_k`` to the VRAM
+    budget lets those graphs run; it costs cluster granularity (fewer
+    survivors per column) but only ever binds when the graph is too large for
+    the user's value — realistic biological networks are far below the cap
+    and are returned unchanged.
+
+    Returns ``(effective_top_k, note)`` where ``note`` is empty when no
+    reduction was applied.
+    """
+    if n <= 0 or user_top_k <= 0 or free_bytes <= 0:
+        return user_top_k, ""
+    budget = int(free_bytes * vram_fraction)
+    max_k  = max(1, budget // (bytes_per_entry * n))
+    if user_top_k <= max_k:
+        return user_top_k, ""
+    note = (
+        f"top_k {user_top_k} -> {int(max_k)} to fit working set "
+        f"(~{n} x {int(max_k)} entries at {bytes_per_entry} B) in "
+        f"{budget/1e6:.0f} MB VRAM budget"
+    )
+    return int(max_k), note
+
+
+# ---------------------------------------------------------------------------
 # GPU exclusive prefix sum (Improvement 2)
 # ---------------------------------------------------------------------------
 
@@ -1782,6 +1831,18 @@ def mcl_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
         if n_original == 0:
             raise ValueError("Empty graph")
 
+        # Out-of-core Stage A: shrink top_k so the pruned working set fits
+        # free VRAM.  On multi-million-node graphs the default top_k makes the
+        # SpGEMM input (CSR + CSC) exceed VRAM before the product is even
+        # computed; capping it here is what lets those graphs run at all.
+        try:
+            _free_b0, _ = cuda.mem_get_info()
+        except Exception:                               # noqa: BLE001
+            _free_b0 = 1 << 30
+        top_k, top_k_note = _adaptive_top_k(n_original, top_k, _free_b0)
+        if top_k_note:
+            logging.info("mcl_gpu: %s", top_k_note)
+
         # Probe shared-memory budget per block (Turing = 48 KB by default).
         try:
             dev = cuda.Device(0)
@@ -1909,10 +1970,11 @@ def mcl_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
                 f" Adaptive prune fired on {len(adaptive_notes)} iteration(s): "
                 f"last='{adaptive_notes[-1]}'."
             )
+        top_k_summary = f" {top_k_note}." if top_k_note else ""
         note = (
             f"Graph symmetrised for MCL ({sym_note}). "
             f"Column-stochastic normalisation applied. "
-            f"Pruning: threshold={prune_threshold:g}, top_k={top_k}. "
+            f"Pruning: threshold={prune_threshold:g}, top_k={top_k}.{top_k_summary} "
             f"Precision: FP32 computation, FP64 convergence check. "
             f"GPU pipeline: threshold-fused hash SpGEMM + GPU-native "
             f"compaction + bitonic top-k "

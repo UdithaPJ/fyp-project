@@ -693,6 +693,13 @@ def _check_memory_or_raise(
 _RUNTIME_RAM_FLOOR_BYTES:  int = 2 * 1024 * 1024 * 1024   # 2 GB
 _RUNTIME_SWAP_ALERT_BYTES: int = 512 * 1024 * 1024        # 512 MB
 
+# Per-backend swap baseline, (re)captured on iteration 1 of each MCL run.
+# The watchdog measures swap GROWTH caused by MCL rather than absolute swap
+# usage: on a busy box the machine's idle swap can already sit above the
+# 512 MB alert (observed ~1.5 GB baseline), which made the absolute check a
+# false positive that aborted CPU MCL at small n on graphs it could handle.
+_SWAP_BASELINE_BY_BACKEND: dict[str, int] = {}
+
 
 def _check_runtime_ram_or_raise(
     *,
@@ -708,21 +715,37 @@ def _check_runtime_ram_or_raise(
     Raises ``MemoryError`` when EITHER:
 
       1. free RAM has dropped below ``floor_bytes`` (default 2 GB), OR
-      2. used swap has grown past ``swap_alert_bytes`` (default 512 MB).
+      2. swap usage has GROWN by more than ``swap_alert_bytes`` (default
+         512 MB) since this MCL run started.
+
+    The swap signal is measured as growth-since-start, not absolute usage:
+    ``iteration <= 1`` (re)captures the baseline swap for this run, and
+    later iterations compare against it.  This attributes swap pressure to
+    MCL's own ``M @ M`` fill-in instead of tripping on the machine's
+    pre-existing idle swap (which can already exceed the absolute alert on
+    a busy box and abort small graphs that would otherwise fit).
 
     Both signals mean the OS OOM killer is close.  Bailing here lets the
     runner surface a clean error instead of the interpreter (and any IDE
     hosting it) getting terminated.
 
-    ``available == 0`` (probe failed) disables the RAM check; swap check
-    is likewise skipped when its probe returns 0.  The pre-run guard is
-    the only safety net when both probes fail.
+    ``available == 0`` (probe failed) disables the RAM check; the swap
+    check is likewise inert when its probe returns 0 (growth stays 0).
+    The pre-run guard is the only safety net when both probes fail.
     """
     available = _available_ram_bytes()
     swap_used = _swap_used_bytes()
 
+    # (Re)capture the baseline at the start of each run.  ``iteration``
+    # restarts at 1 for every MCL call, so this scopes the baseline to the
+    # current graph without any caller bookkeeping.
+    if iteration <= 1:
+        _SWAP_BASELINE_BY_BACKEND[backend] = swap_used
+    swap_baseline = _SWAP_BASELINE_BY_BACKEND.get(backend, swap_used)
+    swap_growth   = max(0, swap_used - swap_baseline)
+
     ram_low   = available > 0 and available < floor_bytes
-    swap_hot  = swap_used > swap_alert_bytes
+    swap_hot  = swap_growth > swap_alert_bytes
 
     if not (ram_low or swap_hot):
         return
@@ -735,7 +758,8 @@ def _check_runtime_ram_or_raise(
         )
     if swap_hot:
         reasons.append(
-            f"swap in use {swap_used/(1024*1024):.0f} MB > "
+            f"swap grew {swap_growth/(1024*1024):.0f} MB since start "
+            f"(now {swap_used/(1024*1024):.0f} MB) > "
             f"alert {swap_alert_bytes/(1024*1024):.0f} MB"
         )
     raise MemoryError(
