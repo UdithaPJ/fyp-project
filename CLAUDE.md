@@ -490,57 +490,131 @@ Do NOT revert to CuPy SpMV or single-tier kernel.
 
 ## HITS GPU implementation (optimised)
 
-Custom PyCUDA kernels — no CuPy dependency.
+Custom PyCUDA kernels — no CuPy dependency.  Four-tier degree
+classification with block-level partial norms; degree-adaptive
+sub-warp SpMV for the warp tier (mirna only, see below); GPU-only
+convergence reduction (single 8-byte D2H per iteration).
 
 Key optimisations over the initial implementation:
-  1. Fused SpMV + norm: `spmv_with_norm_sq` computes y = M·x AND writes
-     per-node y[i]² to `partial_norm` in one kernel pass — eliminates a
-     separate `compute_partial_norm_sq` launch.
-  2. GPU-side norm reduction: `partial_reduce_to_scalar` reduces the
-     `partial_norm` array to a single scalar and writes sqrt(sum) to a
-     GPU pointer — `normalize_inplace` reads that pointer in the next
-     launch with no CPU round-trip between SpMV and normalisation.
-  3. Single CPU sync per iteration: only `d_partial_conv.get()` for the
-     convergence delta check ever transfers to the CPU (vs. ~4–5 syncs
-     before).
-  4. Edge-parallel low-degree kernel: `spmv_edge_parallel_low_degree`
-     packs `NODES_PER_BLOCK = 8` nodes per CTA (one warp each), giving
-     ~8× better SM occupancy for degree < `WARP_SIZE` nodes, which are
-     the majority in biological networks.
-  5. Node reordering: nodes sorted by descending out-degree before CSR
-     upload (`reorder_nodes=True` by default); similar-degree rows are
-     adjacent, improving `x[col_idx[j]]` cache locality.  Original-index
-     order restored before building the result dict.
+  1. **Block-level partial norms** (Opt 1): every SpMV kernel writes
+     ONE float per block (not one per node) into a shared
+     `d_pnorm_blocks` array; `reduce_blocks_to_scalar` reads that
+     (~4.7× smaller) array instead of an n-length one.
+  2. **GPU-only convergence** (Opt 2): `compute_convergence_partial`
+     (FP64 per-block partials) → `reduce_f64_to_scalar` (GPU sqrt(Σ))
+     → a single 8-byte D2H read per iteration (`d_conv_scalar.get()`).
+  3. **Four-tier degree classification** (Opt 3):
+       Warp  (deg < `MED_THRESH`=256)    → `spmv_warp_centric`
+       High  (256 ≤ deg < `SUPER_THRESH`=4096) → `spmv_high_block`
+       Super (deg ≥ 4096)                → `spmv_super_block`
+     (256 = BLOCK_SIZE; 4096 = 16×BLOCK_SIZE, justifying the tier
+     boundaries — see in-source comments.)
+  4. **Warp-centric warp tier** (Opt 4): `spmv_warp_centric` packs
+     `NODES_PER_BLOCK = 8` nodes per 256-thread block, one warp
+     (32 lanes) per node — full occupancy vs. the old medium-degree
+     kernel's 12 % thread utilisation.
+  5. **GPU buffer pool** (Opt 5): `_BUFFER_POOL` reuses `gpuarray`
+     allocations across benchmark runs by `(shape, dtype)` key —
+     eliminates repeated `cuMemAlloc`/`cuMemFree`.
+  6. **Node-reordering validation** (Opt 6): `hits_gpu` always times
+     the reorder step (`reorder_cost_ms` in the result); auto-disabled
+     for `n < REORDER_MIN_N = 500`.  `apply_config`'s HITS strategy
+     sets `reorder_nodes` per graph family
+     (`gp["degree_class"] == "power_law"` — see `gpu_config.py`), so
+     grn/ppi honour whatever the strategy selector decides.
+  7. **Resident prepared-graph cache** (`_HITS_GRAPH_CACHE`): the CPU-
+     side symmetrize / transpose / degree-reorder work is a pure
+     function of the graph; caching the prepared host CSR arrays
+     across calls moves that cost onto the warmup run instead of the
+     timed run.
 
-Kernels per iteration: 10 total (vs. ~14 before).
-CPU-GPU syncs per iteration: 1 (vs. ~4–5 before).
+Kernels (compiled once, cached in `_kernel_cache["hits"]`):
+  - `spmv_warp`   : `spmv_warp_centric`       — warp-per-node, deg < 256, grn/ppi
+  - `spmv_high`   : `spmv_high_block`         — full-block, 256 ≤ deg < 4096
+  - `spmv_super`  : `spmv_super_block`        — 1024-thread block, deg ≥ 4096
+  - `reduce_blocks`: `reduce_blocks_to_scalar` — block-level norm → scalar
+  - `norm_div`    : `normalize_inplace`
+  - `conv_partial`: `compute_convergence_partial` — FP64 per-block partials
+  - `reduce_f64`  : `reduce_f64_to_scalar`    — GPU FP64 reduce → 8-byte D2H
+  - `spmv_warp_tpr2/4/8/16` : `spmv_warp_centric_tpr{2,4,8,16}` — mirna-only
+    degree-adaptive warp tier (see below)
+  - Deprecated (compiled, not called — kept for A/B reference):
+    `spmv_degree_aware`, `compute_partial_norm_sq`, `normalize_vector`,
+    `compute_convergence_delta`, `spmv_edge_parallel_low_degree`,
+    `spmv_with_norm_sq`, `partial_reduce_to_scalar`
+
+### mirna-only degree-adaptive warp-tier SpMV (throughput fix)
+
+**Problem observed**: same root cause as the RWR mirna fix (see the
+RWR section above) — on the RTX 2060 scalability benchmark (avg
+degree ≈ 6), `mode=gpu` HITS was slower than both `cpu_multi`
+(GraphBLAS) and `gpu_baseline` (cuGraph) across BA/ER/WS.  Unlike RWR,
+the internal `apply_config()` call was **not** removed for HITS: its
+HITS strategy sets `reorder_nodes` per graph family (power-law → True,
+uniform → False) and HITS actually consumes that key, so skipping it
+would change behaviour on ER/WS.  HITS is also compute-dominated
+(up to 500 iterations × 2 SpMVs), so the fixed `apply_config` overhead
+matters far less here than it did for RWR.
+
+The actual bottleneck: `spmv_warp_centric` gives every node a full
+32-lane warp regardless of degree.  At avg degree ≈ 6 essentially all
+nodes land in the warp tier, so ~26 of 32 lanes sit idle on both the
+authority and hub SpMV every iteration.
+
+Fix, gated to `network_type == "mirna"` only (grn/ppi unaffected):
+new kernels `spmv_warp_centric_tpr2` / `_tpr4` / `_tpr8` / `_tpr16`
+(macro-generated via `HITS_SPMV_TPR_KERNEL`) where `tpr`
+threads-per-row cooperate on one node, packing `BLOCK_SIZE / tpr`
+nodes per block instead of `NODES_PER_BLOCK = 8`.  Same block-level
+partial-norm contract as `spmv_warp_centric` (one float per block,
+written to `partial_norm_blocks[block_offset + blockIdx.x]`).
+Boundary-safe: sub-groups whose node is out of range stay in the
+shuffle with `partial = 0` (keeps the `0xffffffff` mask valid); `tpr`
+divides 32 and groups are lane-contiguous, so the sub-group
+`__shfl_down_sync` reduction never crosses a group boundary.
+
+`_choose_tpr(avg_degree)` picks `tpr ∈ {2,4,8,16,32}` as the smallest
+power of 2 `>= avg_degree` (capped at 32).  `tpr == 32` means
+`warp_rows_per_block == BLOCK_SIZE/32 == 8 == NODES_PER_BLOCK` — the
+original kernel, grid, and `_pnorm_layout` — so high-average-degree
+mirna graphs and non-mirna types are byte-identical to before.
+`_pnorm_layout`'s `num_warp_blocks` and the warp-tier grids
+(`warp_A_grid` / `warp_AT_grid`) are computed from
+`warp_rows_per_block`, so block counts and pnorm offsets stay
+consistent whichever kernel is selected.
+
+**Verification note**: since mirna and grn build the identical
+adjacency (only `ppi` symmetrises — see Network-type behaviour below),
+mirna GPU `top_hubs`/`top_authorities` on a given graph must match the
+grn GPU run on the same graph.  Use this as the correctness check
+before trusting new benchmark numbers.
+
+**Confirmed on RTX 2060** (`scalability` benchmark, `--network-type
+mirna`, edge targets 1M–50M, barabasi_albert / erdos_renyi /
+watts_strogatz): GPU Optimised now runs below both CPU GraphBLAS and
+GPU Baseline at every tested size across all three graph families.
+grn / ppi results are unaffected (unchanged code path).
 
 Per-iteration sequence:
   Authority (a_new = Aᵀ h):
-    1. `spmv_edge_parallel_low_degree`  — packed-warp SpMV + norm (deg < 32)
-    2. `spmv_with_norm_sq`              — fused SpMV + norm (deg ≥ 32)
-    3. `partial_reduce_to_scalar`       — GPU sqrt(Σ partial_norm) → scalar
-    4. `normalize_inplace`              — divide a_new by GPU scalar
-  Hub (h_new = A a_new):
-    5–8. same four kernels for A
+    1. warp tier (`spmv_warp` — `spmv_warp_centric` or mirna-adaptive
+       `spmv_warp_centric_tprN`), high tier (`spmv_high_block`), super
+       tier (`spmv_super_block`) — only tiers with ≥1 node are launched
+    2. `reduce_blocks_to_scalar`  — GPU sqrt(Σ block-partial norms) → scalar
+    3. `normalize_inplace`       — divide a_new by GPU scalar
+  Hub (h_new = A a_new): same three steps for A
   Convergence:
-    9. `compute_convergence_partial`    — FP64 partial Σ((Δh)² + (Δa)²)
-   10. `stream_compute.synchronize()`  — the single sync
-       `delta = sqrt(sum(d_partial_conv.get()))`
+    4. `compute_convergence_partial` — FP64 partial Σ((Δh)² + (Δa)²)
+    5. `reduce_f64_to_scalar`       — GPU sqrt(Σ) → single FP64 scalar
+    6. `stream_compute.synchronize()` — the single sync per iteration
+       `delta = d_conv_scalar.get()[0]` (8 bytes D2H)
 
-Kernel registry (`_kernel_cache["hits"]`):
-  - `spmv_low_deg`   : `spmv_edge_parallel_low_degree`
-  - `spmv_high`      : `spmv_with_norm_sq`
-  - `reduce_scalar`  : `partial_reduce_to_scalar`
-  - `norm_div`       : `normalize_inplace`
-  - `conv_partial`   : `compute_convergence_partial`
-  - Deprecated (compiled, not called): `spmv_degree_aware`,
-    `compute_partial_norm_sq`, `normalize_vector`,
-    `compute_convergence_delta`
-
-Precision: FP32 for SpMV arithmetic and L2 norms (`partial_norm` is
-  float32).  FP64 for convergence delta only — avoids false early
-  termination near `tolerance = 1e-6` without cancellation error.
+Precision: FP32 for SpMV arithmetic and L2 norms.  FP64 for
+  convergence delta only — avoids false early termination near
+  `tolerance = 1e-6` without cancellation error.  Convergence threshold
+  is scale-invariant: `conv_threshold = tolerance * sqrt(n)` (per-node
+  RMS-change criterion, matching cuGraph's n-scaled definition in
+  spirit).
 
 Both `A` and `Aᵀ` stored in CSR on GPU throughout iteration.
 Pointer swap (`cur_h, nxt_h = nxt_h, cur_h`) avoids data copies.
@@ -549,13 +623,15 @@ CUDA streams: `stream_compute` for kernels, `stream_transfer` for
 Context handling: `retain_primary_context().push()` unconditionally;
   coexists with CuPy (avoids `cuModuleLoadDataEx: invalid device context`).
 Network-type behaviour:
-  - grn / mirna: directed `A`; returns `top_hubs` + `top_authorities` +
-    `hub_authority_overlap`
+  - grn / mirna: directed `A` (one shared code branch); returns
+    `top_hubs` + `top_authorities` + `hub_authority_overlap`
   - ppi: symmetrised `A + Aᵀ` (binarised); returns `top_nodes` only
 Does NOT silently fall back to CPU — raises `RuntimeError` /
   `cuda.LogicError` / `MemoryError`.
-Target: `-arch=sm_75` (RTX 20-series Turing), `BLOCK_SIZE = 256`,
-  `NODES_PER_BLOCK = 8`.
+Target: `-arch=sm_75` (RTX 20-series Turing, adaptive via
+  `_detect_arch_flag`-equivalent probe), `BLOCK_SIZE = 256`,
+  `NODES_PER_BLOCK = 8`, `SUPER_BLOCK_SIZE = 1024`,
+  `MED_THRESH = 256`, `SUPER_THRESH = 4096`.
 
 ---
 
