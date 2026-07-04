@@ -2,7 +2,8 @@
 src/algorithms/cpu/multi_threaded/louvain.py
 ============================================
 
-Louvain — cpu_multi mode, NetworKit Parallel Louvain Method (PLM / PLMR).
+Louvain — cpu_multi mode, NetworKit Parallel Louvain Method (PLM / PLMR),
+run in a CUDA-isolated subprocess.
 
 .. note::
    SuiteSparse:GraphBLAS has **no** native Louvain primitive, and Louvain
@@ -14,23 +15,38 @@ Louvain — cpu_multi mode, NetworKit Parallel Louvain Method (PLM / PLMR).
    NetworKit's ``community.PLM`` is the *Parallel Louvain Method*
    (Staudt & Meyerhenke) — a genuine OpenMP-multithreaded modularity
    optimiser implemented in C++.  ``PLMR`` is the same algorithm with an
-   extra refinement sweep after each coarsening step (``refine=True``),
-   which usually yields slightly higher modularity.  Thread count is set
-   via ``nk.setNumberOfThreads`` so this mode actually exercises multiple
-   cores, unlike the previous scipy ``cpu_single`` delegation.
+   extra refinement sweep (``refine=True``), which usually yields slightly
+   higher modularity.
 
-   ``resolution`` maps to NetworKit's ``gamma``.  Multi-level coarsening
-   (``recurse=True``) is handled internally by PLM, so ``max_levels`` /
-   ``max_phase1_passes`` are not forwarded — NetworKit runs to its own
-   convergence.  The returned community assignments are renumbered to a
-   contiguous ``0..K-1`` range and passed through the shared
-   :func:`_build_result` so ``num_communities`` / ``modularity`` /
-   ``top_communities`` are computed identically to ``cpu_single`` — this
-   keeps benchmark comparisons apples-to-apples.
+Why a subprocess
+----------------
+Importing ``src.algorithms`` builds the algorithm registry at import time,
+which forces a live CUDA context (``cupy.zeros(1)`` inside
+``src.benchmarking.benchmark``).  NetworKit's bundled OpenMP/TBB runtime
+cannot share a process with an already-initialized CUDA context: running
+``PLM.run()`` then aborts the whole process with
+``malloc(): mismatching next->prev_size`` (glibc heap corruption from two
+native threading/allocator runtimes colliding).  ``MALLOC_ARENA_MAX=1``
+does not help.
 
-   If NetworKit is **not** installed the call degrades gracefully to the
-   deterministic scipy ``cpu_single`` implementation (with a warning), so
-   the framework keeps working on machines without NetworKit.
+The fix is process isolation:  the NetworKit computation runs in
+``_networkit_worker.py``, launched **by absolute file path** so the child
+interpreter never imports the ``src`` package chain and therefore never
+creates a CUDA context.  The symmetric adjacency is handed over via a
+temporary ``.npz`` and the community labels come back via a ``.npy``.
+
+Result shape
+------------
+``resolution`` maps to NetworKit's ``gamma``.  Community labels are
+renumbered to a contiguous ``0..K-1`` range and passed through the shared
+:func:`_build_result`, so ``num_communities`` / ``modularity`` /
+``top_communities`` are computed identically to ``cpu_single`` — keeping
+benchmark comparisons apples-to-apples.  Multi-level coarsening
+(``recurse=True``) is internal to PLM, so ``max_levels`` /
+``max_phase1_passes`` are not forwarded.
+
+If NetworKit is **not** installed the call degrades gracefully to the
+deterministic scipy ``cpu_single`` implementation (with a warning).
 
 Install
 -------
@@ -42,8 +58,13 @@ For the deterministic single-thread variant see
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import os
+import shutil
+import subprocess
+import sys
+import tempfile
 import warnings
 
 import numpy as np
@@ -55,18 +76,20 @@ _LOG = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Lazy import of NetworKit
+# NetworKit availability — checked WITHOUT importing networkit.
+#
+# The parent process already holds a CUDA context (see module docstring);
+# even a bare ``import networkit`` loads its native threading runtime into
+# this poisoned process.  ``find_spec`` tells us whether the package is
+# installed without importing it — the real import happens only in the
+# isolated worker subprocess.
 # ---------------------------------------------------------------------------
 
-_NETWORKIT_AVAILABLE = False
-_NK_IMPORT_ERROR: str | None = None
+_NETWORKIT_AVAILABLE = importlib.util.find_spec("networkit") is not None
 
-try:
-    import networkit as nk            # type: ignore
-    _NETWORKIT_AVAILABLE = True
-except ImportError as _exc:           # pragma: no cover
-    nk = None                          # type: ignore[assignment]
-    _NK_IMPORT_ERROR = str(_exc)
+_WORKER_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "_networkit_worker.py"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -92,60 +115,55 @@ def _merge_params(user_params: dict | None) -> dict:
 # Thread control
 # ---------------------------------------------------------------------------
 
-def _configure_nk_threads(n_workers: int | None = None) -> int:
-    """Set NetworKit's OpenMP thread count and return the effective value.
+def _resolve_thread_count(n_workers: int | None = None) -> int:
+    """Resolve the OpenMP thread count to request from the worker.
 
     When ``n_workers`` is None / 0 / negative, uses ``OMP_NUM_THREADS`` if
-    set, otherwise ``os.cpu_count()``.
+    set, otherwise ``os.cpu_count()``.  This does NOT touch networkit — the
+    worker subprocess applies it via ``nk.setNumberOfThreads``.
     """
-    if not _NETWORKIT_AVAILABLE:
-        return 0
     if n_workers and int(n_workers) > 0:
-        n = int(n_workers)
-    else:
-        n = int(os.environ.get("OMP_NUM_THREADS", "0")) or os.cpu_count() or 4
-    try:
-        nk.setNumberOfThreads(int(n))
-        return int(nk.getMaxNumberOfThreads())
-    except Exception as exc:                                       # noqa: BLE001
-        _LOG.debug("could not set networkit threads=%d: %s", n, exc)
-        return int(n)
+        return int(n_workers)
+    return int(os.environ.get("OMP_NUM_THREADS", "0")) or os.cpu_count() or 4
 
 
 # ---------------------------------------------------------------------------
-# scipy -> NetworKit conversion
+# Isolated NetworKit subprocess
 # ---------------------------------------------------------------------------
 
-def _scipy_to_networkit(A_sym: sp.csr_matrix):
-    """Build an undirected weighted NetworKit graph from a symmetric CSR.
+def _run_networkit_subprocess(
+    A_sym:     sp.csr_matrix,
+    refine:    bool,
+    gamma:     float,
+    n_threads: int,
+) -> np.ndarray:
+    """Run PLM / PLMR in a CUDA-free child process; return raw label vector.
 
-    Only the upper triangle (``row <= col``, self-loops included) is used
-    so each undirected edge is added exactly once — feeding the full
-    symmetric matrix would double every off-diagonal edge.  Prefers the
-    vectorised ``nk.GraphFromCoo`` bulk constructor and falls back to a
-    per-edge ``addEdge`` loop only if that entry point is unavailable in
-    the installed NetworKit release.
+    Hands ``A_sym`` to the worker via a temp ``.npz`` and reads the int64
+    community-label vector back from a temp ``.npy``.  Raises
+    ``RuntimeError`` (with the child's stderr) if the worker fails, rather
+    than silently masking a NetworKit problem behind a slow CPU fallback.
     """
-    n   = int(A_sym.shape[0])
-    coo = A_sym.tocoo()
-    upper = coo.row <= coo.col
-    rows  = coo.row[upper].astype(np.int64, copy=False)
-    cols  = coo.col[upper].astype(np.int64, copy=False)
-    data  = coo.data[upper].astype(np.float64, copy=False)
-
-    graph_from_coo = getattr(nk, "GraphFromCoo", None)
-    if graph_from_coo is not None:
-        try:
-            upper_coo = sp.coo_matrix((data, (rows, cols)), shape=(n, n))
-            return graph_from_coo(upper_coo, weighted=True, directed=False)
-        except Exception as exc:                                  # noqa: BLE001
-            _LOG.debug("nk.GraphFromCoo failed (%s); using addEdge fallback", exc)
-
-    G = nk.Graph(n, weighted=True, directed=False)
-    add_edge = G.addEdge
-    for a, b, w in zip(rows.tolist(), cols.tolist(), data.tolist()):
-        add_edge(a, b, w)
-    return G
+    tmpdir  = tempfile.mkdtemp(prefix="nk_louvain_")
+    in_npz  = os.path.join(tmpdir, "A_sym.npz")
+    out_npy = os.path.join(tmpdir, "labels.npy")
+    try:
+        sp.save_npz(in_npz, A_sym.tocsr())
+        cmd = [
+            sys.executable, _WORKER_PATH, in_npz, out_npy,
+            "1" if refine else "0", repr(float(gamma)), str(int(n_threads)),
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0 or not os.path.exists(out_npy):
+            raise RuntimeError(
+                "NetworKit Louvain worker subprocess failed "
+                f"(exit={proc.returncode}).\n"
+                f"cmd: {' '.join(cmd)}\n"
+                f"stderr:\n{proc.stderr.strip()}"
+            )
+        return np.load(out_npy)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -157,20 +175,15 @@ def _louvain_networkit(
     params:    dict,
     n_threads: int,
 ) -> dict:
-    """Run NetworKit PLM / PLMR and pack the standard Louvain result dict."""
-    A_sym = _symmetrize(graph_csr)
-    m     = float(A_sym.sum()) / 2.0
+    """Run NetworKit PLM / PLMR (subprocess) and pack the result dict."""
+    A_sym  = _symmetrize(graph_csr)
+    m      = float(A_sym.sum()) / 2.0
+    refine = bool(params.get("refine", True))
+    gamma  = float(params.get("resolution", 1.0))
 
-    G       = _scipy_to_networkit(A_sym)
-    refine  = bool(params.get("refine", True))
-    gamma   = float(params.get("resolution", 1.0))
+    raw_labels = _run_networkit_subprocess(A_sym, refine, gamma, n_threads)
 
-    plm = nk.community.PLM(G, refine=refine, gamma=gamma)
-    plm.run()
-    partition = plm.getPartition()
-
-    # NetworKit subset ids are not necessarily contiguous — renumber to 0..K-1.
-    raw_labels = np.asarray(partition.getVector(), dtype=np.int64)
+    # NetworKit subset ids are not necessarily contiguous — renumber 0..K-1.
     _, final_labels = np.unique(raw_labels, return_inverse=True)
     final_labels = final_labels.astype(np.int32)
 
@@ -181,8 +194,8 @@ def _louvain_networkit(
 
     algo = "PLMR" if refine else "PLM"
     result["note"] = (
-        f"cpu_multi backend: NetworKit {algo} (parallel Louvain), "
-        f"threads={n_threads}, gamma={gamma}."
+        f"cpu_multi backend: NetworKit {algo} (parallel Louvain, "
+        f"subprocess-isolated from CUDA), threads={n_threads}, gamma={gamma}."
     )
     return result
 
@@ -196,7 +209,7 @@ def louvain_cpu_multi(
     params:    dict,
     n_workers: int | None = None,
 ) -> dict:
-    """Run Louvain via NetworKit's parallel PLM / PLMR.
+    """Run Louvain via NetworKit's parallel PLM / PLMR in an isolated process.
 
     Falls back to the deterministic scipy ``cpu_single`` implementation
     (with a warning) if NetworKit is not installed, so the framework keeps
@@ -206,7 +219,7 @@ def louvain_cpu_multi(
         warnings.warn(
             "louvain_cpu_multi: NetworKit is not installed; falling back to "
             "scipy cpu_single.  Install parallel Louvain with "
-            f"'pip install networkit'.  (ImportError: {_NK_IMPORT_ERROR})",
+            "'pip install networkit'.",
             UserWarning, stacklevel=2,
         )
         from src.algorithms.cpu.single_threaded.louvain import louvain_cpu_single
@@ -219,7 +232,7 @@ def louvain_cpu_multi(
         result["note"] = (existing_note + " | " + extra).strip(" |")
         return result
 
-    n_threads = _configure_nk_threads(n_workers)
+    n_threads = _resolve_thread_count(n_workers)
     return _louvain_networkit(graph_csr, params, n_threads)
 
 
