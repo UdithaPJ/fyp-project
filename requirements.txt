@@ -16,6 +16,7 @@ openpyxl
 numpy
 scipy
 networkx
+python-graphblas
 
 # -- GPU Acceleration (optional — requires CUDA-capable NVIDIA GPU) -----------
 # Install the variant matching your CUDA version, e.g.:

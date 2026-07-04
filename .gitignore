@@ -60,6 +60,8 @@ webapp/frontend/dist/
 data/raw/
 data/processed/
 data/scaled/
+data/pregenerated/
+data/references/
 
 # Experiment outputs (generated locally)
 experiments/outputs/plots/
