@@ -119,7 +119,12 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--source-col", default="protein1")
     p.add_argument("--target-col", default="protein2")
-    p.add_argument("--weight-col", default="combined_score")
+    p.add_argument(
+        "--weight-col", default="combined_score",
+        help="Edge-weight column. Use \"\" or \"none\" for unweighted inputs "
+             "(GRN / miRNA: TRRUST, miRTarBase) so every edge weight defaults "
+             "to 1.0.",
+    )
     p.add_argument("--dataset-name", default=None,
                    help="label used in the CSV (default: file stem)")
     p.add_argument(
@@ -289,12 +294,18 @@ def main() -> None:
     )
 
     sample = None if args.sample_rows == 0 else args.sample_rows
+    # Unweighted inputs (GRN / miRNA: TRRUST, miRTarBase) have no numeric
+    # confidence column.  An empty or "none" --weight-col maps weight to None
+    # so preprocessing defaults every edge weight to 1.0 instead of erroring
+    # on a missing column.
+    _wcol = (args.weight_col or "").strip()
+    weight_map = None if (_wcol == "" or _wcol.lower() == "none") else _wcol
     graph_csr, node_index_map = _load_graph(
         args.raw_path, sample,
         mapping={
             "source": args.source_col,
             "target": args.target_col,
-            "weight": args.weight_col,
+            "weight": weight_map,
         },
         min_edge_weight=args.min_edge_weight,
     )
