@@ -254,6 +254,7 @@ def _extract_topk_predicted(
     k: int,
     network_type: str = "ppi",
     graph_csr=None,
+    gene_side: bool = False,
 ) -> list[str]:
     """Return the top-``k`` node labels ranked by the algorithm's score vector.
 
@@ -266,9 +267,20 @@ def _extract_topk_predicted(
     dominated by *target* genes (dangling sinks accumulate mass), so ranking
     is restricted to nodes with out-degree > 0 (the regulators / miRNAs),
     matching the ``top_regulators`` semantics.  PPI applies no restriction.
+
+    ``gene_side=True`` (used for miRNA validation against GENE references):
+    rank the top TARGET genes instead — the out-degree-0 sink nodes — because
+    disease/drug/essential/GO references annotate genes, not miRNAs.  For HITS
+    the authority scores are used (authorities = target genes on a directed
+    bipartite miRNA graph).
     """
     inner = _inner(result)
-    vec = _score_vector(algorithm, inner)
+    if gene_side and algorithm == "hits":
+        # Target genes are the AUTHORITIES on a bipartite miRNA network.
+        auth = np.asarray(inner.get("authority_scores", []), dtype=np.float64)
+        vec = auth if auth.size else _score_vector(algorithm, inner)
+    else:
+        vec = _score_vector(algorithm, inner)
     idx_to_label = _reverse_index_map(node_index_map)
     if vec is None or idx_to_label is None or vec.size != len(idx_to_label):
         # No aligned score vector → fall back to the pre-baked list.
@@ -276,12 +288,19 @@ def _extract_topk_predicted(
 
     n = vec.size
     eligible = np.ones(n, dtype=bool)
-    if (algorithm == "pagerank" and network_type in ("grn", "mirna")
-            and graph_csr is not None):
+    if graph_csr is not None:
         try:
             outdeg = np.diff(graph_csr.tocsr().indptr)
-            if outdeg.size == n and np.any(outdeg > 0):
-                eligible = outdeg > 0
+            if outdeg.size == n:
+                if gene_side:
+                    # Restrict to target genes (out-degree 0 sinks) so the
+                    # predicted set is genes, matching gene-set references.
+                    if np.any(outdeg == 0):
+                        eligible = outdeg == 0
+                elif (algorithm == "pagerank"
+                      and network_type in ("grn", "mirna")):
+                    if np.any(outdeg > 0):
+                        eligible = outdeg > 0
         except Exception:
             pass
 

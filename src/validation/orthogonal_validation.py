@@ -256,6 +256,9 @@ class OrthogonalValidator:
             predicted = _extract_topk_predicted(
                 algo, result, ds.node_index_map, self.top_k,
                 network_type=ds.network_type, graph_csr=ds.graph_csr,
+                # miRNA references are GENE sets → rank top target genes,
+                # not the miRNA source nodes.
+                gene_side=(ds.network_type == "mirna"),
             )
         else:
             predicted = _extract_predicted(algo, result, ds.node_index_map)
