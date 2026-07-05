@@ -84,10 +84,14 @@ def rwr_cpu_multi(
         }
 
     # Normalize seed input into a list of seed sets.
+    # Empty seeds → a single empty seed set, so ``_make_p0`` produces the
+    # uniform 1/N restart vector (global, PageRank-like RWR) — matching
+    # cpu_single / gpu / gpu_baseline.  Do NOT fall back to [0]; seeding at
+    # node 0 makes cpu_multi disagree with every other implementation.
     if seeds and isinstance(seeds[0], (list, tuple)):
         seed_sets = [list(s) for s in seeds]
     else:
-        seed_sets = [list(seeds) if seeds else [0]]
+        seed_sets = [list(seeds)]
 
     # Build column-stochastic transition matrix W once.
     W_scipy, _ = _build_transition_matrix(graph_csr)
