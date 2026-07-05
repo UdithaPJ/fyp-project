@@ -31,6 +31,7 @@ import scipy.sparse as sp
 from src.algorithms.common.helpers import (
     _add_self_loops,
     _available_ram_bytes,
+    _check_expansion_or_raise,
     _check_memory_or_raise,
     _check_runtime_ram_or_raise,
     _col_normalize,
@@ -151,6 +152,20 @@ def mcl_cpu_single(graph_csr: sp.csr_matrix, params: dict) -> dict:
             backend="cpu_single",
             iteration=iteration,
             current_nnz=int(M.nnz),
+        )
+
+        # ---- Layer 3: pre-allocation expansion projection ----
+        # Project the size of the M @ M about to run and refuse BEFORE the
+        # (uninterruptible) allocation if it would exceed free RAM.  This is
+        # what lets small graphs run to completion while a densifying matrix
+        # is stopped with a clean MemoryError instead of an OS OOM kill.
+        _check_expansion_or_raise(
+            M,
+            backend="cpu_single",
+            iteration=iteration,
+            expansion=e,
+            dtype_bytes=8,     # float64 CPU path
+            index_bytes=4,
         )
 
         M_old = M.copy()

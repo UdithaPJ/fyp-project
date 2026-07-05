@@ -767,3 +767,93 @@ def _check_runtime_ram_or_raise(
         f"(M.nnz={current_nnz}; {'; '.join(reasons)}). "
         f"Use mode=gpu (cuda_optimized) which scales to larger graphs."
     )
+
+
+def _project_expansion_output_nnz(M_csr: sp.csr_matrix) -> int:
+    """Upper bound on ``nnz(M @ M)`` — the size the NEXT expansion allocates.
+
+    scipy's CSR SpGEMM materialises an output whose nnz is at most the
+    number of scalar multiply-adds, i.e. ``sum over nonzeros (i, j) of
+    deg(row j)``.  This is computed in a single vectorised pass over the
+    CSR structure (no matrix multiply), so it is cheap enough to run every
+    iteration:
+
+        deg  = diff(indptr)          # nnz per row
+        flop = deg[indices].sum()    # for each nonzero column j, add deg(j)
+
+    The true output nnz after duplicate-merging is ``<= flop``, so sizing
+    the allocation guard against ``flop`` never under-predicts the peak.
+
+    Returns 0 for an empty matrix.
+    """
+    M = M_csr.tocsr()
+    nnz = int(M.nnz)
+    n   = int(M.shape[0])
+    if nnz == 0 or n == 0:
+        return 0
+    deg = np.diff(M.indptr).astype(np.int64)          # degree of each row
+    # M.indices holds the column index j of every nonzero; deg[j] is the
+    # length of row j that this nonzero will scatter across in M @ M.
+    flop = int(deg[M.indices].sum())
+    # Bounded by a fully dense output.
+    return min(flop, n * n)
+
+
+def _check_expansion_or_raise(
+    M_csr: sp.csr_matrix,
+    *,
+    backend: str,
+    iteration: int,
+    expansion: int = 2,
+    dtype_bytes: int = 4,
+    index_bytes: int = 4,
+    budget_fraction: float = 0.6,
+    available_bytes: int | None = None,
+    safety_factor: float = 2.0,
+) -> None:
+    """Refuse the NEXT ``M @ M`` if its allocation would exceed free RAM.
+
+    This is the pre-allocation guard that closes the gap the per-iteration
+    watchdog cannot: a single scipy/GraphBLAS SpGEMM allocates its whole
+    output in one uninterruptible step, so a between-iterations RAM check
+    cannot stop it once it starts.  Here we PROJECT that allocation's size
+    from the current matrix structure (:func:`_project_expansion_output_nnz`)
+    and raise a clean ``MemoryError`` BEFORE the allocation is attempted,
+    so the process is never handed an allocation it cannot satisfy.
+
+    ``safety_factor`` (default 2.0) covers scipy's transient symbolic +
+    numeric workspaces and the input matrices held live during the product.
+    ``available_bytes is None`` triggers a live RAM probe; pass an explicit
+    value (e.g. free VRAM) to guard a GPU allocation instead.  A probe of 0
+    disables the guard (defer to the runtime).
+
+    For ``expansion > 2`` this projects only the FIRST of the chained
+    products (the others compound on top and are bounded by the same
+    per-iteration re-check on the next iteration's matrix).
+    """
+    if available_bytes is None:
+        available_bytes = _available_ram_bytes()
+    if available_bytes <= 0:
+        return
+
+    proj_nnz   = _project_expansion_output_nnz(M_csr)
+    if proj_nnz == 0:
+        return
+    entry_bytes = dtype_bytes + index_bytes
+    # Peak during the product: output arrays + input arrays held live.
+    proj_bytes  = int(proj_nnz * entry_bytes * safety_factor)
+
+    budget = int(available_bytes * budget_fraction)
+    if proj_bytes <= budget:
+        return
+
+    raise MemoryError(
+        f"MCL {backend}: refusing expansion at iteration {iteration} — the "
+        f"next M @ M is projected to allocate ~{proj_bytes/(1024*1024):.0f} MB "
+        f"(output nnz ~{proj_nnz:,}), exceeding the safe budget "
+        f"({budget/(1024*1024):.0f} MB = {budget_fraction:.0%} of "
+        f"{available_bytes/(1024*1024):.0f} MB free). Refused BEFORE "
+        f"allocating so the process is not killed mid-product. "
+        f"Use mode=gpu (cuda_optimized) which scales to larger graphs, "
+        f"or raise prune_threshold / lower expansion."
+    )

@@ -35,6 +35,7 @@ import scipy.sparse as sp
 
 from src.algorithms.common.helpers import (
     _available_ram_bytes,
+    _check_expansion_or_raise,
     _check_memory_or_raise,
     _check_runtime_ram_or_raise,
     _estimate_mcl_peak_ram_bytes,
@@ -140,6 +141,18 @@ def mcl_cpu_multi(
             backend="cpu_multi",
             iteration=iteration,
             current_nnz=int(M_old_sp.nnz),
+        )
+
+        # ---- Layer 3: pre-allocation expansion projection ----
+        # Project the next SpGEMM's output size from the current matrix and
+        # refuse BEFORE SuiteSparse allocates it if it would exceed free RAM.
+        _check_expansion_or_raise(
+            M_old_sp,
+            backend="cpu_multi",
+            iteration=iteration,
+            expansion=e,
+            dtype_bytes=4,     # GraphBLAS FP32 path
+            index_bytes=4,
         )
 
         # ---- Expansion: M = M^e via SuiteSparse SpGEMM ------------------
