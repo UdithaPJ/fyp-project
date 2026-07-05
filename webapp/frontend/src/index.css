@@ -455,6 +455,41 @@ select {
     linear-gradient(180deg, #fbfdfe, #eef5f9);
 }
 
+.graph-canvas--preview {
+  position: relative;
+  min-height: 480px;
+}
+
+.graph-preview-toolbar {
+  display: flex;
+  gap: 12px;
+  align-items: flex-end;
+  justify-content: space-between;
+  flex-wrap: wrap;
+}
+
+.graph-preview-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(220px, 280px);
+  gap: 16px;
+  align-items: stretch;
+}
+
+.graph-preview-main {
+  min-width: 0;
+}
+
+.graph-preview-detail {
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+}
+
+.graph-preview-detail h4 {
+  margin: 0 0 12px;
+  color: #18384c;
+}
+
 .graph-preview-warning {
   display: inline-flex;
   align-items: center;
@@ -538,6 +573,20 @@ select {
 
   .stepper {
     grid-template-columns: 1fr;
+  }
+
+  .graph-preview-toolbar,
+  .graph-preview-toolbar .graph-search-form,
+  .graph-preview-toolbar .graph-toolbar-actions {
+    width: 100%;
+  }
+
+  .graph-preview-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .graph-canvas--preview {
+    min-height: 360px;
   }
 }
 

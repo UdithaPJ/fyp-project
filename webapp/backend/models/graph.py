@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -20,3 +20,8 @@ class GraphData(BaseModel):
 
     nodes: Dict[str, dict] = Field(default_factory=dict)
     edges: List[EdgeData] = Field(default_factory=list)
+    total_nodes: Optional[int] = None
+    total_edges: Optional[int] = None
+    preview_node_limit: Optional[int] = None
+    preview_edge_limit: Optional[int] = None
+    preview_capped: bool = False

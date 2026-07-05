@@ -35,8 +35,8 @@ except ImportError:  # pragma: no cover - fallback for running from backend dire
 class PreprocessingService:
     """Application service for the preprocessing workflow."""
 
-    GRAPH_PREVIEW_EDGE_LIMIT = 5
-    GRAPH_PREVIEW_NODE_LIMIT = 50
+    GRAPH_PREVIEW_EDGE_LIMIT = 250
+    GRAPH_PREVIEW_NODE_LIMIT = 150
     LARGE_DATASET_ROW_THRESHOLD = 1_000_000
     LARGE_DATASET_MEMORY_THRESHOLD_BYTES = 250 * 1024 * 1024
 
@@ -227,23 +227,39 @@ class PreprocessingService:
     def _to_api_graph(self, graph_data) -> GraphData:
         """Convert the core GraphData object into a lightweight API preview model."""
 
-        # OPTIMIZED: return only a small preview to avoid serializing huge graphs.
-        preview_edges = graph_data.edges[: self.GRAPH_PREVIEW_EDGE_LIMIT]
-        preview_node_ids = []
+        total_nodes = len(graph_data.nodes)
+        total_edges = len(graph_data.edges)
+        sampled_edges = self._sample_preview_edges(
+            graph_data.edges,
+            self.GRAPH_PREVIEW_EDGE_LIMIT,
+        )
+
+        preview_node_ids: List[str] = []
         seen_nodes = set()
-        for source, target, _attributes in preview_edges:
+        preview_edge_rows = []
+        for source, target, attributes in sampled_edges:
+            new_nodes = [
+                node_id
+                for node_id in (source, target)
+                if node_id not in seen_nodes
+            ]
+            if len(seen_nodes) + len(new_nodes) > self.GRAPH_PREVIEW_NODE_LIMIT:
+                continue
+
             if source not in seen_nodes:
                 seen_nodes.add(source)
                 preview_node_ids.append(source)
             if target not in seen_nodes:
                 seen_nodes.add(target)
                 preview_node_ids.append(target)
-            if len(preview_node_ids) >= self.GRAPH_PREVIEW_NODE_LIMIT:
+
+            preview_edge_rows.append((source, target, attributes))
+            if len(preview_edge_rows) >= self.GRAPH_PREVIEW_EDGE_LIMIT:
                 break
 
         preview_nodes = {
             node_id: self._make_json_safe(graph_data.nodes[node_id])
-            for node_id in preview_node_ids[: self.GRAPH_PREVIEW_NODE_LIMIT]
+            for node_id in preview_node_ids
             if node_id in graph_data.nodes
         }
 
@@ -253,12 +269,41 @@ class PreprocessingService:
                 target=target,
                 attributes=self._make_json_safe(attributes),
             )
-            for source, target, attributes in preview_edges
+            for source, target, attributes in preview_edge_rows
         ]
         return GraphData(
             nodes=preview_nodes,
             edges=edges,
+            total_nodes=total_nodes,
+            total_edges=total_edges,
+            preview_node_limit=self.GRAPH_PREVIEW_NODE_LIMIT,
+            preview_edge_limit=self.GRAPH_PREVIEW_EDGE_LIMIT,
+            preview_capped=(
+                total_nodes > len(preview_nodes) or total_edges > len(edges)
+            ),
         )
+
+    def _sample_preview_edges(self, edges, limit: int):
+        """Return a deterministic, spread-out edge sample for graph previews."""
+
+        if limit <= 0 or not edges:
+            return []
+        if len(edges) <= limit:
+            return list(edges)
+
+        last_index = len(edges) - 1
+        if limit == 1:
+            return [edges[0]]
+
+        sampled = []
+        seen_indices = set()
+        for i in range(limit):
+            index = round(i * last_index / (limit - 1))
+            if index in seen_indices:
+                continue
+            seen_indices.add(index)
+            sampled.append(edges[index])
+        return sampled
 
     def _records_to_json_safe(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Normalize preview records for JSON responses."""
