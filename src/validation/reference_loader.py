@@ -83,7 +83,9 @@ _PATTERNS: dict[str, tuple[str, ...]] = {
     # Orthogonal gene-set references (evidence unrelated to network topology).
     # Multiple filename patterns per kind so the loader auto-discovers any of
     # several equivalent public databases the user might have on hand:
-    #   disease     – DisGeNET, DISEASES (Jensen Lab), GWAS Catalog
+    #   disease     – DisGeNET, DISEASES (Jensen Lab), GWAS Catalog,
+    #                 HPO (genes_to_phenotype), ClinVar (gene_condition),
+    #                 Orphanet
     #   essential   – DEG, OGEE, DepMap CRISPR common essentials,
     #                 HART lab CEG core-essential gene lists
     #   drug_target – DrugBank, Therapeutic Target Database (TTD),
@@ -91,7 +93,9 @@ _PATTERNS: dict[str, tuple[str, ...]] = {
     "disgenet":   ("disgenet", "gene_disease", "curated_gene_disease",
                    "all_gene_disease",
                    "human_disease_integrated", "diseases_integrated",
-                   "gwas_catalog", "gwas-associations"),
+                   "gwas_catalog", "gwas-associations",
+                   "genes_to_phenotype", "phenotype_to_genes", "hpo",
+                   "clinvar", "gene_condition", "orphanet"),
     "deg":        ("deg", "ogee", "essential",
                    "common_essentials", "commonessentials",
                    "cegv2", "ceg2", "hart_essential"),
@@ -457,7 +461,10 @@ _GENE_SET_COLUMNS: dict[str, tuple[str, ...]] = {
     # fall through to the first alphabetic cell for header-less files.
     "disgenet": ("geneSymbol", "gene_symbol", "genesymbol", "symbol",
                  "gene", "gene_name", "Gene symbol", "MAPPED_GENE",
-                 "REPORTED GENE(S)"),
+                 "REPORTED GENE(S)",
+                 # HPO genes_to_phenotype / ClinVar gene_condition / Orphanet
+                 "gene-symbol", "entrez-gene-symbol", "AssociatedGenes",
+                 "GeneSymbol", "Gene_Symbol"),
     # DEG/OGEE → "gene_symbol"; DepMap Common Essentials → "gene" or
     # "Gene" (values like "TP53 (7157)" — the loader keeps them, matching
     # trims to the parenthesised suffix — see column-hint doc);
