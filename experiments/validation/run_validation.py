@@ -57,8 +57,13 @@ def _load_graph(raw_path: Path, sample_rows: int | None,
                 mapping: dict[str, str] | None,
                 min_edge_weight: float = 0.0):
     print(f"[validate] loading {raw_path} (sample_rows={sample_rows})")
+    # encoding="utf-8-sig" strips a leading UTF-8 BOM if present, so a header
+    # column like "TF" is not read as "﻿TF" (common when a file's header
+    # was written by PowerShell's Set-Content -Encoding utf8).
     df = pd.read_csv(raw_path, sep=None, engine="python",
-                     nrows=sample_rows, low_memory=True)
+                     nrows=sample_rows, low_memory=True, encoding="utf-8-sig")
+    # Defensive: strip any BOM/whitespace still clinging to column names.
+    df.columns = [str(c).lstrip("﻿").strip() for c in df.columns]
     print(f"[validate] rows loaded: {len(df):,}")
 
     # Confidence filter — drop weak edges before graph construction so dense

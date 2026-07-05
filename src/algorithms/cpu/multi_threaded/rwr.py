@@ -94,7 +94,9 @@ def rwr_cpu_multi(
         seed_sets = [list(seeds)]
 
     # Build column-stochastic transition matrix W once.
-    W_scipy, _ = _build_transition_matrix(graph_csr)
+    # dangling_self_loops=True conserves mass on directed graphs (matches the
+    # single-threaded / GPU RWR spec) so scores sum to 1.0.
+    W_scipy, _ = _build_transition_matrix(graph_csr, dangling_self_loops=True)
     W_gb = _from_scipy(W_scipy.astype(np.float32, copy=False), dtype=np.float32)
 
     one_minus_r = np.float32(1.0 - r)

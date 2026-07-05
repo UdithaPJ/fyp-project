@@ -88,7 +88,9 @@ def rwr_cpu_single(graph_csr: sp.csr_matrix, params: dict) -> dict:
         seeds = seeds[0]
 
     N = graph_csr.shape[0]
-    W, _ = _build_transition_matrix(graph_csr)
+    # dangling_self_loops=True keeps the walk mass-conserving on directed
+    # graphs (GRN/miRNA dangling target genes); matches the GPU RWR spec.
+    W, _ = _build_transition_matrix(graph_csr, dangling_self_loops=True)
     p0   = _make_p0(seeds, N)
     pr   = p0.copy()
 

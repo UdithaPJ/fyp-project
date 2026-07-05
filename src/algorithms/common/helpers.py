@@ -80,6 +80,7 @@ _TOP_K:   int = 15   # top hubs / authorities (hits)
 
 def _build_transition_matrix(
     graph_csr: sp.csr_matrix,
+    dangling_self_loops: bool = False,
 ) -> tuple[sp.csr_matrix, np.ndarray]:
     """
     Build the column-stochastic transition matrix M and a dangling-node mask.
@@ -91,6 +92,16 @@ def _build_transition_matrix(
     redistribute their probability mass (PageRank) or treat the restart term
     as the sole source of probability (RWR).
 
+    Parameters
+    ----------
+    dangling_self_loops : bool, default False
+        When True, add a self-loop ``M[j, j] = 1`` to every dangling column
+        so M is column-stochastic over ALL nodes (not just non-dangling
+        ones).  This conserves probability mass — RWR scores then sum to 1.0
+        instead of leaking on directed graphs with many dangling nodes (e.g.
+        GRN target genes).  Matches the GPU RWR transition-matrix spec.  Left
+        False for PageRank, which redistributes dangling mass explicitly.
+
     Used by
     -------
     src.algorithms.cpu.single_threaded.pagerank
@@ -101,6 +112,7 @@ def _build_transition_matrix(
     Returns
     -------
     M            : (N, N) CSR, column-stochastic over non-dangling nodes
+                   (or ALL nodes when ``dangling_self_loops=True``)
     dangling_mask: boolean array of length N, True for dangling nodes
     """
     # MEMORY_FIX (M-3): build the transition matrix in float32.  Score
@@ -111,6 +123,12 @@ def _build_transition_matrix(
     safe_degrees  = np.where(dangling_mask, np.float32(1.0), out_degrees)
     D_inv         = sp.diags(1.0 / safe_degrees, format="csr", dtype=np.float32)
     M             = (D_inv @ graph_csr).T.tocsr().astype(np.float32)
+    if dangling_self_loops and dangling_mask.any():
+        # Dangling columns are all-zero; a self-loop makes them column-
+        # stochastic (M[j, j] = 1), so the random walker stays put there
+        # instead of the mass vanishing.  Conserves total probability.
+        M = (M + sp.diags(dangling_mask.astype(np.float32),
+                          format="csr", dtype=np.float32)).tocsr()
     return M, dangling_mask
 
 
