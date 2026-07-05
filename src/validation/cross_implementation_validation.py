@@ -710,26 +710,9 @@ class CrossImplementationValidator:
                         f"{y:.3f}",
                         ha="center", va="bottom", fontsize=7)
 
-        # Footnote: flag the stochastic algorithms so their (expectedly)
-        # sub-1.0 bars are not misread as GPU correctness failures.
-        stochastic_present = [a for a in algos_present
-                              if a in ("louvain", "mcl")]
-        if stochastic_present:
-            fig.text(
-                0.5, -0.02,
-                "Note: " + " & ".join(stochastic_present)
-                + " are non-deterministic (stochastic / chaotic) — NMI < 1 "
-                "across independent implementations is EXPECTED, not a "
-                "failure. Judge these by modularity_diff / cluster_count_diff "
-                "(see CSV note column). The deterministic algorithms "
-                "(pagerank, bfs, hits, rwr) at ~1.0 are the correctness proof.",
-                ha="center", va="top", fontsize=7.5, style="italic",
-                wrap=True,
-            )
-
         outpath = self.plots_dir / "validation_summary.png"
         fig.tight_layout()
-        fig.savefig(outpath, dpi=120, bbox_inches="tight")
+        fig.savefig(outpath, dpi=120)
         plt.close(fig)
         return outpath
 
