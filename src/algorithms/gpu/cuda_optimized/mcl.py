@@ -64,32 +64,59 @@ Optimised GPU pipeline (this module)
 6. Adaptive arch compilation: runtime
    `cuda.Device(0).compute_capability()` -> `-arch=sm_XY`.
 
-VRAM ceiling (important)
-------------------------
+7. Out-of-core execution (host-RAM-bounded expansion).  When the (pre-
+   top-k) product would exceed the free-VRAM OR available-host-RAM budget,
+   the expansion is computed by ``_expand_topk_ooc`` instead of the single-
+   shot ``_spgemm_gpu`` + ``_prune_gpu``:
+     - It computes C^T = M^T @ M^T row by row in tiles (a row of C^T is a
+       COMPLETE column of C), so per-column top-k can be applied per tile
+       on the host and only the ``n * top_k`` survivors accumulate — the
+       full (pre-top-k) product is NEVER materialised, on GPU or host.
+     - The plain SpGEMM also has a row-tiled fallback (``_spgemm_gpu_tiled``)
+       that bounds only the GPU output transient (used when top-k is not
+       being fused, e.g. expansion > 2).
+     - ``_adaptive_top_k`` caps top_k so ``n * top_k`` fits BOTH free VRAM
+       and available host RAM; shrinking top_k is what lets progressively
+       larger graphs run (bigger n by keeping fewer survivors per column).
+   The out-of-core path uses EXACT per-column top-k (value desc, index
+   asc), which differs marginally from the in-core bitonic kernel's tie-
+   inclusive behaviour on hub columns; on genuinely clusterable graphs the
+   two agree exactly (ARI 1.0 on planted-partition graphs).
+
+Memory ceiling (important)
+--------------------------
 MCL is the most memory-intensive of the six algorithms: the expansion
 step squares the matrix (M @ M), and the fill-in of the product — not the
-input graph — is the binding VRAM constraint.  On random / scale-free
-graphs there is no tight community structure to keep the product sparse,
-so it explodes before pruning can contain it.
+input graph — is the binding constraint.  On random / scale-free graphs
+there is no tight community structure to keep the product sparse, so it
+explodes before pruning can contain it.
 
-Two mechanisms keep MCL within VRAM as far as possible, then fail cleanly:
-  * ``_adaptive_top_k`` caps top-k so the pruned *working set*
-    (~n * top_k entries) fits free VRAM (bounds the SpGEMM INPUT).
-  * ``_adaptive_prune_threshold`` raises the threshold under pressure to
-    shrink the SpGEMM OUTPUT.
+The out-of-core pipeline (item 7) removes the *product* fill-in as the
+binding VRAM constraint: the iterate is bounded to ``n * top_k`` on both
+GPU and host, with top_k auto-shrunk to fit.  Two limits remain, both of
+which fail CLEANLY (a clear ``MemoryError``, never a silent truncation and
+never an OOM-killer crash):
+  * The per-tile GPU transient and the ``n * top_k`` host survivor set
+    (guarded inside ``_expand_topk_ooc`` / ``_spgemm_gpu_tiled``).
+  * A pre-flight guard on the one-time CPU preprocessing
+    (``_symmetrize_mcl`` builds A + Aᵀ + I; ``_to_column_stochastic`` casts
+    the whole matrix to float64) — this operates on the RAW graph and is
+    NOT bounded by top_k, so for a many-million-edge graph it is the host-
+    RAM spike that PRECEDES the bounded iterate.  ``mcl_gpu`` estimates its
+    peak and refuses fast when it will not fit available host RAM.
 
-When the product still does not fit, MCL raises a clear ``MemoryError``
-(it does NOT silently truncate the product — that was removed as a
-correctness hazard).  Measured ceiling on a 6 GB RTX 2060 (grn/undirected,
-~6 avg degree): roughly ~1M nodes (barabasi_albert, scale-free), ~1.6M
-(erdos_renyi, random), ~3.3M (watts_strogatz, small-world).  The exact
-limit is degree-variance dependent — e.g. erdos_renyi and watts_strogatz
-at the SAME n/m differ because ER's Poisson degree variance produces more
-fill-in than WS's near-uniform degree.  Real biological networks are far
-smaller and sparser than these synthetic stress graphs and run comfortably
-below the ceiling.  Beyond it, a higher-VRAM device (or higher
-prune_threshold / lower top_k_per_column) is required; full out-of-core
-MCL (host-streamed SpGEMM+prune+inflate) is future work.
+Measured on a 6 GB RTX 2060 with ~7 GB host RAM (grn/undirected, ~6 avg
+degree, erdos_renyi): 2M and 3M nodes now run to completion (both OOM'd
+before out-of-core); 8M nodes is refused cleanly by the preprocessing
+guard.  The demonstrated ceiling is ~4M ER nodes here, set by
+preprocessing host RAM, and scales up with more host RAM.  (The old in-core
+VRAM ceiling was ~1M barabasi_albert / ~1.6M erdos_renyi / ~3.3M
+watts_strogatz.)  Real biological networks are far smaller and sparser than
+these synthetic stress graphs and run comfortably below the ceiling.
+Bounding the preprocessing itself (streamed symmetrise/normalise) is the
+remaining out-of-core work; managed-memory spill was evaluated and rejected
+(host RAM, not VRAM, is the wall once the iterate is bounded, and the
+SpGEMM's scatter-heavy access makes UM paging impractically slow).
 
 References
 ----------
@@ -107,6 +134,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from typing import Any
 
 import numpy as np
@@ -181,6 +209,60 @@ TOP_K_BITONIC_THRESHOLD: int = 256
 # Degree thresholds for SpGEMM dispatch.
 HEAVY_ROW_THRESH:  int = BLOCK_SIZE           # 256
 LIGHT_ROW_THRESH:  int = WARP_SIZE            # 32
+
+# Test seam (None in production): caps rows-per-tile in the out-of-core
+# row-tiled SpGEMM so the multi-tile path can be exercised on small graphs.
+_FORCE_TILE_ROWS: int | None = None
+
+# Test seam (False in production): forces the fused out-of-core expansion path
+# (`_expand_topk_ooc`) regardless of the size heuristic, so it can be exercised
+# on small graphs.
+_FORCE_OOC: bool = False
+
+# Out-of-core Stage B host-RAM guard.  The row-tiled SpGEMM accumulates the
+# threshold-pruned product on the HOST before assembling the CSR; on a machine
+# whose host RAM is shared with other work, letting that accumulation grow
+# unbounded can exhaust system memory and invoke the OOM killer.  The guard
+# aborts cleanly (MemoryError) when the projected accumulation would exceed
+# HOST_RAM_BUDGET_FRACTION of currently-available host RAM.
+HOST_RAM_BUDGET_FRACTION: float = 0.5
+# Peak host bytes per accumulated COO entry: 12 B live in the tile list, plus
+# a concatenated copy and the scipy COO->CSR conversion transient — ~2.5x.
+_HOST_PEAK_BYTES_PER_ENTRY: float = 12.0 * 2.5
+
+# Pre-flight preprocessing guard.  MCL's CPU preprocessing (`_symmetrize_mcl`
+# builds A + Aᵀ + I; `_to_column_stochastic` casts the whole matrix to float64)
+# operates on the RAW symmetrised graph and is NOT bounded by the out-of-core
+# top_k machinery — for a many-million-edge graph its transient copies are the
+# host-RAM spike that precedes the bounded iterate.  We estimate that peak as
+# `symmetrised_nnz * _PREPROC_PEAK_BYTES_PER_ENTRY` (conservative: covers the
+# float64 CSC copy, the float32 CSR, the A+Aᵀ scipy transients, and col sums)
+# and fail fast when it would exceed `_PREPROC_HOST_FRACTION` of available RAM.
+_PREPROC_PEAK_BYTES_PER_ENTRY: int = 60
+_PREPROC_HOST_FRACTION: float = 0.55
+
+
+def _host_available_bytes() -> int:
+    """Best-effort available host RAM in bytes (Linux ``MemAvailable``).
+
+    Honours the ``MCL_HOST_AVAIL_BYTES`` environment override when set, so a
+    constrained/benchmark run can pin the effective host budget (e.g. below a
+    cgroup ``MemoryMax``) rather than trusting system-wide ``MemAvailable``.
+    """
+    override = os.environ.get("MCL_HOST_AVAIL_BYTES")
+    if override:
+        try:
+            return int(override)
+        except ValueError:
+            pass
+    try:
+        with open("/proc/meminfo", "rt") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except Exception:                                       # noqa: BLE001
+        pass
+    return 1 << 31                                          # 2 GB fallback
 
 
 # ---------------------------------------------------------------------------
@@ -1018,35 +1100,54 @@ def _adaptive_top_k(
     n: int,
     user_top_k: int,
     free_bytes: int,
+    host_free_bytes: int = 0,
     vram_fraction: float = 0.35,
+    host_fraction: float = 0.30,
     bytes_per_entry: int = _WORKING_BYTES_PER_ENTRY,
 ) -> tuple[int, str]:
-    """Cap ``top_k`` so the pruned working set fits a fraction of free VRAM.
+    """Cap ``top_k`` so the pruned working set fits free VRAM *and* host RAM.
 
     MCL keeps every iteration's matrix bounded by top-k-per-column: after
-    pruning, ``nnz(M) <= n * top_k``.  That bound is what dictates the SpGEMM
-    input (CSR + optional CSC) footprint next iteration.  On very large
-    graphs a fixed ``top_k`` (default 50) makes the working set exceed VRAM
-    before the SpGEMM even starts — the ``cuMemAlloc failed`` seen on the
-    multi-million-node scalability graphs.  Shrinking ``top_k`` to the VRAM
-    budget lets those graphs run; it costs cluster granularity (fewer
-    survivors per column) but only ever binds when the graph is too large for
-    the user's value — realistic biological networks are far below the cap
-    and are returned unchanged.
+    pruning, ``nnz(M) <= n * top_k``.  Two budgets constrain that bound:
+
+      * **VRAM** — the pruned ``M`` is uploaded as CSR (+ optional CSC), so the
+        SpGEMM input footprint is ``~bytes_per_entry * n * top_k``.  A fixed
+        ``top_k`` (default 50) makes this exceed VRAM on multi-million-node
+        graphs (the ``cuMemAlloc failed`` seen on the scalability graphs).
+      * **Host RAM** — the out-of-core fused expansion (:func:`_expand_topk_ooc`)
+        accumulates the ``n * top_k`` survivors on the host and assembles them
+        into a CSR, peaking at ``~_HOST_PEAK_BYTES_PER_ENTRY * n * top_k``.  On
+        a small-host machine this is the binding constraint, so ``top_k`` is
+        also capped to ``host_fraction`` of available host RAM.  Shrinking
+        ``top_k`` here is precisely what lets progressively larger graphs run
+        out-of-core (bigger ``n`` fits by keeping fewer survivors per column).
+
+    Shrinking ``top_k`` costs cluster granularity but only ever binds when the
+    graph is too large for the user's value at the current memory — realistic
+    biological networks are far below both caps and are returned unchanged.
 
     Returns ``(effective_top_k, note)`` where ``note`` is empty when no
     reduction was applied.
     """
     if n <= 0 or user_top_k <= 0 or free_bytes <= 0:
         return user_top_k, ""
-    budget = int(free_bytes * vram_fraction)
-    max_k  = max(1, budget // (bytes_per_entry * n))
+    vram_budget = int(free_bytes * vram_fraction)
+    max_k_vram  = max(1, vram_budget // (bytes_per_entry * n))
+    max_k = max_k_vram
+    binding = f"{vram_budget/1e6:.0f} MB VRAM budget"
+    if host_free_bytes > 0:
+        host_budget = int(host_free_bytes * host_fraction)
+        max_k_host  = max(1, int(
+            host_budget / (_HOST_PEAK_BYTES_PER_ENTRY * n)
+        ))
+        if max_k_host < max_k:
+            max_k = max_k_host
+            binding = f"{host_budget/1e6:.0f} MB host-RAM budget"
     if user_top_k <= max_k:
         return user_top_k, ""
     note = (
         f"top_k {user_top_k} -> {int(max_k)} to fit working set "
-        f"(~{n} x {int(max_k)} entries at {bytes_per_entry} B) in "
-        f"{budget/1e6:.0f} MB VRAM budget"
+        f"(~{n} x {int(max_k)} entries) in {binding}"
     )
     return int(max_k), note
 
@@ -1265,14 +1366,60 @@ def _spgemm_gpu(
         vram_budget   = int(free_bytes * VRAM_BUDGET_FRACTION)
         cap_estimate  = _estimate_spgemm_output_size(M_csr)
         max_cap       = max(1024, vram_budget // COO_BYTES_PER_ENTRY)
+
+        # Out-of-core Stage B: when the estimated single-shot output buffer
+        # would not fit the VRAM budget, the product transient is the binding
+        # constraint (confirmed `cuMemAlloc failed` on the output COO on the
+        # multi-million-node graphs).  Route to the row-tiled path, which
+        # holds only ONE output-row tile's transient on the GPU at a time and
+        # accumulates survivors on the host.  Output rows are independent, so
+        # the result is identical to the single-shot path (same kernels, same
+        # fused threshold) — only the buffer is split.  The existing single-
+        # shot path below is untouched for graphs that already fit.
+        if cap_estimate > max_cap:
+            # Release the input CSR arrays we uploaded above before tiling —
+            # the tiled path re-uploads them once as its own resident copy.
+            for arr in d_local:
+                try:
+                    arr.gpudata.free()
+                except Exception:                       # noqa: BLE001
+                    pass
+            d_local.clear()
+            return _spgemm_gpu_tiled(
+                M_csr, kernels, block_size,
+                stream_compute=stream_compute,
+                stream_transfer=stream_transfer,
+                shared_mem_per_block=shared_mem_per_block,
+                prune_threshold=prune_threshold,
+            )
+
         capacity      = int(min(cap_estimate, max_cap))
         # Floor at nnz // 4 (post-prune output can shrink well below nnz);
         # overflow recovery below handles the rare underestimate.
         capacity      = max(capacity, max(1024, nnz // 4))
 
-        d_C_row = _empty((capacity,), np.int32)
-        d_C_col = _empty((capacity,), np.int32)
-        d_C_val = _empty((capacity,), np.float32)
+        # If the single-shot output buffer cannot be allocated (VRAM
+        # fragmentation, or the estimate simply undershoots the free-VRAM
+        # budget on a later, grown iteration), fall back to the row-tiled
+        # path rather than propagating a raw ``cuMemAlloc failed``.
+        try:
+            d_C_row = _empty((capacity,), np.int32)
+            d_C_col = _empty((capacity,), np.int32)
+            d_C_val = _empty((capacity,), np.float32)
+        except (MemoryError, cuda.MemoryError):         # type: ignore[attr-defined]
+            for arr in d_local:
+                try:
+                    arr.gpudata.free()
+                except Exception:                       # noqa: BLE001
+                    pass
+            d_local.clear()
+            return _spgemm_gpu_tiled(
+                M_csr, kernels, block_size,
+                stream_compute=stream_compute,
+                stream_transfer=stream_transfer,
+                shared_mem_per_block=shared_mem_per_block,
+                prune_threshold=prune_threshold,
+            )
         d_C_nnz = _empty((1,),         np.int32)
         cuda.memset_d32(d_C_nnz.gpudata, 0, 1)
 
@@ -1420,6 +1567,321 @@ def _spgemm_gpu(
                 arr.gpudata.free()
             except Exception:                           # noqa: BLE001
                 pass
+
+
+# ---------------------------------------------------------------------------
+# Out-of-core Stage B: row-tiled SpGEMM
+# ---------------------------------------------------------------------------
+
+def _spgemm_gpu_tiled(
+    M_csr: sp.csr_matrix,
+    kernels: dict[str, Any],
+    block_size: int,
+    stream_compute,
+    stream_transfer,
+    shared_mem_per_block: int = DEFAULT_SHARED_MEM_PER_BLOCK,
+    prune_threshold: float = 1e-3,
+) -> tuple[sp.csr_matrix, str]:
+    """Row-tiled ``C = M @ M`` for graphs whose product transient exceeds VRAM.
+
+    The single-shot :func:`_spgemm_gpu` allocates one output COO buffer big
+    enough for the whole (threshold-fused) product; on multi-million-node
+    graphs that buffer alone exceeds VRAM and ``cuMemAlloc`` fails.  Output
+    rows of ``M @ M`` are independent, so this variant:
+
+      * uploads the input CSR (and CSC, if any heavy rows) to the GPU ONCE
+        and keeps it resident across all tiles;
+      * walks the output rows in tiles, allocating a *small* per-tile output
+        buffer, running the same hash / inner-product kernels restricted to
+        the tile's rows, and downloading the tile's survivors to the host;
+      * concatenates the per-tile COO on the host and assembles the CSR.
+
+    Peak VRAM is therefore ``resident(M) + one tile buffer`` rather than
+    ``resident(M) + full product``.  Tile size is chosen from free VRAM and
+    shrunk (with a retry) whenever a tile overflows its buffer, so the result
+    is never truncated and never OOMs mid-tile.  Numerically identical to the
+    single-shot path (same kernels, same fused ``prune_threshold``).
+
+    Raises
+    ------
+    MemoryError
+        If a *single* output row's product exceeds the per-tile VRAM budget
+        (cannot be tiled finer), or if the accumulated host product exhausts
+        host RAM.  The message is actionable (raise ``prune_threshold`` /
+        lower ``top_k`` / use a higher-VRAM device).
+    """
+    n   = int(M_csr.shape[0])
+    nnz = int(M_csr.nnz)
+    if nnz == 0:
+        return sp.csr_matrix((n, n), dtype=np.float32), ""
+
+    h_row_ptr = np.ascontiguousarray(M_csr.indptr,  dtype=np.int32)
+    h_col_idx = np.ascontiguousarray(M_csr.indices, dtype=np.int32)
+    h_values  = np.ascontiguousarray(M_csr.data,    dtype=np.float32)
+
+    heavy, medium, light = _classify_rows_by_degree(h_row_ptr)
+
+    resident: list = []          # freed once, at the very end
+    k_hash  = kernels["spgemm_hash"]
+    k_inner = kernels["spgemm"]
+
+    def _alloc(shape, dtype, bucket):
+        ga = gpuarray.empty(shape, dtype=dtype)
+        bucket.append(ga)
+        return ga
+
+    def _free(bucket):
+        for arr in bucket:
+            try:
+                arr.gpudata.free()
+            except Exception:                           # noqa: BLE001
+                pass
+        bucket.clear()
+
+    try:
+        # ---- Resident input CSR (uploaded once) -----------------------
+        d_row_ptr = _alloc(h_row_ptr.shape, np.int32,   resident)
+        d_col_idx = _alloc(h_col_idx.shape, np.int32,   resident)
+        d_values  = _alloc(h_values.shape,  np.float32, resident)
+        cuda.memcpy_htod_async(d_row_ptr.gpudata, h_row_ptr, stream_transfer)
+        cuda.memcpy_htod_async(d_col_idx.gpudata, h_col_idx, stream_transfer)
+        cuda.memcpy_htod_async(d_values.gpudata,  h_values,  stream_transfer)
+
+        # ---- Resident CSC (only if heavy rows need the inner product) --
+        d_B_col_ptr = d_B_row_idx = d_B_values = None
+        if heavy.size > 0:
+            M_csc = M_csr.tocsc()
+            h_B_col_ptr = np.ascontiguousarray(M_csc.indptr,  dtype=np.int32)
+            h_B_row_idx = np.ascontiguousarray(M_csc.indices, dtype=np.int32)
+            h_B_values  = np.ascontiguousarray(M_csc.data,    dtype=np.float32)
+            d_B_col_ptr = _alloc(h_B_col_ptr.shape, np.int32,   resident)
+            d_B_row_idx = _alloc(h_B_row_idx.shape, np.int32,   resident)
+            d_B_values  = _alloc(h_B_values.shape,  np.float32, resident)
+            cuda.memcpy_htod_async(d_B_col_ptr.gpudata, h_B_col_ptr,
+                                    stream_transfer)
+            cuda.memcpy_htod_async(d_B_row_idx.gpudata, h_B_row_idx,
+                                    stream_transfer)
+            cuda.memcpy_htod_async(d_B_values.gpudata,  h_B_values,
+                                    stream_transfer)
+        transfer_done = cuda.Event()
+        transfer_done.record(stream_transfer)
+        stream_compute.wait_for_event(transfer_done)
+
+        # ---- Hash-table sizing (identical to single-shot path) --------
+        max_hash_entries = max(64, shared_mem_per_block // HASH_ENTRY_BYTES)
+        avg_row_len_full = max(1.0, nnz / max(1, n))
+        hash_size_medium = _estimate_hash_size(
+            avg_row_len_full, avg_row_len_full, max_hash_entries,
+        )
+        hash_size_light  = max(
+            64,
+            min(_next_pow2(int(avg_row_len_full * avg_row_len_full * 2)),
+                max_hash_entries // 2),
+        )
+
+        # ---- Tile sizing from free VRAM after resident upload ---------
+        try:
+            free_after, _ = cuda.mem_get_info()
+        except Exception:                               # noqa: BLE001
+            free_after = 1 << 30
+        # Half the remaining VRAM for the transient output COO tile buffer
+        # (leaves headroom for the row_list uploads and driver overhead).
+        tile_budget_entries = max(
+            1 << 20, int(free_after * 0.5) // COO_BYTES_PER_ENTRY
+        )
+        # Estimated output nnz per row (same model as the whole-matrix
+        # estimator, divided by n): avg_row^2 * safety.
+        per_row_est = max(
+            1, int(math.ceil(avg_row_len_full * avg_row_len_full * 1.5))
+        )
+        rows_per_tile = max(1, min(n, tile_budget_entries // per_row_est))
+        # Test seam: force a small tile count to exercise the multi-tile path
+        # (accumulation + boundary slicing) on graphs that would otherwise fit
+        # a single tile.  Unset in production.
+        if _FORCE_TILE_ROWS is not None:
+            rows_per_tile = max(1, min(rows_per_tile, int(_FORCE_TILE_ROWS)))
+
+        out_rows: list[np.ndarray] = []
+        out_cols: list[np.ndarray] = []
+        out_vals: list[np.ndarray] = []
+        acc_entries = 0                                  # host-RAM guard counter
+        host_entry_budget = int(
+            _host_available_bytes() * HOST_RAM_BUDGET_FRACTION
+            / _HOST_PEAK_BYTES_PER_ENTRY
+        )
+
+        d_C_nnz = _alloc((1,), np.int32, resident)      # reused every tile
+
+        # Cache class-row arrays as sorted for fast tile slicing.
+        heavy_s  = np.sort(heavy)  if heavy.size  else heavy
+        medium_s = np.sort(medium) if medium.size else medium
+        light_s  = np.sort(light)  if light.size  else light
+
+        def _tile_rows(sorted_rows, r0, r1):
+            if sorted_rows.size == 0:
+                return sorted_rows
+            lo = int(np.searchsorted(sorted_rows, r0, side="left"))
+            hi = int(np.searchsorted(sorted_rows, r1, side="left"))
+            return sorted_rows[lo:hi]
+
+        r0 = 0
+        while r0 < n:
+            rpt = rows_per_tile
+            while True:
+                r1 = min(n, r0 + rpt)
+                m_tile = _tile_rows(medium_s, r0, r1)
+                l_tile = _tile_rows(light_s,  r0, r1)
+                h_tile = _tile_rows(heavy_s,  r0, r1)
+                # Per-tile capacity: estimate for THIS tile's rows, capped to
+                # the VRAM budget.  Overflow (underestimate) triggers a retry.
+                cap = int(min(tile_budget_entries,
+                              max(1024, (r1 - r0) * per_row_est * 2)))
+
+                tile_bufs: list = []
+                try:
+                    d_C_row = _alloc((cap,), np.int32,   tile_bufs)
+                    d_C_col = _alloc((cap,), np.int32,   tile_bufs)
+                    d_C_val = _alloc((cap,), np.float32, tile_bufs)
+                except (MemoryError, cuda.MemoryError):  # type: ignore[attr-defined]
+                    _free(tile_bufs)
+                    if rpt <= 1:
+                        raise MemoryError(
+                            "MCL gpu: a single SpGEMM output row exceeds the "
+                            "per-tile VRAM budget even at 1 row/tile. Raise "
+                            "prune_threshold or lower top_k_per_column."
+                        )
+                    rpt = max(1, rpt // 2)
+                    continue
+
+                cuda.memset_d32(d_C_nnz.gpudata, 0, 1)
+
+                if m_tile.size > 0:
+                    d_list = _alloc(m_tile.shape, np.int32, tile_bufs)
+                    cuda.memcpy_htod_async(d_list.gpudata,
+                                            np.ascontiguousarray(m_tile),
+                                            stream_transfer)
+                    ev = cuda.Event(); ev.record(stream_transfer)
+                    stream_compute.wait_for_event(ev)
+                    k_hash(
+                        d_row_ptr, d_col_idx, d_values,
+                        d_row_ptr, d_col_idx, d_values,
+                        d_list,
+                        d_C_row, d_C_col, d_C_val, d_C_nnz,
+                        np.int32(m_tile.size),
+                        np.int32(hash_size_medium),
+                        np.int32(cap),
+                        np.float32(prune_threshold),
+                        block=(block_size, 1, 1),
+                        grid=(int(m_tile.size), 1, 1),
+                        shared=hash_size_medium * HASH_ENTRY_BYTES,
+                        stream=stream_compute,
+                    )
+                if l_tile.size > 0:
+                    d_list = _alloc(l_tile.shape, np.int32, tile_bufs)
+                    cuda.memcpy_htod_async(d_list.gpudata,
+                                            np.ascontiguousarray(l_tile),
+                                            stream_transfer)
+                    ev = cuda.Event(); ev.record(stream_transfer)
+                    stream_compute.wait_for_event(ev)
+                    k_hash(
+                        d_row_ptr, d_col_idx, d_values,
+                        d_row_ptr, d_col_idx, d_values,
+                        d_list,
+                        d_C_row, d_C_col, d_C_val, d_C_nnz,
+                        np.int32(l_tile.size),
+                        np.int32(hash_size_light),
+                        np.int32(cap),
+                        np.float32(prune_threshold),
+                        block=(block_size, 1, 1),
+                        grid=(int(l_tile.size), 1, 1),
+                        shared=hash_size_light * HASH_ENTRY_BYTES,
+                        stream=stream_compute,
+                    )
+                if h_tile.size > 0:
+                    d_list = _alloc(h_tile.shape, np.int32, tile_bufs)
+                    cuda.memcpy_htod_async(d_list.gpudata,
+                                            np.ascontiguousarray(h_tile),
+                                            stream_transfer)
+                    ev = cuda.Event(); ev.record(stream_transfer)
+                    stream_compute.wait_for_event(ev)
+                    k_inner(
+                        d_row_ptr, d_col_idx, d_values,
+                        d_B_col_ptr, d_B_row_idx, d_B_values,
+                        d_list,
+                        d_C_row, d_C_col, d_C_val, d_C_nnz,
+                        np.int32(h_tile.size),
+                        np.int32(n),
+                        np.int32(cap),
+                        np.float32(prune_threshold),
+                        block=(block_size, 1, 1),
+                        grid=(int(h_tile.size), 1, 1),
+                        stream=stream_compute,
+                    )
+
+                stream_compute.synchronize()
+                written = int(d_C_nnz.get()[0])
+
+                if written > cap:
+                    # Underestimate — this tile's product did not fit its
+                    # buffer.  Shrink and retry (no truncation).
+                    _free(tile_bufs)
+                    if rpt <= 1:
+                        need_mb = written * COO_BYTES_PER_ENTRY / (1024 * 1024)
+                        raise MemoryError(
+                            "MCL gpu: a single SpGEMM output row needs "
+                            f"{written:,} entries (~{need_mb:.0f} MB), exceeding "
+                            "the per-tile VRAM budget. Raise prune_threshold "
+                            "or lower top_k_per_column."
+                        )
+                    rpt = max(1, rpt // 2)
+                    continue
+
+                if written > 0:
+                    acc_entries += written
+                    if acc_entries > host_entry_budget:
+                        _free(tile_bufs)
+                        acc_mb = (acc_entries * _HOST_PEAK_BYTES_PER_ENTRY
+                                  / (1024 * 1024))
+                        raise MemoryError(
+                            "MCL gpu: the threshold-pruned M @ M product "
+                            f"exceeds the host-RAM budget "
+                            f"(~{acc_mb:.0f} MB projected peak vs "
+                            f"{host_entry_budget:,} entries allowed). The graph "
+                            "is too large for out-of-core MCL on this host's "
+                            "available RAM. Raise prune_threshold, lower "
+                            "top_k_per_column, or use a machine with more RAM."
+                        )
+                    out_rows.append(d_C_row.get()[:written].copy())
+                    out_cols.append(d_C_col.get()[:written].copy())
+                    out_vals.append(d_C_val.get()[:written].copy())
+                _free(tile_bufs)
+                break
+
+            r0 = r1
+
+    finally:
+        _free(resident)
+
+    if not out_rows:
+        return sp.csr_matrix((n, n), dtype=np.float32), ""
+
+    try:
+        rows_host = np.concatenate(out_rows)
+        cols_host = np.concatenate(out_cols)
+        vals_host = np.concatenate(out_vals)
+        out = sp.coo_matrix(
+            (vals_host, (rows_host, cols_host)),
+            shape=(n, n), dtype=np.float32,
+        ).tocsr()
+        out.sum_duplicates()
+    except MemoryError as exc:
+        total = sum(a.size for a in out_rows)
+        raise MemoryError(
+            "MCL gpu: the threshold-pruned M @ M product has "
+            f"{total:,} entries and exhausts host RAM during assembly. "
+            "Raise prune_threshold or lower top_k_per_column."
+        ) from exc
+    return out, ""
 
 
 # ---------------------------------------------------------------------------
@@ -1592,6 +2054,351 @@ def _prune_gpu(
                 arr.gpudata.free()
             except Exception:                           # noqa: BLE001
                 pass
+
+
+# ---------------------------------------------------------------------------
+# Out-of-core Stage D: column-tiled fused expansion + per-column top-k
+# ---------------------------------------------------------------------------
+
+# Per-tile output-buffer cap (entries) for the fused path.  Smaller than the
+# pure-SpGEMM tiling because each tile is downloaded to the host and top-k'd
+# there; a large tile would spike host RAM during the numpy sort.  ~32M
+# entries ~= 0.38 GB download + sort transients well under the host budget.
+_FUSED_TILE_MAX_ENTRIES: int = 32 << 20
+
+
+def _ooc_expansion_needed(M_csr: sp.csr_matrix, top_k: int) -> bool:
+    """Decide whether the expansion step must run out-of-core.
+
+    Returns True when the estimated (pre-top-k) ``M @ M`` product would exceed
+    either the free-VRAM budget or the available-host-RAM budget — i.e. when
+    the single-shot / row-tiled paths would OOM or trip the host guard.  In
+    that case the fused column-tiled :func:`_expand_topk_ooc` is used, which
+    only ever holds ``n * top_k`` survivors on the host.
+    """
+    if not PYCUDA_AVAILABLE or top_k <= 0:
+        return False
+    est = _estimate_spgemm_output_size(M_csr)
+    try:
+        free_vram, _ = cuda.mem_get_info()
+    except Exception:                                       # noqa: BLE001
+        free_vram = 1 << 30
+    vram_cap = int(free_vram * VRAM_BUDGET_FRACTION) // COO_BYTES_PER_ENTRY
+    host_cap = int(_host_available_bytes() * HOST_RAM_BUDGET_FRACTION
+                   / _HOST_PEAK_BYTES_PER_ENTRY)
+    return est > vram_cap or est > host_cap
+
+
+def _host_topk_per_row(
+    rows: np.ndarray,
+    cols: np.ndarray,
+    vals: np.ndarray,
+    top_k: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Keep the ``top_k`` largest entries per ``row`` (ties: smaller ``col``).
+
+    Replicates ``topk_column_prune`` semantics (value desc, index asc) but on
+    the host, applied to one output-row tile of ``C^T`` (= one column block of
+    ``C``).  Rows with ``<= top_k`` entries are kept in full.
+    """
+    if rows.size == 0 or top_k <= 0:
+        return rows, cols, vals
+    # Primary row asc, secondary value desc, tertiary col asc — matches the
+    # kernel's `u > v || (u == v && j < i)` ranking (j<i == row-index asc,
+    # which in C^T space is the col index).
+    order = np.lexsort((cols, -vals, rows))
+    r = rows[order]
+    change = np.empty(r.size, dtype=bool)
+    change[0] = True
+    np.not_equal(r[1:], r[:-1], out=change[1:])
+    grp_start = np.flatnonzero(change)
+    grp_id = np.cumsum(change) - 1
+    within = np.arange(r.size) - grp_start[grp_id]
+    keep = within < top_k
+    sel = order[keep]
+    return rows[sel], cols[sel], vals[sel]
+
+
+def _expand_topk_ooc(
+    M_csr: sp.csr_matrix,
+    kernels: dict[str, Any],
+    block_size: int,
+    stream_compute,
+    stream_transfer,
+    shared_mem_per_block: int,
+    prune_threshold: float,
+    top_k: int,
+) -> sp.csr_matrix:
+    """Fused, host-RAM-bounded ``C = prune(top_k, M @ M)``.
+
+    Equivalent to ``_prune_gpu(_spgemm_gpu(M), prune_threshold, top_k)`` but
+    without ever materialising the full (pre-top-k) product on the host.
+
+    Method
+    ------
+    ``C = M @ M`` so ``C^T = M^T @ M^T``.  We compute ``C^T`` row by row in
+    tiles (a row of ``C^T`` is a *complete* column of ``C``), download each
+    tile's threshold-pruned entries, apply per-row top-k on the host (== the
+    per-column top-k that ``_prune_gpu`` does), and accumulate only the
+    survivors.  Peak host RAM is therefore ``one tile download + n*top_k
+    survivors`` instead of the whole product — the change that lets graphs
+    whose full product exceeds host RAM still run.  The input CSR/CSC of
+    ``M^T`` stay resident on the GPU across all tiles.
+
+    Raises
+    ------
+    MemoryError
+        If a single output row overflows the per-tile VRAM budget even at one
+        row per tile, or if the survivor set exceeds the host-RAM budget.
+    """
+    n   = int(M_csr.shape[0])
+    nnz = int(M_csr.nnz)
+    if nnz == 0 or top_k <= 0:
+        # Degenerate: nothing to fuse — defer to the plain pruned SpGEMM.
+        C, _ = _spgemm_gpu(
+            M_csr, kernels, block_size, stream_compute, stream_transfer,
+            shared_mem_per_block, prune_threshold,
+        )
+        return _prune_gpu(C, kernels, prune_threshold, top_k, block_size,
+                          stream_compute, stream_transfer)
+
+    # M^T in CSR == transpose; its rows are the columns of M.  Squaring it
+    # yields C^T, whose rows are the columns of C.
+    Mt = M_csr.transpose().tocsr()
+    Mt.sort_indices()
+    h_row_ptr = np.ascontiguousarray(Mt.indptr,  dtype=np.int32)
+    h_col_idx = np.ascontiguousarray(Mt.indices, dtype=np.int32)
+    h_values  = np.ascontiguousarray(Mt.data,    dtype=np.float32)
+
+    heavy, medium, light = _classify_rows_by_degree(h_row_ptr)
+    heavy_s  = np.sort(heavy)  if heavy.size  else heavy
+    medium_s = np.sort(medium) if medium.size else medium
+    light_s  = np.sort(light)  if light.size  else light
+
+    k_hash  = kernels["spgemm_hash"]
+    k_inner = kernels["spgemm"]
+
+    resident: list = []
+
+    def _alloc(shape, dtype, bucket):
+        ga = gpuarray.empty(shape, dtype=dtype)
+        bucket.append(ga)
+        return ga
+
+    def _free(bucket):
+        for arr in bucket:
+            try:
+                arr.gpudata.free()
+            except Exception:                           # noqa: BLE001
+                pass
+        bucket.clear()
+
+    # Accumulated survivors, stored in C-space (row = C row, col = C col).
+    acc_rows: list[np.ndarray] = []
+    acc_cols: list[np.ndarray] = []
+    acc_vals: list[np.ndarray] = []
+    acc_entries = 0
+    host_entry_budget = int(
+        _host_available_bytes() * HOST_RAM_BUDGET_FRACTION
+        / _HOST_PEAK_BYTES_PER_ENTRY
+    )
+
+    try:
+        d_row_ptr = _alloc(h_row_ptr.shape, np.int32,   resident)
+        d_col_idx = _alloc(h_col_idx.shape, np.int32,   resident)
+        d_values  = _alloc(h_values.shape,  np.float32, resident)
+        cuda.memcpy_htod_async(d_row_ptr.gpudata, h_row_ptr, stream_transfer)
+        cuda.memcpy_htod_async(d_col_idx.gpudata, h_col_idx, stream_transfer)
+        cuda.memcpy_htod_async(d_values.gpudata,  h_values,  stream_transfer)
+
+        d_B_col_ptr = d_B_row_idx = d_B_values = None
+        if heavy.size > 0:
+            # Inner product for heavy rows of M^T needs CSC of M^T == CSR of M.
+            h_B_col_ptr = np.ascontiguousarray(M_csr.indptr,  dtype=np.int32)
+            h_B_row_idx = np.ascontiguousarray(M_csr.indices, dtype=np.int32)
+            h_B_values  = np.ascontiguousarray(M_csr.data,    dtype=np.float32)
+            d_B_col_ptr = _alloc(h_B_col_ptr.shape, np.int32,   resident)
+            d_B_row_idx = _alloc(h_B_row_idx.shape, np.int32,   resident)
+            d_B_values  = _alloc(h_B_values.shape,  np.float32, resident)
+            cuda.memcpy_htod_async(d_B_col_ptr.gpudata, h_B_col_ptr,
+                                    stream_transfer)
+            cuda.memcpy_htod_async(d_B_row_idx.gpudata, h_B_row_idx,
+                                    stream_transfer)
+            cuda.memcpy_htod_async(d_B_values.gpudata,  h_B_values,
+                                    stream_transfer)
+        transfer_done = cuda.Event()
+        transfer_done.record(stream_transfer)
+        stream_compute.wait_for_event(transfer_done)
+
+        max_hash_entries = max(64, shared_mem_per_block // HASH_ENTRY_BYTES)
+        avg_row_len_full = max(1.0, nnz / max(1, n))
+        hash_size_medium = _estimate_hash_size(
+            avg_row_len_full, avg_row_len_full, max_hash_entries,
+        )
+        hash_size_light  = max(
+            64,
+            min(_next_pow2(int(avg_row_len_full * avg_row_len_full * 2)),
+                max_hash_entries // 2),
+        )
+
+        try:
+            free_after, _ = cuda.mem_get_info()
+        except Exception:                               # noqa: BLE001
+            free_after = 1 << 30
+        tile_budget_entries = int(min(
+            _FUSED_TILE_MAX_ENTRIES,
+            max(1 << 20, int(free_after * 0.5) // COO_BYTES_PER_ENTRY),
+        ))
+        per_row_est = max(
+            1, int(math.ceil(avg_row_len_full * avg_row_len_full * 1.5))
+        )
+        rows_per_tile = max(1, min(n, tile_budget_entries // per_row_est))
+        if _FORCE_TILE_ROWS is not None:
+            rows_per_tile = max(1, min(rows_per_tile, int(_FORCE_TILE_ROWS)))
+
+        d_C_nnz = _alloc((1,), np.int32, resident)
+
+        def _tile_rows(sorted_rows, r0, r1):
+            if sorted_rows.size == 0:
+                return sorted_rows
+            lo = int(np.searchsorted(sorted_rows, r0, side="left"))
+            hi = int(np.searchsorted(sorted_rows, r1, side="left"))
+            return sorted_rows[lo:hi]
+
+        r0 = 0
+        while r0 < n:
+            rpt = rows_per_tile
+            while True:
+                r1 = min(n, r0 + rpt)
+                m_tile = _tile_rows(medium_s, r0, r1)
+                l_tile = _tile_rows(light_s,  r0, r1)
+                h_tile = _tile_rows(heavy_s,  r0, r1)
+                cap = int(min(tile_budget_entries,
+                              max(1024, (r1 - r0) * per_row_est * 2)))
+
+                tile_bufs: list = []
+                try:
+                    d_C_row = _alloc((cap,), np.int32,   tile_bufs)
+                    d_C_col = _alloc((cap,), np.int32,   tile_bufs)
+                    d_C_val = _alloc((cap,), np.float32, tile_bufs)
+                except (MemoryError, cuda.MemoryError):  # type: ignore[attr-defined]
+                    _free(tile_bufs)
+                    if rpt <= 1:
+                        raise MemoryError(
+                            "MCL gpu: a single fused SpGEMM output row exceeds "
+                            "the per-tile VRAM budget. Raise prune_threshold "
+                            "or lower top_k_per_column."
+                        )
+                    rpt = max(1, rpt // 2)
+                    continue
+
+                cuda.memset_d32(d_C_nnz.gpudata, 0, 1)
+
+                if m_tile.size > 0:
+                    d_list = _alloc(m_tile.shape, np.int32, tile_bufs)
+                    cuda.memcpy_htod_async(d_list.gpudata,
+                                            np.ascontiguousarray(m_tile),
+                                            stream_transfer)
+                    ev = cuda.Event(); ev.record(stream_transfer)
+                    stream_compute.wait_for_event(ev)
+                    k_hash(
+                        d_row_ptr, d_col_idx, d_values,
+                        d_row_ptr, d_col_idx, d_values,
+                        d_list, d_C_row, d_C_col, d_C_val, d_C_nnz,
+                        np.int32(m_tile.size), np.int32(hash_size_medium),
+                        np.int32(cap), np.float32(prune_threshold),
+                        block=(block_size, 1, 1), grid=(int(m_tile.size), 1, 1),
+                        shared=hash_size_medium * HASH_ENTRY_BYTES,
+                        stream=stream_compute,
+                    )
+                if l_tile.size > 0:
+                    d_list = _alloc(l_tile.shape, np.int32, tile_bufs)
+                    cuda.memcpy_htod_async(d_list.gpudata,
+                                            np.ascontiguousarray(l_tile),
+                                            stream_transfer)
+                    ev = cuda.Event(); ev.record(stream_transfer)
+                    stream_compute.wait_for_event(ev)
+                    k_hash(
+                        d_row_ptr, d_col_idx, d_values,
+                        d_row_ptr, d_col_idx, d_values,
+                        d_list, d_C_row, d_C_col, d_C_val, d_C_nnz,
+                        np.int32(l_tile.size), np.int32(hash_size_light),
+                        np.int32(cap), np.float32(prune_threshold),
+                        block=(block_size, 1, 1), grid=(int(l_tile.size), 1, 1),
+                        shared=hash_size_light * HASH_ENTRY_BYTES,
+                        stream=stream_compute,
+                    )
+                if h_tile.size > 0:
+                    d_list = _alloc(h_tile.shape, np.int32, tile_bufs)
+                    cuda.memcpy_htod_async(d_list.gpudata,
+                                            np.ascontiguousarray(h_tile),
+                                            stream_transfer)
+                    ev = cuda.Event(); ev.record(stream_transfer)
+                    stream_compute.wait_for_event(ev)
+                    k_inner(
+                        d_row_ptr, d_col_idx, d_values,
+                        d_B_col_ptr, d_B_row_idx, d_B_values,
+                        d_list, d_C_row, d_C_col, d_C_val, d_C_nnz,
+                        np.int32(h_tile.size), np.int32(n),
+                        np.int32(cap), np.float32(prune_threshold),
+                        block=(block_size, 1, 1), grid=(int(h_tile.size), 1, 1),
+                        stream=stream_compute,
+                    )
+
+                stream_compute.synchronize()
+                written = int(d_C_nnz.get()[0])
+                if written > cap:
+                    _free(tile_bufs)
+                    if rpt <= 1:
+                        raise MemoryError(
+                            "MCL gpu: a single fused SpGEMM output row exceeds "
+                            "the per-tile VRAM budget. Raise prune_threshold "
+                            "or lower top_k_per_column."
+                        )
+                    rpt = max(1, rpt // 2)
+                    continue
+
+                if written > 0:
+                    ct_row = d_C_row.get()[:written]   # = column index of C
+                    ct_col = d_C_col.get()[:written]   # = row index of C
+                    ct_val = d_C_val.get()[:written]
+                    # Per-column-of-C top-k == per-row-of-C^T top-k.
+                    ct_row, ct_col, ct_val = _host_topk_per_row(
+                        ct_row, ct_col, ct_val, top_k,
+                    )
+                    acc_entries += ct_row.size
+                    if acc_entries > host_entry_budget:
+                        _free(tile_bufs)
+                        acc_mb = (acc_entries * _HOST_PEAK_BYTES_PER_ENTRY
+                                  / (1024 * 1024))
+                        raise MemoryError(
+                            "MCL gpu: the top-k-pruned product still exceeds "
+                            f"the host-RAM budget (~{acc_mb:.0f} MB). Lower "
+                            "top_k_per_column or use a machine with more RAM."
+                        )
+                    # Store in C-space: swap (C row = ct_col, C col = ct_row).
+                    acc_rows.append(ct_col.copy())
+                    acc_cols.append(ct_row.copy())
+                    acc_vals.append(ct_val.copy())
+                _free(tile_bufs)
+                break
+
+            r0 = r1
+
+    finally:
+        _free(resident)
+
+    if not acc_rows:
+        return sp.csr_matrix((n, n), dtype=np.float32)
+
+    rows_host = np.concatenate(acc_rows)
+    cols_host = np.concatenate(acc_cols)
+    vals_host = np.concatenate(acc_vals)
+    out = sp.coo_matrix(
+        (vals_host, (rows_host, cols_host)), shape=(n, n), dtype=np.float32,
+    ).tocsr()
+    out.sum_duplicates()
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1845,14 +2652,20 @@ def mcl_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
             raise ValueError("Empty graph")
 
         # Out-of-core Stage A: shrink top_k so the pruned working set fits
-        # free VRAM.  On multi-million-node graphs the default top_k makes the
-        # SpGEMM input (CSR + CSC) exceed VRAM before the product is even
-        # computed; capping it here is what lets those graphs run at all.
+        # BOTH free VRAM and available host RAM.  On multi-million-node graphs
+        # the default top_k makes the SpGEMM input (CSR + CSC) exceed VRAM
+        # before the product is even computed, and — for the out-of-core fused
+        # expansion — the n*top_k survivors exceed host RAM during assembly.
+        # Capping top_k to whichever budget binds is what lets those graphs run
+        # at all (smaller top_k => larger n fits).
         try:
             _free_b0, _ = cuda.mem_get_info()
         except Exception:                               # noqa: BLE001
             _free_b0 = 1 << 30
-        top_k, top_k_note = _adaptive_top_k(n_original, top_k, _free_b0)
+        top_k, top_k_note = _adaptive_top_k(
+            n_original, top_k, _free_b0,
+            host_free_bytes=_host_available_bytes(),
+        )
         if top_k_note:
             logging.info("mcl_gpu: %s", top_k_note)
 
@@ -1864,6 +2677,29 @@ def mcl_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
             )
         except Exception:                               # noqa: BLE001
             shared_mem_per_block = DEFAULT_SHARED_MEM_PER_BLOCK
+
+        # ---- Pre-flight preprocessing host-RAM guard ------------------
+        # The symmetrise + column-stochastic step is an in-core host
+        # operation on the RAW graph and is NOT bounded by the out-of-core
+        # top_k machinery; on a small-host machine it is the spike that
+        # precedes the bounded iterate.  Fail fast (rather than drive the
+        # host into the OOM killer) when its estimated peak won't fit.
+        raw_nnz  = int(graph_csr.nnz)
+        sym_nnz  = 2 * raw_nnz + n_original          # A + Aᵀ + I upper bound
+        preproc_peak = sym_nnz * _PREPROC_PEAK_BYTES_PER_ENTRY
+        host_avail   = _host_available_bytes()
+        preproc_budget = int(host_avail * _PREPROC_HOST_FRACTION)
+        if preproc_peak > preproc_budget:
+            raise MemoryError(
+                "MCL gpu: symmetrise + column-stochastic preprocessing of this "
+                f"graph needs ~{preproc_peak/1e9:.1f} GB host RAM (est. "
+                f"{sym_nnz:,} symmetrised entries), exceeding the "
+                f"{preproc_budget/1e9:.1f} GB budget "
+                f"({_PREPROC_HOST_FRACTION:.0%} of {host_avail/1e9:.1f} GB "
+                "available). MCL's out-of-core iterate is host-RAM bounded, but "
+                "building A+Aᵀ on the raw graph is not — use a machine with "
+                "more RAM for a graph this large."
+            )
 
         # ---- CPU preprocessing ----------------------------------------
         A_sym, sym_note = _symmetrize_mcl(graph_csr, network_type)
@@ -1926,26 +2762,45 @@ def mcl_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
             # (Fix 4 — dynamic per-iteration sizing via _spgemm_gpu).
             # O1: threshold pruning is fused into the SpGEMM hash flush,
             # so iter_threshold directly shrinks the output buffer.
-            for _ in range(expansion - 1):
-                M_new, ow = _spgemm_gpu(
+            #
+            # Out-of-core Stage D: when the (pre-top-k) product would exceed
+            # the VRAM *or* host-RAM budget, run the fused column-tiled path
+            # that never materialises the full product — it accumulates only
+            # the n*top_k top-k survivors.  This is only valid for the single-
+            # square case (expansion == 2); chained squares (expansion > 2)
+            # must not be pruned between squares, so they keep the in-core
+            # path (and fail cleanly via the guards if they overflow).
+            if expansion == 2 and (_FORCE_OOC
+                                   or _ooc_expansion_needed(M_new, top_k)):
+                M_new = _expand_topk_ooc(
                     M_new, kernels, block_size,
                     stream_compute=stream_compute,
                     stream_transfer=stream_transfer,
                     shared_mem_per_block=shared_mem_per_block,
                     prune_threshold=iter_threshold,
+                    top_k=top_k,
                 )
-                if ow:
-                    overflow_warning = ow   # keep last non-empty message
+            else:
+                for _ in range(expansion - 1):
+                    M_new, ow = _spgemm_gpu(
+                        M_new, kernels, block_size,
+                        stream_compute=stream_compute,
+                        stream_transfer=stream_transfer,
+                        shared_mem_per_block=shared_mem_per_block,
+                        prune_threshold=iter_threshold,
+                    )
+                    if ow:
+                        overflow_warning = ow   # keep last non-empty message
 
-            # ---- Prune (threshold + top-k) ----
-            M_new = _prune_gpu(
-                M_new, kernels,
-                prune_threshold=iter_threshold,
-                top_k=top_k,
-                block_size=block_size,
-                stream_compute=stream_compute,
-                stream_transfer=stream_transfer,
-            )
+                # ---- Prune (threshold + top-k) ----
+                M_new = _prune_gpu(
+                    M_new, kernels,
+                    prune_threshold=iter_threshold,
+                    top_k=top_k,
+                    block_size=block_size,
+                    stream_compute=stream_compute,
+                    stream_transfer=stream_transfer,
+                )
 
             # ---- Inflate + column-renormalise ----
             if M_new.nnz > 0:

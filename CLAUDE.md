@@ -859,36 +859,80 @@ Target: adaptive (RTX 20-series Turing by default), `BLOCK_SIZE = 256`,
   `TOP_K_BITONIC_THRESHOLD = 256`,
   `HEAVY_ROW_THRESH = 256`, `LIGHT_ROW_THRESH = 32`.
 
-### VRAM ceiling and fast-fail policy
+### Out-of-core execution and memory ceiling
 
 MCL is the most memory-intensive of the six algorithms: expansion squares
 the matrix (`M @ M`) and the fill-in of the *product* (not the input
-graph) is the binding VRAM constraint.  Two adaptive mechanisms push the
-ceiling up, then MCL fails cleanly:
+graph) is the binding constraint.  MCL now runs **out-of-core** so this
+fill-in no longer OOMs, and the remaining limits fail **cleanly** (a clear
+`MemoryError`, never a silent truncation and never an OOM-killer crash).
 
-- `_adaptive_top_k(n, top_k, free_vram)` caps `top_k` so the pruned
-  working set (`~n * top_k` entries, held as CSR + CSC ≈ 16 B/entry) fits
-  ~35 % of free VRAM.  Bounds the SpGEMM **input**.  Only binds on graphs
-  too large for the user's `top_k`; realistic biological networks pass
-  through unchanged.  Logged and surfaced in `result["note"]`.
-- `_adaptive_prune_threshold` raises the threshold under pressure to
-  shrink the SpGEMM **output**.
+**Out-of-core iterate (host-RAM-bounded).**  When the estimated pre-top-k
+product would exceed the free-VRAM **or** available-host-RAM budget
+(`_ooc_expansion_needed`), the expansion+prune runs via `_expand_topk_ooc`
+instead of `_spgemm_gpu` + `_prune_gpu`:
+- It computes `C^T = M^T @ M^T` in **row tiles** — a row of `C^T` is a
+  COMPLETE column of `C`, so per-column top-k is applied per tile on the
+  host and only the `n * top_k` survivors accumulate.  The full pre-top-k
+  product is never materialised, on GPU or host.  Reuses the existing
+  hash / inner-product kernels unchanged.
+- Uses **exact** per-column top-k (value desc, index asc).  This differs
+  marginally from the in-core bitonic kernel's tie-inclusive behaviour on
+  hub columns (it keeps ties at the k-th value, i.e. slightly > `top_k`);
+  on genuinely clusterable graphs the two agree exactly (verified ARI 1.0
+  on planted-partition graphs; in-core-vs-in-core self-variance is the
+  same order as in-core-vs-ooc on hub-heavy `barabasi_albert`).
+- A pure-SpGEMM **row-tiled** fallback (`_spgemm_gpu_tiled`) bounds only the
+  GPU output transient; used when top-k is not fused (e.g. `expansion > 2`)
+  or when the single-shot output buffer alloc fails.  Numerically identical
+  to the single-shot path (byte-identical product; output rows are
+  independent).
 
-- **No silent truncation.**  When the product still exceeds the VRAM
-  budget, `_spgemm_gpu` raises a clear `MemoryError` (previously it kept
-  the first `capacity` entries and continued with "approximate results" —
-  removed as a correctness hazard).  `cuMemAlloc` failures are re-raised
-  from `mcl_gpu` with concrete ceiling guidance rather than the cryptic
-  driver message.
+**Adaptive `top_k` (now VRAM- *and* host-aware).**
+`_adaptive_top_k(n, top_k, free_vram, host_free_bytes)` caps `top_k` so the
+`n * top_k` working set fits BOTH ~35 % of free VRAM (SpGEMM input, CSR+CSC
+≈ 16 B/entry) AND ~30 % of available host RAM (the out-of-core survivor
+accumulation, ≈ 30 B/entry peak).  Shrinking `top_k` is precisely what lets
+progressively larger graphs run — bigger `n` fits by keeping fewer
+survivors per column.  Only binds on graphs too large for the user's
+`top_k`; realistic biological networks pass through unchanged.  Logged and
+surfaced in `result["note"]`.  `_adaptive_prune_threshold` still raises the
+threshold under pressure to shrink the SpGEMM output.
 
-- **Measured ceiling** on a 6 GB RTX 2060 (grn/undirected, ~6 avg degree):
-  ~1M nodes (`barabasi_albert`), ~1.6M (`erdos_renyi`), ~3.3M
-  (`watts_strogatz`).  The limit is degree-variance dependent (ER and WS
-  at equal n/m differ: ER's Poisson variance yields more fill-in).  Full
-  out-of-core MCL (host-streamed SpGEMM+prune+inflate) is future work; the
-  SpGEMM output's scatter-heavy access makes naive managed-memory spill
-  impractically slow, so it is a substantial undertaking, not a quick
-  tiling change.
+**Pre-flight preprocessing guard.**  The one-time CPU preprocessing
+(`_symmetrize_mcl` builds `A + Aᵀ + I`; `_to_column_stochastic` casts the
+whole matrix to float64) runs on the RAW graph and is NOT bounded by the
+out-of-core `top_k` machinery — for a many-million-edge graph its transient
+copies are the host-RAM spike that PRECEDES the bounded iterate.  `mcl_gpu`
+estimates that peak (`~symmetrised_nnz * 60 B`) and refuses fast (before any
+allocation) when it would exceed ~55 % of available host RAM.
+
+**No silent truncation** (unchanged): the removed "approximate results"
+truncation stays removed.
+
+- **Measured on a 6 GB RTX 2060 with ~7 GB host RAM** (grn/undirected, ~6
+  avg degree, `erdos_renyi`): 2M and 3M nodes now run to completion (both
+  OOM-crashed before out-of-core, at ~2.5 GB peak with `top_k` auto-capped
+  to 20 / 15); 8M is refused cleanly in seconds by the preprocessing guard.
+  The demonstrated ceiling here is ~4M ER nodes, set by **preprocessing
+  host RAM** (no longer VRAM), and scales up with more host RAM.  (Old
+  in-core VRAM ceiling: ~1M `barabasi_albert` / ~1.6M `erdos_renyi` / ~3.3M
+  `watts_strogatz`.)
+- **Remaining work / rejected alternatives.**  Bounding the preprocessing
+  itself (streamed symmetrise/normalise) is the next out-of-core step.
+  Managed-memory spill was evaluated and **rejected**: once the iterate is
+  bounded, host RAM (not VRAM) is the wall, and the SpGEMM's scatter-heavy
+  access makes UM paging impractically slow.
+- **Out-of-core overhead**: the fused path adds a per-iteration host
+  transpose + per-tile host top-k sort, so it is slower per iteration than
+  the in-core path (ER 3M: ~250 s GPU time over 6 iters).  It is used only
+  when the in-core path would OOM, so "slower but runs" replaces "crash".
+
+**Test seams** (all default to off/None in production; used by the
+out-of-core validation harness): `_FORCE_TILE_ROWS` caps rows-per-tile,
+`_FORCE_OOC` forces the fused path on small graphs, and the
+`MCL_HOST_AVAIL_BYTES` env var pins the effective host budget (e.g. below a
+cgroup `MemoryMax`).
 
 ---
 
