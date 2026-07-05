@@ -287,13 +287,26 @@ def load_trrust(path: Optional[Path] = None) -> Optional[ReferenceSet]:
 # BioGRID  (PPI)
 # ---------------------------------------------------------------------------
 
-def load_biogrid(path: Optional[Path] = None) -> Optional[ReferenceSet]:
+def load_biogrid(path: Optional[Path] = None,
+                 organism_id: str = "9606") -> Optional[ReferenceSet]:
     """
-    Load a BioGRID-style PPI file.
+    Load a BioGRID tab3 PPI file (streaming, human-filtered by default).
 
-    Accepts both BioGRID-tab2/tab3 and a simple two-column edge list.
-    For BioGRID files the symbol columns are
-    'Official Symbol Interactor A/B' (tab2/3).
+    BioGRID's ``.tab3.txt`` is a 37-column TSV whose **header line begins
+    with '#'** (``#BioGRID Interaction ID	...``).  The generic table reader
+    discards ``#`` lines and mis-detects the delimiter on this multi-GB
+    file, so BioGRID gets a dedicated parser here:
+
+      * streamed line-by-line (never loads the whole 1.5 GB file into RAM),
+      * columns located from the (``#``-stripped) header by name, with the
+        documented tab3 indices as fallback — symbols at 7 / 8, organism
+        ids at 15 / 16,
+      * filtered to ``organism_id`` (default human 9606) on BOTH interactors,
+      * BioGRID's ``"-"`` missing-symbol placeholder skipped.
+
+    Also accepts a simple pre-extracted two-column symbol edge list (no
+    ``#`` header): detected when the header has < 9 columns, in which case
+    the first two columns are used.
     """
     p = _find_file("biogrid", path)
     if p is None:
@@ -301,40 +314,49 @@ def load_biogrid(path: Optional[Path] = None) -> Optional[ReferenceSet]:
         return None
 
     rs = ReferenceSet(name="BioGRID", network_type="ppi", source_path=p)
-    header_consumed = False
-    for row in _iter_table(p):
-        if not row:
-            continue
-        a = (row.get("Official Symbol Interactor A")
-             or row.get("Symbol A") or row.get("symbol_a")
-             or row.get("interactor_a") or row.get("source")
-             or row.get("col0"))
-        b = (row.get("Official Symbol Interactor B")
-             or row.get("Symbol B") or row.get("symbol_b")
-             or row.get("interactor_b") or row.get("target")
-             or row.get("col1"))
-        if not a or not b:
-            a, b = _first_two_values(row)
-        if not a or not b:
-            continue
-        a, b = _norm(str(a)), _norm(str(b))
-        if not a or not b or a == b:
-            continue
-        if not header_consumed:
-            header_consumed = True
-            # Skip an obvious header row
-            if a in {"SOURCE", "PROTEIN1", "SYMBOL A", "INTERACTOR_A"} or \
-               b in {"TARGET", "PROTEIN2", "SYMBOL B", "INTERACTOR_B"}:
-                continue
-        rs.sources.add(a)
-        rs.sources.add(b)   # PPI is undirected — both ends are "hubs"
-        rs.targets.add(a)
-        rs.targets.add(b)
-        rs.edges.add(frozenset({a, b}))
-        rs.n_records += 1
+    try:
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+            header = f.readline().lstrip("#").rstrip("\n\r").split("\t")
 
-    _LOG.info("BioGRID loaded: %d edges, %d nodes",
-              rs.n_records, len(rs.sources))
+            def _col(name: str, default: int) -> int:
+                try:
+                    return header.index(name)
+                except ValueError:
+                    return default
+
+            tab3 = len(header) >= 9
+            if tab3:
+                ia = _col("Official Symbol Interactor A", 7)
+                ib = _col("Official Symbol Interactor B", 8)
+                oa = _col("Organism ID Interactor A", 15)
+                ob = _col("Organism ID Interactor B", 16)
+                need = max(ia, ib, oa, ob)
+            else:
+                ia, ib, oa, ob, need = 0, 1, -1, -1, 1
+
+            for line in f:
+                cols = line.rstrip("\n\r").split("\t")
+                if len(cols) <= need:
+                    continue
+                # Human-only (skip when organism columns present and mismatch)
+                if oa >= 0 and (cols[oa].strip() != organism_id
+                                or cols[ob].strip() != organism_id):
+                    continue
+                a, b = _norm(cols[ia]), _norm(cols[ib])
+                if not a or not b or a == b or a == "-" or b == "-":
+                    continue
+                rs.sources.add(a)
+                rs.sources.add(b)   # PPI undirected — both ends are hubs
+                rs.targets.add(a)
+                rs.targets.add(b)
+                rs.edges.add(frozenset({a, b}))
+                rs.n_records += 1
+    except Exception as exc:
+        _LOG.warning("Failed to read BioGRID %s: %s", p, exc)
+        return None
+
+    _LOG.info("BioGRID loaded (organism %s): %d edges, %d proteins",
+              organism_id, rs.n_records, len(rs.sources))
     return rs if rs.n_records > 0 else None
 
 
