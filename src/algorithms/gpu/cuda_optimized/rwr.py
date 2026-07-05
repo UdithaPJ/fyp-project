@@ -623,8 +623,13 @@ def _get_kernels() -> dict[str, Any]:
                 "install pycuda and ensure NVCC is on PATH."
             )
         arch_flag = _detect_arch_flag()
+        # Force ASCII: PyCUDA writes the source to a temp .cu with the locale
+        # codec, which raises on non-ASCII (e.g. an em-dash / arrow in a
+        # comment) under a C/ASCII locale.  Comments only — never changes
+        # semantics.
+        _src_ascii = KERNEL_SOURCE.encode("ascii", "replace").decode("ascii")
         mod = SourceModule(
-            KERNEL_SOURCE,
+            _src_ascii,
             options=[arch_flag, "-O3"],
             no_extern_c=True,
         )
@@ -895,8 +900,11 @@ def _get_chunk_kernel() -> Any:
         if not PYCUDA_AVAILABLE:
             raise RuntimeError("PyCUDA required.")
         arch_flag = _detect_arch_flag()
+        # Force ASCII (see _get_kernels above) — protects the chunk-kernel
+        # source from non-ASCII bytes under a C/ASCII locale.
+        _src_ascii = _CHUNK_KERNEL_SOURCE.encode("ascii", "replace").decode("ascii")
         mod = SourceModule(
-            _CHUNK_KERNEL_SOURCE,
+            _src_ascii,
             options=[arch_flag, "-O3"],
             no_extern_c=True,
         )

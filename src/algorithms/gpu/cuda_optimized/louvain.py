@@ -669,8 +669,12 @@ def _get_kernels() -> dict[str, Any]:
         if cc_major < 7:
             options.append("-DDISABLE_COOPERATIVE_GROUPS")
 
+        # Force ASCII: PyCUDA writes the source to a temp .cu with the locale
+        # codec, which raises on non-ASCII (e.g. an em-dash in a comment)
+        # under a C/ASCII locale.  Comments only — never changes semantics.
+        _src_ascii = KERNEL_SOURCE.encode("ascii", "replace").decode("ascii")
         mod = SourceModule(
-            KERNEL_SOURCE,
+            _src_ascii,
             options=options,
             no_extern_c=True,
         )

@@ -654,7 +654,11 @@ def _get_kernels() -> dict[str, Any]:
         options = [arch_flag, "-O3"]
         if cc_major >= 8:
             options.append("-use_fast_math")
-        mod = SourceModule(_BFS_CU_SRC, options=options, no_extern_c=True)
+        # Force ASCII: PyCUDA writes the source to a temp .cu with the locale
+        # codec, which raises on non-ASCII (e.g. an em-dash in a comment)
+        # under a C/ASCII locale.  Comments only — never changes semantics.
+        _src_ascii = _BFS_CU_SRC.encode("ascii", "replace").decode("ascii")
+        mod = SourceModule(_src_ascii, options=options, no_extern_c=True)
         _KERNEL_CACHE[key] = {
             # Opt 8: new sparse kernels
             "push_sparse":      mod.get_function("bfs_frontier_sparse"),

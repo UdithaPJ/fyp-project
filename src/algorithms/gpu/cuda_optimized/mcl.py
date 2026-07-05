@@ -437,7 +437,7 @@ __global__ void spgemm_row_chunk(
                 ++bi;
             }
         }
-        // Threshold pruning fused (O1) — see spgemm_hash_row.
+        // Threshold pruning fused (O1) -- see spgemm_hash_row.
         if (dot >= prune_threshold) {
             const int pos = atomicAdd(C_nnz, 1);
             if (pos < max_C_nnz) {
@@ -875,8 +875,15 @@ def _get_kernels() -> dict[str, Any]:
                 "install pycuda and ensure NVCC is on PATH."
             )
         arch_flag = _detect_arch_flag()
+        # PyCUDA writes the kernel source to a temp .cu file using the
+        # process locale's default codec.  Under an ASCII / C locale (common
+        # on Linux benchmark boxes) any non-ASCII byte in the source — e.g.
+        # an em-dash in a comment — raises UnicodeEncodeError before nvcc
+        # ever runs.  Force the source to pure ASCII (comments only ever hold
+        # non-ASCII, so this never changes kernel semantics).
+        kernel_source_ascii = KERNEL_SOURCE.encode("ascii", "replace").decode("ascii")
         mod = SourceModule(
-            KERNEL_SOURCE,
+            kernel_source_ascii,
             options=[arch_flag, "-O3"],
             no_extern_c=True,
         )
