@@ -173,6 +173,7 @@ class HoldoutValidator:
         test_fraction: float = 0.2,
         seed: int = 42,
         max_eval: int = 5000,
+        max_directed_seeds: int = 100,
     ) -> None:
         _root = Path(__file__).resolve().parents[2]
         self.output_dir = Path(output_dir) if output_dir else (
@@ -184,6 +185,11 @@ class HoldoutValidator:
         self.test_fraction = float(test_fraction)
         self.seed = int(seed)
         self.max_eval = int(max_eval)
+        # For RWR on DIRECTED graphs (grn/mirna) the undirected score-product
+        # metric is invalid (RWR mass concentrates on sink targets).  Instead
+        # we seed RWR at each held-out edge's SOURCE and check whether the
+        # target ranks high — capped at this many source nodes for speed.
+        self.max_directed_seeds = int(max_directed_seeds)
         self._datasets: list[_HoldoutDataset] = []
         self.records: list[HoldoutRecord] = []
 
@@ -334,6 +340,12 @@ class HoldoutValidator:
                             algo, ds, train_csr, test_edges, negatives,
                             train_edges,
                         )
+                    elif algo == "rwr" and ds.network_type in ("grn", "mirna"):
+                        # Direction-aware RWR link prediction for directed nets.
+                        rec = self._eval_ranking_directed_rwr(
+                            ds, train_csr, test_edges, all_edges,
+                            train_edges, rng,
+                        )
                     elif algo in _RANKING_ALGOS:
                         rec = self._eval_ranking(
                             algo, ds, train_csr, test_edges, negatives,
@@ -384,6 +396,77 @@ class HoldoutValidator:
             test_edges=int(test_edges.shape[0]), train_edges=train_edges,
             auroc=_auroc(pos, neg), avg_precision=_average_precision(pos, neg),
             note="link-prediction AUROC (score-product)", status="ok",
+        )
+
+    def _eval_ranking_directed_rwr(
+        self, ds: _HoldoutDataset, train_csr: sp.csr_matrix,
+        test_edges: np.ndarray, all_edges: set, train_edges: int,
+        rng: np.random.Generator,
+    ) -> HoldoutRecord:
+        """Direction-aware RWR link prediction for directed graphs.
+
+        RWR is a "propagate from a seed" algorithm, so the honest test on a
+        directed network is: seed RWR at each held-out edge's SOURCE and check
+        whether that source's held-out TARGETS score higher than random
+        non-targets.  Positives = RWR(source)[held-out target]; negatives =
+        RWR(source)[random node that is NOT an out-neighbour of source].  This
+        respects edge direction, unlike the undirected score-product.
+
+        One RWR run per sampled source node (capped at ``max_directed_seeds``).
+        """
+        n = train_csr.shape[0]
+        # Group held-out edges by source; sample a capped set of sources.
+        sources = np.unique(test_edges[:, 0])
+        if sources.size > self.max_directed_seeds:
+            sources = rng.choice(sources, self.max_directed_seeds, replace=False)
+
+        pos: list[float] = []
+        neg: list[float] = []
+        seeds_used = 0
+        for u in sources:
+            u = int(u)
+            targets = np.unique(test_edges[test_edges[:, 0] == u, 1])
+            if targets.size == 0:
+                continue
+            inner = self._run_cpu("rwr", train_csr, ds.network_type,
+                                  {"rwr": {"seed_nodes": [u]}})
+            s = np.asarray(inner.get("scores", []), dtype=np.float64)
+            if s.size != n:
+                continue
+            seeds_used += 1
+            # out-neighbours of u to EXCLUDE from negatives (train + held-out)
+            excl = {u}
+            excl.update(int(t) for t in targets)
+            row = train_csr.indptr
+            excl.update(int(c) for c in train_csr.indices[row[u]:row[u + 1]])
+            pos.extend(float(s[t]) for t in targets)
+            # one random non-target negative per positive
+            drawn = 0
+            attempts = 0
+            while drawn < targets.size and attempts < targets.size * 30:
+                w = int(rng.integers(0, n))
+                attempts += 1
+                if w in excl:
+                    continue
+                neg.append(float(s[w]))
+                drawn += 1
+
+        pos_a = np.asarray(pos)
+        neg_a = np.asarray(neg)
+        if pos_a.size == 0 or neg_a.size == 0:
+            return HoldoutRecord(
+                algorithm="rwr", dataset=ds.name, network_type=ds.network_type,
+                test_edges=int(test_edges.shape[0]), train_edges=train_edges,
+                note="directed RWR: no evaluable source/target pairs",
+                status="skipped",
+            )
+        return HoldoutRecord(
+            algorithm="rwr", dataset=ds.name, network_type=ds.network_type,
+            test_edges=int(test_edges.shape[0]), train_edges=train_edges,
+            auroc=_auroc(pos_a, neg_a),
+            avg_precision=_average_precision(pos_a, neg_a),
+            note=f"direction-aware RWR link prediction "
+                 f"({seeds_used} seed sources)", status="ok",
         )
 
     def _eval_clustering(
