@@ -656,10 +656,12 @@ class ScalabilityBenchmarker:
         return {
             "scalability_runtime": self._plot_scalability("runtime_s",
                                                           "Runtime (s)",
-                                                          "scalability_runtime.png"),
+                                                          "scalability_runtime.png",
+                                                          y_floor=1e-4),
             "scalability_memory":  self._plot_scalability("peak_mb",
                                                           "Peak memory delta (MB)",
-                                                          "scalability_memory.png"),
+                                                          "scalability_memory.png",
+                                                          y_floor=1e-1),
             "scalability_speedup": self._plot_speedup_curves(),
         }
 
@@ -670,6 +672,7 @@ class ScalabilityBenchmarker:
         metric: str,
         ylabel: str,
         filename: str,
+        y_floor: float = 0.0,
     ) -> Path:
         outpath = self.plots_dir / filename
         algos   = sorted({r.algorithm for r in self.records})
@@ -705,6 +708,11 @@ class ScalabilityBenchmarker:
                     )
                     if pts:
                         xs, ys = zip(*pts)
+                        # Floor non-positive values (peak_mb can be exactly 0)
+                        # so they remain visible at the bottom of the log axis
+                        # instead of being dropped by matplotlib.
+                        if y_floor > 0.0:
+                            ys = tuple(y if y > 0.0 else y_floor for y in ys)
                         ax.plot(xs, ys,
                                 marker=_TYPE_MARKERS.get(gt, "o"),
                                 color=_MODE_COLOURS.get(mode, "#888"),
@@ -718,8 +726,8 @@ class ScalabilityBenchmarker:
                     ax.set_ylabel("")
                 ax.set_xlabel("n nodes", fontsize=7)
                 ax.set_xscale("log")
-                ax.set_yscale("symlog", linthresh=1e-3)
-                ax.grid(linestyle=":", alpha=0.4)
+                _finalize_log_axis(ax)
+                ax.grid(linestyle=":", alpha=0.4, which="both")
                 ax.tick_params(labelsize=7)
 
         # Collect legend handles from the first populated axis
@@ -800,8 +808,8 @@ class ScalabilityBenchmarker:
                     ax.set_ylabel("")
                 ax.set_xlabel("n nodes", fontsize=7)
                 ax.set_xscale("log")
-                ax.set_yscale("symlog", linthresh=0.5)
-                ax.grid(linestyle=":", alpha=0.4)
+                _finalize_log_axis(ax)
+                ax.grid(linestyle=":", alpha=0.4, which="both")
                 ax.tick_params(labelsize=7)
 
         for ax in axes.flat:
@@ -824,6 +832,42 @@ class ScalabilityBenchmarker:
 # ---------------------------------------------------------------------------
 # Helper
 # ---------------------------------------------------------------------------
+
+def _finalize_log_axis(
+    ax,
+    *,
+    bottom_pad: float = 2.0,
+    top_pad: float = 3.0,
+) -> None:
+    """Put a strictly-positive axis on a log scale with padded y-limits.
+
+    Replaces the previous ``symlog`` scaling, which reserved a large negative
+    decade band (``-10^0``, ``-10^1`` …) that is always empty for these
+    positive-only metrics (seconds, MB, ×speedup) and squashed the data into
+    the top third of each panel.
+
+    Reads the positive, finite y-values already plotted on ``ax`` and sets
+    ``[min / bottom_pad, max * top_pad]`` so the curves sit centred with
+    breathing room below and a little extra headroom above (the previous
+    plots clipped the top-most points).  No-op when nothing positive is
+    plotted (leaves matplotlib's default linear autoscale, e.g. a blank
+    panel).
+    """
+    yvals = [
+        float(y)
+        for line in ax.get_lines()
+        for y in np.asarray(line.get_ydata(), dtype=float).ravel()
+        if np.isfinite(y) and y > 0.0
+    ]
+    if not yvals:
+        return
+    lo, hi = min(yvals), max(yvals)
+    ax.set_yscale("log")
+    if hi <= lo:                       # single distinct value → give it a decade
+        ax.set_ylim(lo / (bottom_pad * 5.0), hi * (top_pad * 5.0))
+    else:
+        ax.set_ylim(lo / bottom_pad, hi * top_pad)
+
 
 def _blank_plot(path: Path, msg: str = "no data") -> Path:
     fig, ax = plt.subplots(figsize=(5, 3))
