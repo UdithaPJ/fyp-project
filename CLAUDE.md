@@ -859,6 +859,37 @@ Target: adaptive (RTX 20-series Turing by default), `BLOCK_SIZE = 256`,
   `TOP_K_BITONIC_THRESHOLD = 256`,
   `HEAVY_ROW_THRESH = 256`, `LIGHT_ROW_THRESH = 32`.
 
+### VRAM ceiling and fast-fail policy
+
+MCL is the most memory-intensive of the six algorithms: expansion squares
+the matrix (`M @ M`) and the fill-in of the *product* (not the input
+graph) is the binding VRAM constraint.  Two adaptive mechanisms push the
+ceiling up, then MCL fails cleanly:
+
+- `_adaptive_top_k(n, top_k, free_vram)` caps `top_k` so the pruned
+  working set (`~n * top_k` entries, held as CSR + CSC ≈ 16 B/entry) fits
+  ~35 % of free VRAM.  Bounds the SpGEMM **input**.  Only binds on graphs
+  too large for the user's `top_k`; realistic biological networks pass
+  through unchanged.  Logged and surfaced in `result["note"]`.
+- `_adaptive_prune_threshold` raises the threshold under pressure to
+  shrink the SpGEMM **output**.
+
+- **No silent truncation.**  When the product still exceeds the VRAM
+  budget, `_spgemm_gpu` raises a clear `MemoryError` (previously it kept
+  the first `capacity` entries and continued with "approximate results" —
+  removed as a correctness hazard).  `cuMemAlloc` failures are re-raised
+  from `mcl_gpu` with concrete ceiling guidance rather than the cryptic
+  driver message.
+
+- **Measured ceiling** on a 6 GB RTX 2060 (grn/undirected, ~6 avg degree):
+  ~1M nodes (`barabasi_albert`), ~1.6M (`erdos_renyi`), ~3.3M
+  (`watts_strogatz`).  The limit is degree-variance dependent (ER and WS
+  at equal n/m differ: ER's Poisson variance yields more fill-in).  Full
+  out-of-core MCL (host-streamed SpGEMM+prune+inflate) is future work; the
+  SpGEMM output's scatter-heavy access makes naive managed-memory spill
+  impractically slow, so it is a substantial undertaking, not a quick
+  tiling change.
+
 ---
 
 ## PageRank GPU implementation

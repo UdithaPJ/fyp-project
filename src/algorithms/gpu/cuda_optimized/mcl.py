@@ -64,6 +64,33 @@ Optimised GPU pipeline (this module)
 6. Adaptive arch compilation: runtime
    `cuda.Device(0).compute_capability()` -> `-arch=sm_XY`.
 
+VRAM ceiling (important)
+------------------------
+MCL is the most memory-intensive of the six algorithms: the expansion
+step squares the matrix (M @ M), and the fill-in of the product — not the
+input graph — is the binding VRAM constraint.  On random / scale-free
+graphs there is no tight community structure to keep the product sparse,
+so it explodes before pruning can contain it.
+
+Two mechanisms keep MCL within VRAM as far as possible, then fail cleanly:
+  * ``_adaptive_top_k`` caps top-k so the pruned *working set*
+    (~n * top_k entries) fits free VRAM (bounds the SpGEMM INPUT).
+  * ``_adaptive_prune_threshold`` raises the threshold under pressure to
+    shrink the SpGEMM OUTPUT.
+
+When the product still does not fit, MCL raises a clear ``MemoryError``
+(it does NOT silently truncate the product — that was removed as a
+correctness hazard).  Measured ceiling on a 6 GB RTX 2060 (grn/undirected,
+~6 avg degree): roughly ~1M nodes (barabasi_albert, scale-free), ~1.6M
+(erdos_renyi, random), ~3.3M (watts_strogatz, small-world).  The exact
+limit is degree-variance dependent — e.g. erdos_renyi and watts_strogatz
+at the SAME n/m differ because ER's Poisson degree variance produces more
+fill-in than WS's near-uniform degree.  Real biological networks are far
+smaller and sparser than these synthetic stress graphs and run comfortably
+below the ceiling.  Beyond it, a higher-VRAM device (or higher
+prune_threshold / lower top_k_per_column) is required; full out-of-core
+MCL (host-streamed SpGEMM+prune+inflate) is future work.
+
 References
 ----------
 van Dongen, S. (2000). A Cluster Algorithm for Graphs. CWI Tech. Report.
@@ -1352,40 +1379,26 @@ def _spgemm_gpu(
         stream_compute.synchronize()
         written = int(d_C_nnz.get()[0])
 
-        # Fix 1: In-buffer overflow recovery — truncate instead of raising.
-        overflow_msg = ""
+        # Fast-fail on SpGEMM output overflow.  This previously TRUNCATED the
+        # product (kept the first ``capacity`` entries, dropped the rest) and
+        # continued with "approximate" results — a silent correctness hazard
+        # that produced a wrong clustering rather than an error.  MCL's
+        # expansion (M @ M) fill-in genuinely does not fit VRAM in this case,
+        # so we stop with a clear, actionable message instead.  See the module
+        # docstring "VRAM ceiling" note for the per-topology limits.
         if written > capacity:
-            overflow_msg = (
-                f"SpGEMM output overflow: {written} entries needed but only "
-                f"{capacity} allocated. Truncating and applying emergency "
-                f"threshold prune (threshold={prune_threshold:g}). "
-                f"Results are approximate for this iteration."
+            need_mb = written * COO_BYTES_PER_ENTRY / (1024 * 1024)
+            have_mb = capacity * COO_BYTES_PER_ENTRY / (1024 * 1024)
+            raise MemoryError(
+                "MCL gpu: SpGEMM expansion output exceeds VRAM — the pruned "
+                f"M @ M product needs {written:,} entries (~{need_mb:.0f} MB) "
+                f"but only {capacity:,} (~{have_mb:.0f} MB) fit the VRAM "
+                "budget, so the graph is too large for MCL at this VRAM. "
+                "MCL squares the matrix each iteration and is the most "
+                "memory-intensive of the six algorithms. Options: use a "
+                "higher-VRAM device, raise prune_threshold, or lower "
+                "top_k_per_column."
             )
-            logging.warning(overflow_msg)
-            # Entries at positions 0..capacity-1 WERE written successfully;
-            # entries at positions capacity..written-1 were silently dropped
-            # by the kernel's `if (pos < max_C_nnz)` guard.  Use what we have.
-            rows_host = d_C_row.get()[:capacity]
-            cols_host = d_C_col.get()[:capacity]
-            vals_host = d_C_val.get()[:capacity]
-            # Emergency threshold prune: drop weak entries from truncated set.
-            if prune_threshold > 0.0:
-                keep = vals_host >= prune_threshold
-                if keep.any():
-                    rows_host = rows_host[keep]
-                    cols_host = cols_host[keep]
-                    vals_host = vals_host[keep]
-                else:
-                    # Everything below threshold — return identity-like empty.
-                    return sp.csr_matrix((n, n), dtype=np.float32), overflow_msg
-            if rows_host.size == 0:
-                return sp.csr_matrix((n, n), dtype=np.float32), overflow_msg
-            out = sp.coo_matrix(
-                (vals_host, (rows_host, cols_host)),
-                shape=(n, n), dtype=np.float32,
-            ).tocsr()
-            out.sum_duplicates()
-            return out, overflow_msg
 
         if written == 0:
             return sp.csr_matrix((n, n), dtype=np.float32), ""
@@ -2005,16 +2018,27 @@ def mcl_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
     except cuda.LogicError as e:
         logging.error("CUDA error in mcl_gpu: %s", e)
         raise
-    except MemoryError:
-        # This path is reached only when a gpuarray.empty() allocation
-        # genuinely exhausts VRAM — not for SpGEMM output overflow, which
-        # is now recovered from internally (Fix 1).
-        logging.warning(
-            "VRAM exhausted in mcl_gpu (gpuarray allocation failed). "
-            "Try a smaller graph, higher prune_threshold, lower "
-            "top_k_per_column, or a higher-VRAM device."
-        )
-        raise
+    except MemoryError as mem_exc:
+        # Two ways to get here: (1) the explicit fast-fail raise on SpGEMM
+        # output overflow (message already actionable), or (2) a raw
+        # gpuarray.empty() / cuMemAlloc failure when an intermediate genuinely
+        # exceeds VRAM.  For (2) the underlying "cuMemAlloc failed: out of
+        # memory" is cryptic, so re-raise with the concrete MCL VRAM-ceiling
+        # guidance.  MCL squares the matrix each iteration; its fill-in is the
+        # binding constraint, and the reachable size depends on degree
+        # variance (see module docstring "VRAM ceiling").
+        msg = str(mem_exc)
+        if "MCL gpu:" in msg:
+            raise                                       # already actionable
+        raise MemoryError(
+            "MCL gpu: VRAM exhausted during the expansion (M @ M) — MCL is "
+            "the most memory-intensive of the six algorithms and its fill-in "
+            "does not fit this GPU for a graph of this size/density. On a 6 GB "
+            "GPU it scales to roughly ~1M nodes (scale-free), ~1.6M (random), "
+            "~3.3M (small-world); the exact limit depends on degree variance. "
+            "Use a higher-VRAM device, raise prune_threshold, or lower "
+            f"top_k_per_column. (Underlying error: {msg})"
+        ) from mem_exc
     finally:
         if pushed_ctx is not None:
             try:

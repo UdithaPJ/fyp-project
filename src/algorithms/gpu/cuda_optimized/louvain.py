@@ -764,21 +764,6 @@ def _remove_self_loops(csr: sp.csr_matrix) -> sp.csr_matrix:
     return csr
 
 
-def _handle_isolated_nodes(
-    csr: sp.csr_matrix,
-) -> tuple[sp.csr_matrix, np.ndarray]:
-    """Identify zero-degree nodes.
-
-    The CSR is returned unchanged; isolated nodes naturally remain in
-    singleton communities (``compute_proposed_moves`` returns
-    ``proposed = current`` when ``degree == 0``).  The list is returned
-    purely for downstream reporting / re-integration logic.
-    """
-    degrees = np.asarray(csr.sum(axis=1), dtype=np.float64).flatten()
-    isolated = np.where(degrees == 0)[0].astype(np.int32)
-    return csr, isolated
-
-
 def _normalize_weights(csr: sp.csr_matrix) -> sp.csr_matrix:
     """Rescale edge weights so max(w) <= 1.
 
@@ -1471,13 +1456,13 @@ def louvain_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
 
     Pipeline
     --------
-    CPU preprocessing (NOT timed):
+    CPU preprocessing (runs before the CUDA-event region, but still counts
+    toward the runner's BenchmarkTimer wall time — see note below):
       _symmetrize          — network-type-aware undirected conversion
       _remove_self_loops   — drop diagonal
-      _handle_isolated_nodes
       _normalize_weights   — divide by max (Q invariant under scaling)
 
-    GPU loop (timed):
+    GPU loop (CUDA-event timed):
       For each level (up to max_levels):
         _louvain_level         — Phase 1 + modularity
         _build_coarsened_graph — Phase 2 (mixed GPU + CPU)
@@ -1543,13 +1528,11 @@ def louvain_gpu(graph_csr: sp.csr_matrix, params: dict) -> dict:
             raise ValueError("Empty graph")
 
         # ---- CPU preprocessing ----------------------------------------
+        # Isolated (zero-degree) nodes need no special handling here: they
+        # naturally stay in singleton communities via compute_proposed_moves
+        # (proposed == current when degree == 0).
         A_sym, sym_note = _symmetrize(graph_csr, network_type)
         A_sym           = _remove_self_loops(A_sym)
-        # _handle_isolated_nodes intentionally NOT called here: its returned
-        # isolated-node list was discarded, so the full O(nnz) degree
-        # reduction it performed was pure setup overhead counted in the timed
-        # region.  Isolated nodes correctly stay in singleton communities via
-        # compute_proposed_moves (proposed == current when degree == 0).
         A_sym           = _normalize_weights(A_sym)
 
         # Ensure float32 throughout the GPU pipeline.
