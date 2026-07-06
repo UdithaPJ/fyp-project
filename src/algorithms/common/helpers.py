@@ -1,0 +1,877 @@
+"""
+src/algorithms/common/helpers.py — Shared helpers for CPU algorithm files
+==========================================================================
+
+Contains:
+- Functions shared between *both* the single-threaded and multi-threaded
+  variants of the same algorithm (used by both single_threaded/<name>.py
+  and multi_threaded/<name>.py).
+- The ``_build_transition_matrix`` function that is **cross-algorithm**
+  (identical implementation used by both pagerank and rwr).
+
+Naming conventions
+------------------
+Where two algorithms define a function with the same name but different
+signatures, the helpers here are prefixed with the algorithm name:
+    bfs_pack_result  — packs a BFS distance/cascade result dict
+    hits_pack_result — packs a HITS hub/authority result dict
+
+Importers alias them back to the local name they expect, e.g.:
+    from src.algorithms.common.helpers import bfs_pack_result as _pack_result
+"""
+
+from __future__ import annotations
+
+import os
+from typing import Callable
+
+import numpy as np
+import scipy.sparse as sp
+import scipy.sparse.csgraph as csgraph
+
+
+# ===========================================================================
+# Worker-process initializer (used by every cpu_multi algorithm)
+# ===========================================================================
+
+def _worker_init_no_blas() -> None:
+    """Multiprocessing pool initializer — pin worker BLAS threads to 1.
+
+    MEMORY_FIX (H-3): without this, every worker process inherits the
+    parent's OMP_NUM_THREADS=physical_cores and each Pool with 4 workers
+    spawns 4 × physical_cores BLAS threads on the same CPU.  The
+    resulting oversubscription collapses throughput on biological graphs.
+
+    The env-var changes must happen BEFORE numpy/scipy import inside the
+    worker — `import` order is preserved by `spawn` start method as long
+    as we set the variables before any heavy import the worker may use.
+    """
+    for var in (
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "BLIS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+    ):
+        os.environ[var] = "1"
+    # Some BLAS libs expose runtime knobs via threadpoolctl; set them too
+    # when the module is already loaded.
+    try:
+        from threadpoolctl import threadpool_limits
+        threadpool_limits(1)
+    except Exception:                                              # noqa: BLE001
+        pass
+
+# ---------------------------------------------------------------------------
+# Module-level constants (used as default parameters in helper signatures)
+# ---------------------------------------------------------------------------
+
+_TOP_N:   int = 20   # top nodes (pagerank, rwr)
+_TOP_REG: int = 15   # top regulators (pagerank)
+_TOP_TGT: int = 15   # top target genes (pagerank)
+_TOP_TF:  int = 10   # top seed TFs (rwr)
+_TOP_K:   int = 15   # top hubs / authorities (hits)
+
+
+# ===========================================================================
+# Shared across pagerank AND rwr
+# ===========================================================================
+
+def _build_transition_matrix(
+    graph_csr: sp.csr_matrix,
+    dangling_self_loops: bool = False,
+) -> tuple[sp.csr_matrix, np.ndarray]:
+    """
+    Build the column-stochastic transition matrix M and a dangling-node mask.
+
+    M[j, i] = A[i, j] / out_degree(i)
+
+    Dangling nodes (out_degree == 0) have no outgoing edges; their rows in
+    graph_csr are all-zero.  They are tracked separately so the caller can
+    redistribute their probability mass (PageRank) or treat the restart term
+    as the sole source of probability (RWR).
+
+    Parameters
+    ----------
+    dangling_self_loops : bool, default False
+        When True, add a self-loop ``M[j, j] = 1`` to every dangling column
+        so M is column-stochastic over ALL nodes (not just non-dangling
+        ones).  This conserves probability mass — RWR scores then sum to 1.0
+        instead of leaking on directed graphs with many dangling nodes (e.g.
+        GRN target genes).  Matches the GPU RWR transition-matrix spec.  Left
+        False for PageRank, which redistributes dangling mass explicitly.
+
+    Used by
+    -------
+    src.algorithms.cpu.single_threaded.pagerank
+    src.algorithms.cpu.multi_threaded.pagerank
+    src.algorithms.cpu.single_threaded.rwr
+    src.algorithms.cpu.multi_threaded.rwr
+
+    Returns
+    -------
+    M            : (N, N) CSR, column-stochastic over non-dangling nodes
+                   (or ALL nodes when ``dangling_self_loops=True``)
+    dangling_mask: boolean array of length N, True for dangling nodes
+    """
+    # MEMORY_FIX (M-3): build the transition matrix in float32.  Score
+    # vectors converge under FP32 tolerance ≥ 1e-7; FP64 halves SIMD
+    # throughput and doubles RAM for no biological-precision benefit.
+    out_degrees   = np.asarray(graph_csr.sum(axis=1)).flatten().astype(np.float32)
+    dangling_mask = out_degrees == 0
+    safe_degrees  = np.where(dangling_mask, np.float32(1.0), out_degrees)
+    D_inv         = sp.diags(1.0 / safe_degrees, format="csr", dtype=np.float32)
+    M             = (D_inv @ graph_csr).T.tocsr().astype(np.float32)
+    if dangling_self_loops and dangling_mask.any():
+        # Dangling columns are all-zero; a self-loop makes them column-
+        # stochastic (M[j, j] = 1), so the random walker stays put there
+        # instead of the mass vanishing.  Conserves total probability.
+        M = (M + sp.diags(dangling_mask.astype(np.float32),
+                          format="csr", dtype=np.float32)).tocsr()
+    return M, dangling_mask
+
+
+# ===========================================================================
+# PageRank helpers
+# ===========================================================================
+
+def _get_top_nodes(scores: np.ndarray, n: int = _TOP_N) -> list[int]:
+    """Return indices of the top-n highest-scoring nodes."""
+    k = min(n, len(scores))
+    return np.argsort(scores)[::-1][:k].tolist()
+
+
+def _split_top_nodes(
+    scores:      np.ndarray,
+    out_degrees: np.ndarray,
+    n_reg: int = _TOP_REG,
+    n_tgt: int = _TOP_TGT,
+) -> tuple[list[int], list[int]]:
+    """
+    Partition top-scoring nodes into regulators (out_degree > 0) and
+    target genes (out_degree == 0).
+
+    Returns
+    -------
+    top_regulators : top-n_reg node indices with out_degree > 0
+    top_targets    : top-n_tgt node indices with out_degree == 0
+    """
+    reg_idx = np.where(out_degrees > 0)[0]
+    tgt_idx = np.where(out_degrees == 0)[0]
+
+    top_reg = (
+        reg_idx[np.argsort(scores[reg_idx])[::-1][:n_reg]].tolist()
+        if len(reg_idx) > 0 else []
+    )
+    top_tgt = (
+        tgt_idx[np.argsort(scores[tgt_idx])[::-1][:n_tgt]].tolist()
+        if len(tgt_idx) > 0 else []
+    )
+    return top_reg, top_tgt
+
+
+# ===========================================================================
+# BFS helpers
+# ===========================================================================
+
+def bfs_pack_result(
+    distances:        np.ndarray,
+    visited_order:    list[int],
+    cascade_by_depth: dict[int, list[int]],
+) -> dict:
+    """Pack BFS output arrays into the standard result dict."""
+    return {
+        "distances":        distances.tolist(),
+        "visited_order":    visited_order,
+        "num_reachable":    int((distances >= 0).sum()),
+        "cascade_by_depth": {str(k): v for k, v in cascade_by_depth.items()},
+    }
+
+
+# ===========================================================================
+# HITS helpers
+# ===========================================================================
+
+def _l2_normalize(v: np.ndarray) -> np.ndarray:
+    """L2-normalise a vector; return unchanged if norm is zero."""
+    norm = np.linalg.norm(v)
+    return v / norm if norm > 0.0 else v
+
+
+def _top_k(scores: np.ndarray, k: int = _TOP_K) -> list[int]:
+    """Return indices of the top-k highest-scoring entries."""
+    return np.argsort(scores)[::-1][:k].tolist()
+
+
+def hits_pack_result(
+    hub:       np.ndarray,
+    auth:      np.ndarray,
+    iteration: int,
+    converged: bool,
+) -> dict:
+    """Pack HITS hub/authority arrays into the standard result dict."""
+    top_h   = _top_k(hub)
+    top_a   = _top_k(auth)
+    overlap = sorted(set(top_h) & set(top_a))
+    return {
+        "hub_scores":            hub.tolist(),
+        "authority_scores":      auth.tolist(),
+        "iterations":            iteration,
+        "converged":             converged,
+        "top_hubs":              top_h,
+        "top_authorities":       top_a,
+        "hub_authority_overlap": overlap,
+    }
+
+
+# ===========================================================================
+# RWR helpers
+# ===========================================================================
+
+def _make_p0(seed_nodes: list[int], N: int) -> np.ndarray:
+    """Uniform distribution over seed nodes; falls back to 1/N if none valid."""
+    # MEMORY_FIX (M-3): FP32 — matches the FP32 transition matrix.
+    p0    = np.zeros(N, dtype=np.float32)
+    valid = [s for s in seed_nodes if 0 <= s < N]
+    if not valid:
+        return np.full(N, np.float32(1.0 / N), dtype=np.float32)
+    p0[valid] = np.float32(1.0 / len(valid))
+    return p0
+
+
+def _top_tfs(
+    scores:     np.ndarray,
+    seed_nodes: list[int],
+    k:          int = _TOP_TF,
+) -> list[int]:
+    """Return the top-k seed nodes ordered by their post-diffusion score."""
+    seed_arr = np.array([s for s in seed_nodes if 0 <= s < len(scores)])
+    if len(seed_arr) == 0:
+        return []
+    order = np.argsort(scores[seed_arr])[::-1]
+    return seed_arr[order[:k]].tolist()
+
+
+def _top_nodes(scores: np.ndarray, k: int = _TOP_N) -> list[int]:
+    """Return the top-k highest-scoring node indices."""
+    return np.argsort(scores)[::-1][:k].tolist()
+
+
+# ===========================================================================
+# Louvain helpers
+# ===========================================================================
+
+def _symmetrize(graph_csr: sp.csr_matrix) -> sp.csr_matrix:
+    """
+    Symmetrize a directed GRN adjacency: A_sym = A + A^T.
+
+    Mutual TF↔gene edges get weight 2× (tighter co-regulation);
+    one-way edges keep their original weight.
+    """
+    A_sym = (graph_csr + graph_csr.T).tocsr()
+    A_sym.sum_duplicates()
+    # MEMORY_FIX (M-6): float32 keeps the symmetric view cheap; modularity
+    # under FP32 differs from FP64 only in the 7th significant digit.
+    return A_sym.astype(np.float32)
+
+
+def _compute_modularity(
+    adj_sym:    sp.csr_matrix,
+    labels:     np.ndarray,
+    m:          float,
+    resolution: float,
+) -> float:
+    """Compute modularity Q for a labelled partition in O(nnz)."""
+    degrees = np.asarray(adj_sym.sum(axis=1)).flatten()
+    coo     = adj_sym.tocoo()
+    same    = labels[coo.row] == labels[coo.col]
+    expected = degrees[coo.row] * degrees[coo.col] / (2.0 * m)
+    Q = float(np.sum((coo.data - resolution * expected) * same) / (2.0 * m))
+    return Q
+
+
+def _phase2_collapse(
+    adj_csr:     sp.csr_matrix,
+    communities: np.ndarray,
+) -> tuple[sp.csr_matrix, np.ndarray]:
+    """
+    Collapse a community assignment into a new weighted super-node graph.
+
+    Returns
+    -------
+    new_adj   : (K × K) CSR — weighted super-node adjacency (with self-loops)
+    new_labels: (n,) array  — old node index → new super-node index
+    """
+    _, new_labels = np.unique(communities, return_inverse=True)
+    K   = int(new_labels.max()) + 1
+    coo = adj_csr.tocoo()
+    row_new = new_labels[coo.row]
+    col_new = new_labels[coo.col]
+    new_adj = sp.coo_matrix(
+        (coo.data.astype(np.float64), (row_new, col_new)),
+        shape=(K, K),
+    ).tocsr()
+    new_adj.sum_duplicates()
+    return new_adj, new_labels.astype(np.int32)
+
+
+def _build_result(
+    A_sym:        sp.csr_matrix,
+    final_labels: np.ndarray,
+    hierarchy:    list[list[int]],
+    m:            float,
+    resolution:   float,
+) -> dict:
+    """Build the standard Louvain result dict from final community labels."""
+    K    = int(final_labels.max()) + 1
+    Q    = _compute_modularity(A_sym, final_labels, m, resolution)
+    sizes = np.bincount(final_labels, minlength=K)
+    top5  = np.argsort(sizes)[::-1][:5]
+    top_communities = [
+        {
+            "community_id": int(c),
+            "size":         int(sizes[c]),
+            "member_nodes": np.where(final_labels == c)[0].tolist(),
+        }
+        for c in top5 if sizes[c] > 0
+    ]
+    return {
+        "community_assignments": final_labels.tolist(),
+        "num_communities":       K,
+        "modularity":            Q,
+        "hierarchy":             hierarchy,
+        "top_communities":       top_communities,
+    }
+
+
+def _run_louvain(
+    A_sym:             sp.csr_matrix,
+    m:                 float,
+    resolution:        float,
+    min_delta_q:       float,
+    max_levels:        int,
+    phase1_fn:         Callable,
+    max_phase1_passes: int = 100,
+) -> tuple[np.ndarray, list[list[int]]]:
+    """
+    Execute the two-phase Louvain loop using a pluggable Phase 1 function.
+
+    ``phase1_fn`` must accept
+    ``(adj_csr, communities, degrees, m, resolution, min_delta_q)`` and
+    return ``(communities, improved: bool)``.
+
+    ``max_phase1_passes`` caps the inner while-loop.  Sequential Phase 1
+    (cpu_single) converges monotonically and typically exits before the cap.
+    Bulk-synchronous Phase 1 (cpu_multi) can oscillate, so the cap is its
+    primary termination condition.
+
+    Returns ``(final_labels, hierarchy)``.
+    """
+    N             = A_sym.shape[0]
+    node_to_super = np.arange(N, dtype=np.int32)
+    current_adj   = A_sym
+    current_m     = m
+    hierarchy: list[list[int]] = []
+
+    for _level in range(max_levels):
+        n_cur    = current_adj.shape[0]
+        degrees  = np.asarray(current_adj.sum(axis=1)).flatten().astype(np.float64)
+        communities = np.arange(n_cur, dtype=np.int32)
+
+        changed  = True
+        pass_num = 0
+        prev_Q   = None
+        while changed and pass_num < max_phase1_passes:
+            communities, changed = phase1_fn(
+                current_adj, communities, degrees, current_m, resolution, min_delta_q
+            )
+            pass_num += 1
+
+            # Modularity-delta convergence.  Q is bounded in ~[-0.5, 1], so an
+            # absolute ``min_delta_q`` threshold on the realized ΔQ is
+            # scale-robust — unlike a per-move or summed-gain threshold, whose
+            # fixed value is swamped by the many tiny per-node gains a large
+            # graph accumulates.  Phase 1's move-count flag has a very long,
+            # low-yield tail (a 100k graph keeps moving 1-3 % of nodes for 100+
+            # passes while Q barely changes); stopping when a pass improves Q
+            # by less than min_delta_q cuts dozens of those passes with no
+            # meaningful loss of partition quality.
+            Q = _compute_modularity(current_adj, communities, current_m, resolution)
+            if prev_Q is not None and (Q - prev_Q) < min_delta_q:
+                break
+            prev_Q = Q
+
+        level_comms = communities[node_to_super]
+        _, level_renumbered = np.unique(level_comms, return_inverse=True)
+        hierarchy.append(level_renumbered.tolist())
+
+        new_adj, new_labels = _phase2_collapse(current_adj, communities)
+        K = new_adj.shape[0]
+
+        if K >= n_cur:
+            break
+
+        node_to_super = new_labels[communities[node_to_super]]
+        current_adj   = new_adj
+        current_m     = float(new_adj.sum()) / 2.0
+
+    final_labels = node_to_super
+    _, final_labels = np.unique(final_labels, return_inverse=True)
+    return final_labels.astype(np.int32), hierarchy
+
+
+# ===========================================================================
+# MCL helpers
+# ===========================================================================
+
+def _add_self_loops(M: sp.csr_matrix) -> sp.csr_matrix:
+    """Add identity to ensure every node has at least one self-transition."""
+    n   = M.shape[0]
+    eye = sp.eye(n, format="csr", dtype=M.dtype)
+    result = M + eye
+    result.sum_duplicates()
+    return result
+
+
+def _col_normalize(M: sp.csr_matrix) -> sp.csr_matrix:
+    """Column-normalise M so each column sums to 1 (column-stochastic matrix)."""
+    M_csc    = M.tocsc().astype(np.float64)
+    col_sums = np.asarray(M_csc.sum(axis=0)).flatten()
+    col_sums[col_sums == 0.0] = 1.0
+    inv      = sp.diags(1.0 / col_sums, format="csr")
+    return (M_csc @ inv).tocsr()
+
+
+def _expand(M: sp.csr_matrix, e: int) -> sp.csr_matrix:
+    """Expansion step: raise M to the integer power e via repeated SpGEMM."""
+    result = M
+    for _ in range(e - 1):
+        result = result @ M
+    return result
+
+
+def _prune(M: sp.csr_matrix, threshold: float) -> sp.csr_matrix:
+    """Zero out entries below threshold and remove structural zeros."""
+    M = M.copy()
+    M.data[M.data < threshold] = 0.0
+    M.eliminate_zeros()
+    return M
+
+
+def _frobenius_diff(A: sp.csr_matrix, B: sp.csr_matrix) -> float:
+    """Frobenius norm of (A - B) for sparse matrices."""
+    diff = A - B
+    return float(np.sqrt(diff.data @ diff.data))
+
+
+def _extract_clusters(M: sp.csr_matrix) -> np.ndarray:
+    """
+    Extract cluster labels from a converged MCL matrix.
+
+    Strategy
+    --------
+    1. Identify attractor nodes: columns j where M[j,j] > 0.
+    2. For each node i, assign it to the attractor j = argmax M[i, attractors].
+    3. Fallback: weakly-connected components if no diagonal entry is non-zero.
+    """
+    n     = M.shape[0]
+    M_csr = M.tocsr()
+    diag  = np.asarray(M_csr.diagonal()).flatten()
+    attractors = np.where(diag > 0)[0]
+
+    if len(attractors) == 0:
+        _, labels = csgraph.connected_components(
+            M_csr, directed=False, connection="weak"
+        )
+        return labels.astype(np.int32)
+
+    # MEMORY_FIX (C-4): the previous `np.asarray(M_csr[:, attractors].todense())`
+    # allocated an (n × K) dense FP64 matrix.  For n=500k, K=1000 that is
+    # 4 GB and reliably OOMs.  We now walk the CSR row-wise and pick the
+    # heaviest attractor for each node, allocating only an (n,) int32
+    # assignment vector and an int32 column→attractor-index lookup.
+    attractor_rank = np.full(n, -1, dtype=np.int32)
+    attractor_rank[attractors] = np.arange(len(attractors), dtype=np.int32)
+
+    assignments = np.zeros(n, dtype=np.int32)
+    indptr  = M_csr.indptr
+    indices = M_csr.indices
+    data    = M_csr.data
+    for i in range(n):
+        s, e = int(indptr[i]), int(indptr[i + 1])
+        if s == e:
+            continue
+        # Mask this row's columns down to those that are attractors.
+        cols = indices[s:e]
+        ranks = attractor_rank[cols]
+        keep = ranks >= 0
+        if not keep.any():
+            continue
+        vals = data[s:e][keep]
+        sub_ranks = ranks[keep]
+        # Index of max value within the kept subset → attractor index.
+        assignments[i] = int(sub_ranks[int(np.argmax(vals))])
+    return assignments
+
+
+# ===========================================================================
+# Memory-guard helpers
+# ===========================================================================
+#
+# Used by the non-GPU-optimized MCL variants (cpu_single, cpu_multi,
+# gpu_baseline) to refuse work that would blow up RAM or VRAM instead of
+# crashing the whole application.  The GPU-optimized MCL keeps its own
+# adaptive-threshold path and does NOT use these — it is expected to
+# handle graphs that would trip these guards.
+
+def _available_ram_bytes() -> int:
+    """Best-effort available-RAM query using stdlib only.
+
+    Windows: ``GlobalMemoryStatusEx`` via ctypes.
+    Linux  : ``/proc/meminfo`` ``MemAvailable`` (more accurate than
+             ``SC_AVPHYS_PAGES`` because it accounts for reclaimable
+             cache).  Falls back to ``sysconf`` if the file is missing.
+    Other POSIX: ``os.sysconf('SC_AVPHYS_PAGES') * SC_PAGE_SIZE``.
+    Fallback: 0 (caller should treat this as "unknown → skip guard").
+    """
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            class _MemStatusEx(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength",             ctypes.c_ulong),
+                    ("dwMemoryLoad",         ctypes.c_ulong),
+                    ("ullTotalPhys",         ctypes.c_ulonglong),
+                    ("ullAvailPhys",         ctypes.c_ulonglong),
+                    ("ullTotalPageFile",     ctypes.c_ulonglong),
+                    ("ullAvailPageFile",     ctypes.c_ulonglong),
+                    ("ullTotalVirtual",      ctypes.c_ulonglong),
+                    ("ullAvailVirtual",      ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            ms = _MemStatusEx()
+            ms.dwLength = ctypes.sizeof(_MemStatusEx)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
+                return int(ms.ullAvailPhys)
+            return 0
+        # Linux — prefer /proc/meminfo MemAvailable (matches `free -h`).
+        try:
+            with open("/proc/meminfo", "r") as fh:
+                for line in fh:
+                    if line.startswith("MemAvailable:"):
+                        parts = line.split()
+                        # "MemAvailable:    12345678 kB"
+                        return int(parts[1]) * 1024
+        except FileNotFoundError:
+            pass
+        except Exception:                                   # noqa: BLE001
+            pass
+        # Generic POSIX fallback
+        if hasattr(os, "sysconf") and "SC_AVPHYS_PAGES" in os.sysconf_names:
+            pages = os.sysconf("SC_AVPHYS_PAGES")
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            if pages > 0 and page_size > 0:
+                return int(pages) * int(page_size)
+        return 0
+    except Exception:                                       # noqa: BLE001
+        return 0
+
+
+def _swap_used_bytes() -> int:
+    """Best-effort used-swap query using stdlib only.
+
+    A rising swap count means the OS has already started swapping — the
+    OOM killer is close.  Watchdog uses this to bail before RAM alone
+    would signal the problem.
+
+    Only implemented on Linux (``/proc/meminfo`` ``SwapTotal`` -
+    ``SwapFree``).  Windows PageFile has different semantics — it acts
+    as a commit-reserve backing whether or not pages are actually paged
+    out — so we return 0 there and let the RAM-floor check carry the
+    watchdog.  Returns 0 when unknown so callers can treat "no signal"
+    as "OK".
+    """
+    if os.name == "nt":
+        return 0
+    try:
+        with open("/proc/meminfo", "r") as fh:
+            total = free = None
+            for line in fh:
+                if line.startswith("SwapTotal:"):
+                    total = int(line.split()[1]) * 1024
+                elif line.startswith("SwapFree:"):
+                    free = int(line.split()[1]) * 1024
+                if total is not None and free is not None:
+                    return max(0, total - free)
+    except FileNotFoundError:
+        pass
+    except Exception:                                       # noqa: BLE001
+        pass
+    return 0
+
+
+def _estimate_mcl_peak_ram_bytes(
+    graph_csr: sp.csr_matrix,
+    expansion: int = 2,
+    dtype_bytes: int = 4,
+    index_bytes: int = 4,
+    safety_factor: float = 5.0,
+) -> int:
+    """Estimate the peak RAM footprint of a scipy MCL iteration.
+
+    Peak is dominated by ``M @ M`` (expansion) which materialises an
+    intermediate whose nnz ~ ``nnz(M) * avg_row_len``.  Sizing is done
+    against the POST-SYMMETRIZATION matrix that actually enters the
+    iteration loop (``2 * nnz + n`` — the symmetrize adds the transpose,
+    self-loops add n more) because raw-input sizing under-predicts by
+    ~2× for typical biological networks.
+
+    ``safety_factor`` (default 5.0) covers:
+      - scipy's transient buffers during CSR ``@`` (~2× output).
+      - the ``M_old = M.copy()`` snapshot kept for the Frobenius diff.
+      - M growing denser across iterations before the prune stabilises.
+      - allocator fragmentation on repeated iteration allocations.
+
+    Returns an integer number of bytes; callers should compare against
+    a fraction of available RAM.  Returns 0 for an empty graph.
+    """
+    n       = int(graph_csr.shape[0])
+    raw_nnz = int(graph_csr.nnz)
+    if n == 0 or raw_nnz == 0:
+        return 0
+    # After symmetrize + self-loops M has ~2 * raw_nnz + n entries.
+    effective_nnz = 2 * raw_nnz + n
+    avg_row = max(1.0, float(effective_nnz) / max(1, n))
+    est_out_nnz = min(
+        int(effective_nnz * avg_row * safety_factor), n * n
+    )
+    entry_bytes = dtype_bytes + index_bytes
+    peak = est_out_nnz * entry_bytes
+    # Chained expansion (e > 2) squares repeatedly; each square inflates
+    # the intermediate again.  Multiply by (expansion - 1) as a bound.
+    return int(peak * max(1, expansion - 1))
+
+
+def _check_memory_or_raise(
+    estimated_bytes: int,
+    available_bytes: int,
+    *,
+    backend: str,
+    budget_fraction: float = 0.7,
+    extra_hint: str = "",
+) -> None:
+    """Raise ``MemoryError`` early if ``estimated_bytes`` exceeds budget.
+
+    ``available_bytes == 0`` disables the guard (the probe returned
+    "unknown", so we defer to the OS/runtime).
+
+    Parameters
+    ----------
+    estimated_bytes : int
+        Projected peak allocation.
+    available_bytes : int
+        Live free RAM or VRAM.  ``0`` disables the guard.
+    backend : str
+        Human-readable label ("cpu_single", "cpu_multi", "gpu_baseline")
+        used in the error message.
+    budget_fraction : float
+        Safe fraction of ``available_bytes`` we allow the algorithm to
+        consume.  Default 0.7 leaves headroom for OS overhead and the
+        result envelope.
+    extra_hint : str
+        Extra guidance appended to the message (e.g. specific fallback
+        suggestion).
+    """
+    if available_bytes <= 0:
+        return
+    budget = int(available_bytes * budget_fraction)
+    if estimated_bytes <= budget:
+        return
+    est_mb    = estimated_bytes / (1024 * 1024)
+    avail_mb  = available_bytes  / (1024 * 1024)
+    budget_mb = budget           / (1024 * 1024)
+    msg = (
+        f"MCL {backend}: refusing to run — estimated peak memory "
+        f"{est_mb:.0f} MB exceeds safe budget "
+        f"({budget_mb:.0f} MB = {budget_fraction:.0%} of {avail_mb:.0f} MB free). "
+        f"Use mode=gpu (cuda_optimized) which scales to larger graphs."
+    )
+    if extra_hint:
+        msg = f"{msg} {extra_hint}"
+    raise MemoryError(msg)
+
+
+# Runtime watchdog thresholds.  These are DELIBERATELY conservative:
+# by the time swap starts filling, the OS OOM killer is minutes away
+# from killing the Python process (and any IDE hosting it), so we bail
+# well before the RAM-only signal turns critical.
+_RUNTIME_RAM_FLOOR_BYTES:  int = 2 * 1024 * 1024 * 1024   # 2 GB
+_RUNTIME_SWAP_ALERT_BYTES: int = 512 * 1024 * 1024        # 512 MB
+
+# Per-backend swap baseline, (re)captured on iteration 1 of each MCL run.
+# The watchdog measures swap GROWTH caused by MCL rather than absolute swap
+# usage: on a busy box the machine's idle swap can already sit above the
+# 512 MB alert (observed ~1.5 GB baseline), which made the absolute check a
+# false positive that aborted CPU MCL at small n on graphs it could handle.
+_SWAP_BASELINE_BY_BACKEND: dict[str, int] = {}
+
+
+def _check_runtime_ram_or_raise(
+    *,
+    backend: str,
+    iteration: int,
+    current_nnz: int,
+    floor_bytes: int = _RUNTIME_RAM_FLOOR_BYTES,
+    swap_alert_bytes: int = _RUNTIME_SWAP_ALERT_BYTES,
+) -> None:
+    """Per-iteration RAM + swap watchdog for CPU MCL.
+
+    Called at the top of each MCL iteration BEFORE the next ``M @ M``.
+    Raises ``MemoryError`` when EITHER:
+
+      1. free RAM has dropped below ``floor_bytes`` (default 2 GB), OR
+      2. swap usage has GROWN by more than ``swap_alert_bytes`` (default
+         512 MB) since this MCL run started.
+
+    The swap signal is measured as growth-since-start, not absolute usage:
+    ``iteration <= 1`` (re)captures the baseline swap for this run, and
+    later iterations compare against it.  This attributes swap pressure to
+    MCL's own ``M @ M`` fill-in instead of tripping on the machine's
+    pre-existing idle swap (which can already exceed the absolute alert on
+    a busy box and abort small graphs that would otherwise fit).
+
+    Both signals mean the OS OOM killer is close.  Bailing here lets the
+    runner surface a clean error instead of the interpreter (and any IDE
+    hosting it) getting terminated.
+
+    ``available == 0`` (probe failed) disables the RAM check; the swap
+    check is likewise inert when its probe returns 0 (growth stays 0).
+    The pre-run guard is the only safety net when both probes fail.
+    """
+    available = _available_ram_bytes()
+    swap_used = _swap_used_bytes()
+
+    # (Re)capture the baseline at the start of each run.  ``iteration``
+    # restarts at 1 for every MCL call, so this scopes the baseline to the
+    # current graph without any caller bookkeeping.
+    if iteration <= 1:
+        _SWAP_BASELINE_BY_BACKEND[backend] = swap_used
+    swap_baseline = _SWAP_BASELINE_BY_BACKEND.get(backend, swap_used)
+    swap_growth   = max(0, swap_used - swap_baseline)
+
+    ram_low   = available > 0 and available < floor_bytes
+    swap_hot  = swap_growth > swap_alert_bytes
+
+    if not (ram_low or swap_hot):
+        return
+
+    reasons: list[str] = []
+    if ram_low:
+        reasons.append(
+            f"free RAM {available/(1024*1024):.0f} MB < "
+            f"floor {floor_bytes/(1024*1024):.0f} MB"
+        )
+    if swap_hot:
+        reasons.append(
+            f"swap grew {swap_growth/(1024*1024):.0f} MB since start "
+            f"(now {swap_used/(1024*1024):.0f} MB) > "
+            f"alert {swap_alert_bytes/(1024*1024):.0f} MB"
+        )
+    raise MemoryError(
+        f"MCL {backend}: aborting at iteration {iteration} "
+        f"(M.nnz={current_nnz}; {'; '.join(reasons)}). "
+        f"Use mode=gpu (cuda_optimized) which scales to larger graphs."
+    )
+
+
+def _project_expansion_output_nnz(M_csr: sp.csr_matrix) -> int:
+    """Upper bound on ``nnz(M @ M)`` — the size the NEXT expansion allocates.
+
+    scipy's CSR SpGEMM materialises an output whose nnz is at most the
+    number of scalar multiply-adds, i.e. ``sum over nonzeros (i, j) of
+    deg(row j)``.  This is computed in a single vectorised pass over the
+    CSR structure (no matrix multiply), so it is cheap enough to run every
+    iteration:
+
+        deg  = diff(indptr)          # nnz per row
+        flop = deg[indices].sum()    # for each nonzero column j, add deg(j)
+
+    The true output nnz after duplicate-merging is ``<= flop``, so sizing
+    the allocation guard against ``flop`` never under-predicts the peak.
+
+    Returns 0 for an empty matrix.
+    """
+    M = M_csr.tocsr()
+    nnz = int(M.nnz)
+    n   = int(M.shape[0])
+    if nnz == 0 or n == 0:
+        return 0
+    deg = np.diff(M.indptr).astype(np.int64)          # degree of each row
+    # M.indices holds the column index j of every nonzero; deg[j] is the
+    # length of row j that this nonzero will scatter across in M @ M.
+    flop = int(deg[M.indices].sum())
+    # Bounded by a fully dense output.
+    return min(flop, n * n)
+
+
+def _check_expansion_or_raise(
+    M_csr: sp.csr_matrix,
+    *,
+    backend: str,
+    iteration: int,
+    expansion: int = 2,
+    dtype_bytes: int = 4,
+    index_bytes: int = 4,
+    budget_fraction: float = 0.6,
+    available_bytes: int | None = None,
+    safety_factor: float = 2.0,
+) -> None:
+    """Refuse the NEXT ``M @ M`` if its allocation would exceed free RAM.
+
+    This is the pre-allocation guard that closes the gap the per-iteration
+    watchdog cannot: a single scipy/GraphBLAS SpGEMM allocates its whole
+    output in one uninterruptible step, so a between-iterations RAM check
+    cannot stop it once it starts.  Here we PROJECT that allocation's size
+    from the current matrix structure (:func:`_project_expansion_output_nnz`)
+    and raise a clean ``MemoryError`` BEFORE the allocation is attempted,
+    so the process is never handed an allocation it cannot satisfy.
+
+    ``safety_factor`` (default 2.0) covers scipy's transient symbolic +
+    numeric workspaces and the input matrices held live during the product.
+    ``available_bytes is None`` triggers a live RAM probe; pass an explicit
+    value (e.g. free VRAM) to guard a GPU allocation instead.  A probe of 0
+    disables the guard (defer to the runtime).
+
+    For ``expansion > 2`` this projects only the FIRST of the chained
+    products (the others compound on top and are bounded by the same
+    per-iteration re-check on the next iteration's matrix).
+    """
+    if available_bytes is None:
+        available_bytes = _available_ram_bytes()
+    if available_bytes <= 0:
+        return
+
+    proj_nnz   = _project_expansion_output_nnz(M_csr)
+    if proj_nnz == 0:
+        return
+    entry_bytes = dtype_bytes + index_bytes
+    # Peak during the product: output arrays + input arrays held live.
+    proj_bytes  = int(proj_nnz * entry_bytes * safety_factor)
+
+    budget = int(available_bytes * budget_fraction)
+    if proj_bytes <= budget:
+        return
+
+    raise MemoryError(
+        f"MCL {backend}: refusing expansion at iteration {iteration} — the "
+        f"next M @ M is projected to allocate ~{proj_bytes/(1024*1024):.0f} MB "
+        f"(output nnz ~{proj_nnz:,}), exceeding the safe budget "
+        f"({budget/(1024*1024):.0f} MB = {budget_fraction:.0%} of "
+        f"{available_bytes/(1024*1024):.0f} MB free). Refused BEFORE "
+        f"allocating so the process is not killed mid-product. "
+        f"Use mode=gpu (cuda_optimized) which scales to larger graphs, "
+        f"or raise prune_threshold / lower expansion."
+    )
