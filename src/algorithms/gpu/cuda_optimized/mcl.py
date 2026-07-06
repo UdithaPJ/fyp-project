@@ -196,6 +196,18 @@ WARP_SIZE: int         = 32
 VRAM_BUDGET_FRACTION: float = 0.70
 COO_BYTES_PER_ENTRY: int = 12    # int (row) + int (col) + float (val)
 
+# The COO SpGEMM output kernels index write positions with a 32-bit signed
+# `int`, and the per-tile entry counter (`d_C_nnz`) is int32.  No single
+# in-core or per-tile output buffer may therefore hold >= 2^31 entries: the
+# position arithmetic / atomic counter would wrap negative, and PyCUDA raises
+# "OverflowError: Python integer <cap> out of bounds for int32" the moment the
+# size is passed to a kernel as np.int32.  On a high-VRAM card (e.g. 80 GB A100)
+# the VRAM-derived buffer size can exceed this, so every buffer-sizing site
+# clamps to it and routes larger products to the tiled / fused out-of-core
+# paths (whose per-tile buffers each stay under the bound).  Small margin below
+# the exact 2^31-1 limit.
+_MAX_INT32_ENTRIES: int = (1 << 31) - 1024
+
 # Default shared-memory budget per block on Turing (RTX 20-series) is 48 KB.
 # We probe at runtime and fall back to this conservative value.
 DEFAULT_SHARED_MEM_PER_BLOCK: int = 48 * 1024     # 49152 bytes
@@ -1373,6 +1385,11 @@ def _spgemm_gpu(
         vram_budget   = int(free_bytes * VRAM_BUDGET_FRACTION)
         cap_estimate  = _estimate_spgemm_output_size(M_csr)
         max_cap       = max(1024, vram_budget // COO_BYTES_PER_ENTRY)
+        # Never size a single in-core COO buffer beyond int32 addressing (the
+        # output kernels index positions with a 32-bit int).  On a high-VRAM
+        # card the budget can exceed this; clamp so larger products fall through
+        # to the row-tiled path below instead of overflowing np.int32(capacity).
+        max_cap       = min(max_cap, _MAX_INT32_ENTRIES)
 
         # Out-of-core Stage B: when the estimated single-shot output buffer
         # would not fit the VRAM budget, the product transient is the binding
@@ -1696,6 +1713,11 @@ def _spgemm_gpu_tiled(
         tile_budget_entries = max(
             1 << 20, int(free_after * 0.5) // COO_BYTES_PER_ENTRY
         )
+        # Cap per-tile buffer at int32 addressing (COO kernels use int
+        # positions); on a high-VRAM card half of free VRAM can exceed 2^31
+        # entries, which would overflow np.int32(cap) at kernel launch and force
+        # a spuriously huge allocation.  Clamping just makes the path tile finer.
+        tile_budget_entries = min(tile_budget_entries, _MAX_INT32_ENTRIES)
         # Estimated output nnz per row (same model as the whole-matrix
         # estimator, divided by n): avg_row^2 * safety.
         per_row_est = max(
@@ -2093,7 +2115,12 @@ def _ooc_expansion_needed(M_csr: sp.csr_matrix, top_k: int) -> bool:
     vram_cap = int(free_vram * VRAM_BUDGET_FRACTION) // COO_BYTES_PER_ENTRY
     host_cap = int(_host_available_bytes() * HOST_RAM_BUDGET_FRACTION
                    / _HOST_PEAK_BYTES_PER_ENTRY)
-    return est > vram_cap or est > host_cap
+    # Force out-of-core when the single-shot product would exceed int32
+    # addressing, regardless of free VRAM / host RAM — otherwise the in-core
+    # COO buffer size overflows int32 at kernel launch.  The fused out-of-core
+    # path tiles at _FUSED_TILE_MAX_ENTRIES and applies per-column top-k, so its
+    # buffers and accumulated survivors both stay int32-safe.
+    return est > vram_cap or est > host_cap or est >= _MAX_INT32_ENTRIES
 
 
 def _host_topk_per_row(
