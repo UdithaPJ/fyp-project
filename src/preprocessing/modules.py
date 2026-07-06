@@ -40,8 +40,39 @@ class FileLoader:
     # OPTIMIZED (upload-time): candidate separators considered when
     # sniffing an unknown (.txt/.tab) delimiter from a small sample,
     # instead of parsing the whole file with the slow python engine.
+    # ``r"\s+"`` (a regex, matched literally further below rather than
+    # escaped) covers whitespace-separated formats such as STRING's
+    # PPI export ("protein1 protein2 combined_score").
     _SNIFF_SAMPLE_BYTES = 8192
-    _CANDIDATE_DELIMITERS = ["\t", ",", ";", "|"]
+    _CANDIDATE_DELIMITERS = ["\t", ",", ";", "|", ":", r"\s+"]
+    # Characters that legitimately occur inside identifiers/values and
+    # must never be guessed as a delimiter just because they appear in
+    # the header (gene/protein IDs commonly contain these).
+    _DELIMITER_EXCLUDE_CHARS = set("_.-'\"")
+
+    @classmethod
+    def _split_line(cls, line: str, delimiter: str) -> List[str]:
+        """Split one sample line on ``delimiter`` (plain char or regex)."""
+
+        pattern = delimiter if delimiter == r"\s+" else re.escape(delimiter)
+        return re.split(pattern, line.strip())
+
+    @classmethod
+    def _header_derived_candidates(cls, header: str) -> List[str]:
+        """Discover extra delimiter candidates from punctuation in the header.
+
+        Lets detection handle separators outside the fixed shortlist
+        (e.g. ``~``, ``#``, ``@``) instead of only recognising a
+        hardcoded set of "known" delimiters.
+        """
+
+        found: List[str] = []
+        for ch in header:
+            if ch.isalnum() or ch.isspace() or ch in cls._DELIMITER_EXCLUDE_CHARS:
+                continue
+            if ch not in found:
+                found.append(ch)
+        return found
 
     @classmethod
     def _sniff_delimiter(cls, sample: str) -> str:
@@ -51,25 +82,73 @@ class FileLoader:
         delimiter but forces the pure-Python parser across the *entire*
         file, which is 10-20x slower than the C engine on large files.
         Sniffing a small sample lets the fast C engine handle the actual
-        parse for the common case (tab/comma/semicolon/pipe-separated
-        edge lists).
+        parse for the common case.
+
+        Every candidate — including csv.Sniffer's guess — is validated
+        by checking that it splits the header into the SAME number of
+        fields as every sampled data row. A delimiter that "looks
+        standard" but disagrees with the header/data-row column count is
+        rejected, so this generalises to whatever a given file actually
+        uses (whitespace runs, colons, arbitrary punctuation) rather than
+        only a hardcoded shortlist. Among candidates that pass, the one
+        producing the most columns wins.
         """
 
-        try:
-            dialect = csv.Sniffer().sniff(sample, delimiters="\t,;|")
-            return dialect.delimiter
-        except csv.Error:
-            pass
-
-        lines = [line for line in sample.splitlines() if line.strip()][:5]
+        lines = [line for line in sample.splitlines() if line.strip()]
         if not lines:
             return ","
-        counts = {
-            delimiter: min(line.count(delimiter) for line in lines)
-            for delimiter in cls._CANDIDATE_DELIMITERS
-        }
-        best_delimiter, best_count = max(counts.items(), key=lambda kv: kv[1])
-        return best_delimiter if best_count > 0 else ","
+        header, *data_lines = lines
+        data_lines = data_lines[:9] or [header]
+
+        def consistent_column_count(delimiter: str) -> Optional[int]:
+            try:
+                expected = len(cls._split_line(header, delimiter))
+            except re.error:
+                return None
+            if expected < 2:
+                return None
+            for line in data_lines:
+                if len(cls._split_line(line, delimiter)) != expected:
+                    return None
+            return expected
+
+        candidates = list(cls._CANDIDATE_DELIMITERS)
+        try:
+            sniffed_delimiter = csv.Sniffer().sniff(sample, delimiters="\t,;|: ").delimiter
+            if sniffed_delimiter not in candidates:
+                candidates.insert(0, sniffed_delimiter)
+        except csv.Error:
+            pass
+        for ch in cls._header_derived_candidates(header):
+            if ch not in candidates:
+                candidates.append(ch)
+
+        best_delimiter: Optional[str] = None
+        best_columns = 1  # must beat a trivial single-column split
+        for delimiter in candidates:
+            columns = consistent_column_count(delimiter)
+            if columns is not None and columns > best_columns:
+                best_delimiter, best_columns = delimiter, columns
+
+        return best_delimiter if best_delimiter is not None else ","
+
+    @staticmethod
+    def _sep_read_kwargs(detected_sep: str, chunksize: Optional[int] = None) -> dict:
+        """Build ``pd.read_csv`` kwargs appropriate for a detected separator.
+
+        Regex separators (currently only ``r"\\s+"``) aren't supported by
+        pandas' C engine and reject the ``low_memory`` kwarg under the
+        Python engine, so the two paths need slightly different kwargs.
+        """
+
+        kwargs: dict = {"sep": detected_sep}
+        if chunksize is not None:
+            kwargs["chunksize"] = chunksize
+        if detected_sep == r"\s+":
+            kwargs["engine"] = "python"
+        else:
+            kwargs["low_memory"] = True
+        return kwargs
 
     def load(self, file_path: str | Path) -> pd.DataFrame:
         """Load a CSV, TSV, TXT, Excel, or JSON file."""
@@ -158,7 +237,7 @@ class FileLoader:
             detected_sep = self._sniff_delimiter(sample)
             try:
                 return pd.read_csv(
-                    path, sep=detected_sep, chunksize=chunksize, low_memory=True
+                    path, **self._sep_read_kwargs(detected_sep, chunksize=chunksize)
                 )
             except Exception:
                 # Fall back to the slow-but-robust auto-detecting parser.
@@ -167,7 +246,6 @@ class FileLoader:
                     sep=None,
                     engine="python",
                     chunksize=chunksize,
-                    low_memory=True,
                 )
 
         raise ValueError(
@@ -189,9 +267,9 @@ class FileLoader:
                     return pd.DataFrame()
                 detected_sep = self._sniff_delimiter(sample)
                 try:
-                    return pd.read_csv(path, sep=detected_sep, low_memory=True)
+                    return pd.read_csv(path, **self._sep_read_kwargs(detected_sep))
                 except Exception:
-                    return pd.read_csv(path, sep=None, engine="python", low_memory=True)
+                    return pd.read_csv(path, sep=None, engine="python")
             # OPTIMIZED: keep the default fast CSV engine for known delimiters.
             return pd.read_csv(path, sep=sep, low_memory=True)
         except pd.errors.EmptyDataError:
@@ -214,11 +292,11 @@ class FileLoader:
                 detected_sep = self._sniff_delimiter(sample)
                 try:
                     return pd.read_csv(
-                        io.BytesIO(content), sep=detected_sep, low_memory=True
+                        io.BytesIO(content), **self._sep_read_kwargs(detected_sep)
                     )
                 except Exception:
                     return pd.read_csv(
-                        io.BytesIO(content), sep=None, engine="python", low_memory=True
+                        io.BytesIO(content), sep=None, engine="python"
                     )
             # OPTIMIZED: keep the default fast CSV engine for known delimiters.
             return pd.read_csv(io.BytesIO(content), sep=sep, low_memory=True)
