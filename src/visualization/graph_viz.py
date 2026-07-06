@@ -20,7 +20,9 @@ Output schema
         ...
       ],
       "node_count_capped": bool,   # True if max_nodes truncated the view
+      "edge_count_capped": bool,   # True if max_edges truncated the view
       "total_nodes_in_graph": int,
+      "total_edges_in_graph": int,
     }
 
 The view is capped at ``max_nodes`` (default 200) so the frontend can
@@ -163,12 +165,13 @@ def make_highlight_data(
     graph_csr: sp.csr_matrix,
     node_index_map: dict | None = None,
     max_nodes: int = 200,
+    max_edges: int = 600,
 ) -> dict:
     """
     Build a node/edge payload for the frontend graph visualisation.
 
-    Caps at ``max_nodes`` for performance.  Edges are restricted to those
-    where BOTH endpoints survive the node cap.
+    Caps at ``max_nodes`` and ``max_edges`` for browser performance.  Edges
+    are restricted to those where BOTH endpoints survive the node cap.
     """
     n_total = int(graph_csr.shape[0]) if graph_csr is not None else 0
     if n_total == 0:
@@ -216,24 +219,36 @@ def make_highlight_data(
     # Iterate the CSR rows for selected sources only — avoids touching the
     # full nnz of a huge graph.
     edges_payload: list[dict] = []
+    edge_count_capped = False
     indptr  = graph_csr.indptr
     indices = graph_csr.indices
     data    = graph_csr.data
     for src_idx in selected:
+        if len(edges_payload) >= max_edges:
+            edge_count_capped = True
+            break
         s = int(indptr[src_idx])
         e = int(indptr[src_idx + 1])
         for k in range(s, e):
             tgt_idx = int(indices[k])
             if tgt_idx in selected_set:
+                if len(edges_payload) >= max_edges:
+                    edge_count_capped = True
+                    break
                 edges_payload.append({
                     "source": reverse.get(int(src_idx), f"node_{src_idx}"),
                     "target": reverse.get(tgt_idx,      f"node_{tgt_idx}"),
                     "weight": float(data[k]),
                 })
+        if edge_count_capped:
+            break
 
     return {
         "nodes": nodes_payload,
         "edges": edges_payload,
         "node_count_capped":     bool(len(selected) < n_total),
+        "edge_count_capped":     bool(edge_count_capped),
         "total_nodes_in_graph":  int(n_total),
+        "total_edges_in_graph":  int(graph_csr.nnz),
+        "rendered_edge_limit":   int(max_edges),
     }
