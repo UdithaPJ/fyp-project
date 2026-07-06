@@ -270,25 +270,41 @@ function useDebouncedQuery(query, delay = TYPEAHEAD_DEBOUNCE_MS) {
 }
 
 function useNodeSearch(uploadId, query, initialOptions) {
-  const [results, setResults] = useState(initialOptions);
+  const [results, setResults] = useState(
+    Array.isArray(initialOptions) ? initialOptions : [],
+  );
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
   const debouncedQuery = useDebouncedQuery(query);
+  const cachedOptions = useMemo(
+    () => (Array.isArray(initialOptions) ? initialOptions : []),
+    [initialOptions],
+  );
+
+  useEffect(() => {
+    if (!debouncedQuery) {
+      setResults(cachedOptions);
+    }
+  }, [cachedOptions, debouncedQuery]);
 
   useEffect(() => {
     let cancelled = false;
     if (!uploadId) {
       setResults([]);
+      setError("");
       return undefined;
     }
     setLoading(true);
+    setError("");
     getNodes(uploadId, debouncedQuery, DEFAULT_TYPEAHEAD_LIMIT)
       .then((res) => {
         if (cancelled) return;
         setResults(Array.isArray(res?.nodes) ? res.nodes : []);
       })
-      .catch(() => {
+      .catch((err) => {
         if (cancelled) return;
-        setResults([]);
+        setResults(!debouncedQuery ? cachedOptions : []);
+        setError(err?.message || "Unable to load node names.");
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -296,15 +312,15 @@ function useNodeSearch(uploadId, query, initialOptions) {
     return () => {
       cancelled = true;
     };
-  }, [uploadId, debouncedQuery]);
+  }, [uploadId, debouncedQuery, cachedOptions]);
 
-  return { results, loading };
+  return { results, loading, error };
 }
 
 function ParamNodeSelector({ param, value, onChange, uploadId, initialNodes }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
-  const { results, loading } = useNodeSearch(uploadId, query, initialNodes);
+  const { results, loading, error } = useNodeSearch(uploadId, query, initialNodes);
 
   // Look up the label for the currently selected index.
   const selectedNode =
@@ -354,9 +370,10 @@ function ParamNodeSelector({ param, value, onChange, uploadId, initialNodes }) {
               className="node-search-input"
               autoFocus
             />
+            {error ? <div className="node-error">{error}</div> : null}
             {loading ? <div className="node-loading">Searching…</div> : null}
             <div className="node-list">
-              {results.length === 0 && !loading ? (
+              {results.length === 0 && !loading && !error ? (
                 <div className="node-loading">No matches.</div>
               ) : null}
               {results.map((node) => (
@@ -397,7 +414,7 @@ function ParamMultiNodeSelector({
   const selectedIndices = Array.isArray(value) ? value : [];
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
-  const { results, loading } = useNodeSearch(uploadId, query, initialNodes);
+  const { results, loading, error } = useNodeSearch(uploadId, query, initialNodes);
 
   // Resolve labels for the selected indices: prefer initialNodes,
   // then fall back to the search results, then a placeholder.
@@ -475,9 +492,10 @@ function ParamMultiNodeSelector({
               className="node-search-input"
               autoFocus
             />
+            {error ? <div className="node-error">{error}</div> : null}
             {loading ? <div className="node-loading">Searching…</div> : null}
             <div className="node-list">
-              {results.length === 0 && !loading ? (
+              {results.length === 0 && !loading && !error ? (
                 <div className="node-loading">No matches.</div>
               ) : null}
               {results.map((node) => (
