@@ -4,11 +4,9 @@ import CytoscapeComponent from "react-cytoscapejs";
 
 const MIN_NODE_SIZE = 10;
 const MAX_NODE_SIZE = 26;
-const MAX_RENDER_EDGES = 600;
-const PRESET_LAYOUT_LIMIT = 80;
 const SMALL_LAYOUT_LIMIT = 1000;
 const MEDIUM_LAYOUT_LIMIT = 5000;
-const LABEL_REDUCTION_LIMIT = 40;
+const LABEL_REDUCTION_LIMIT = 120;
 const FOCUS_ZOOM = 1.6;
 
 const COMMUNITY_COLOR_CACHE = new Map();
@@ -48,12 +46,6 @@ function formatCompact(value) {
   if (!Number.isFinite(numeric)) return "-";
   if (Math.abs(numeric) >= 1000) return numeric.toLocaleString();
   return numeric.toFixed(3);
-}
-
-function compactLabel(label) {
-  const text = String(label || "");
-  if (text.length <= 18) return text;
-  return `${text.slice(0, 9)}...${text.slice(-6)}`;
 }
 
 function stableHue(seed) {
@@ -98,32 +90,8 @@ function buildPresetPosition(index, total, community) {
   };
 }
 
-function buildRankedPresetPosition(index, total, rankScore, isHighlight) {
-  const highlightedCount = Math.min(10, total);
-  if (isHighlight && index < highlightedCount) {
-    const centerOffset = index - (highlightedCount - 1) / 2;
-    return {
-      x: centerOffset * 64,
-      y: -190 - Math.abs(centerOffset) * 7,
-    };
-  }
-
-  const adjustedIndex = Math.max(0, index - highlightedCount);
-  const ring = Math.floor(Math.sqrt(adjustedIndex + 1));
-  const nodesInRing = Math.max(8, ring * 8);
-  const offsetInRing = adjustedIndex - ring * ring;
-  const angle = ((offsetInRing / nodesInRing) * Math.PI * 2) + ring * 0.42;
-  const radius = 82 + ring * 34;
-  const rankLift = (1 - clamp(rankScore, 0, 1)) * 28;
-
-  return {
-    x: Math.cos(angle) * radius,
-    y: Math.sin(angle) * radius + 56 + rankLift,
-  };
-}
-
-function pickLayout(nodeCount, algorithmName, usePresetLayout) {
-  if (usePresetLayout || nodeCount > MEDIUM_LAYOUT_LIMIT) {
+function pickLayout(nodeCount) {
+  if (nodeCount > MEDIUM_LAYOUT_LIMIT) {
     return {
       name: "preset",
       fit: true,
@@ -131,32 +99,6 @@ function pickLayout(nodeCount, algorithmName, usePresetLayout) {
       animate: false,
     };
   }
-
-  if (algorithmName === "bfs") {
-    return {
-      name: "breadthfirst",
-      animate: false,
-      fit: true,
-      padding: 48,
-      directed: true,
-      spacingFactor: 1.25,
-      avoidOverlap: true,
-    };
-  }
-
-  if (algorithmName === "pagerank" || algorithmName === "rwr" || algorithmName === "hits") {
-    return {
-      name: "concentric",
-      animate: false,
-      fit: true,
-      padding: 48,
-      avoidOverlap: true,
-      minNodeSpacing: nodeCount > 120 ? 16 : 22,
-      concentric: (node) => Number(node.data("rankScore")) || 0,
-      levelWidth: () => 0.18,
-    };
-  }
-
   if (nodeCount >= SMALL_LAYOUT_LIMIT) {
     if (FCOSE_AVAILABLE) {
       return {
@@ -182,9 +124,6 @@ function pickLayout(nodeCount, algorithmName, usePresetLayout) {
     animate: false,
     fit: true,
     padding: 32,
-    nodeRepulsion: 12000,
-    idealEdgeLength: 90,
-    numIter: 700,
   };
 }
 
@@ -283,21 +222,18 @@ function buildGuidance(algorithmName) {
 
   return [
     "Node size and color both reflect score strength for fast ranking comparisons.",
-    "Highlighted nodes stay visually separated on dense graphs; hover, click, or search to show labels.",
+    "Highlighted nodes stay labeled on dense graphs so the most important results remain readable.",
     ...common,
   ];
 }
 
 function buildGraphModel(graphData, algorithmName) {
   const nodes = Array.isArray(graphData?.nodes) ? graphData.nodes : [];
-  const rawEdges = Array.isArray(graphData?.edges) ? graphData.edges : [];
-  const edges = rawEdges.slice(0, MAX_RENDER_EDGES);
+  const edges = Array.isArray(graphData?.edges) ? graphData.edges : [];
   const isCluster = algorithmName === "louvain" || algorithmName === "mcl";
   const isBfs = algorithmName === "bfs";
   const isScoreAlgo =
     algorithmName === "pagerank" || algorithmName === "rwr" || algorithmName === "hits";
-  const usePresetLayout =
-    nodes.length > PRESET_LAYOUT_LIMIT && (isScoreAlgo || isCluster);
 
   const finiteScores = nodes
     .map((node) => Number(node.score))
@@ -336,7 +272,7 @@ function buildGraphModel(graphData, algorithmName) {
     neighborMap.get(target)?.add(source);
   }
 
-  const nodeSummaries = nodes.map((node, index) => {
+  const nodeSummaries = nodes.map((node) => {
     const id = String(node.id);
     const label = String(node.label || node.id);
     const score = Number(node.score);
@@ -346,7 +282,6 @@ function buildGraphModel(graphData, algorithmName) {
     const sizeNorm = isBfs ? 1 - scoreNorm : scoreNorm;
     const size = MIN_NODE_SIZE + (MAX_NODE_SIZE - MIN_NODE_SIZE) * sizeNorm;
     const isHighlight = Boolean(node.highlight);
-    const showDefaultLabel = !reduceLabels;
 
     let color = "#2f6f7e";
     if (isCluster) {
@@ -369,8 +304,7 @@ function buildGraphModel(graphData, algorithmName) {
       neighborCount: neighborMap.get(id)?.size || 0,
       size,
       color,
-      rankScore: isBfs ? 1 - scoreNorm : scoreNorm,
-      defaultLabel: showDefaultLabel ? compactLabel(label) : "",
+      defaultLabel: reduceLabels && !isHighlight ? "" : label,
     };
   });
 
@@ -386,21 +320,11 @@ function buildGraphModel(graphData, algorithmName) {
         highlight: node.highlight,
         size: node.size,
         color: node.color,
-        rankScore: node.rankScore,
       },
       classes: node.highlight ? "is-highlight" : "",
     };
 
-    if (usePresetLayout && isScoreAlgo) {
-      element.position = buildRankedPresetPosition(
-        index,
-        nodes.length,
-        node.rankScore,
-        node.highlight,
-      );
-    } else if (usePresetLayout && isCluster) {
-      element.position = buildPresetPosition(index, nodes.length, node.community);
-    } else if (nodes.length > MEDIUM_LAYOUT_LIMIT) {
+    if (nodes.length > MEDIUM_LAYOUT_LIMIT) {
       element.position = buildPresetPosition(index, nodes.length, node.community);
     }
 
@@ -444,26 +368,13 @@ function buildGraphModel(graphData, algorithmName) {
   const stats = [
     { label: "Rendered nodes", value: nodes.length.toLocaleString() },
     { label: "Rendered edges", value: edges.length.toLocaleString() },
-    {
-      label: "Capping",
-      value: [
-        graphData?.node_count_capped ? "Nodes" : "",
-        graphData?.edge_count_capped || rawEdges.length > edges.length ? "Edges" : "",
-      ].filter(Boolean).join(" + ") || "Off",
-    },
+    { label: "Capping", value: graphData?.node_count_capped ? "Active" : "Off" },
   ];
 
   if (graphData?.node_count_capped) {
     stats.push({
       label: "Original nodes",
       value: Number(graphData?.total_nodes_in_graph || 0).toLocaleString(),
-    });
-  }
-
-  if (graphData?.edge_count_capped || rawEdges.length > edges.length) {
-    stats.push({
-      label: "Original edges",
-      value: Number(graphData?.total_edges_in_graph || rawEdges.length).toLocaleString(),
     });
   }
 
@@ -502,15 +413,13 @@ function buildGraphModel(graphData, algorithmName) {
     edgeCount: edges.length,
     nodeCount: nodes.length,
     isCapped: Boolean(graphData?.node_count_capped),
-    isEdgeCapped: Boolean(graphData?.edge_count_capped || rawEdges.length > edges.length),
     totalNodes: Number(graphData?.total_nodes_in_graph || nodes.length),
-    totalEdges: Number(graphData?.total_edges_in_graph || rawEdges.length),
     reduceLabels,
     hasWeightedEdges,
     stats,
     legendItems: buildLegendItems(algorithmName, hasWeightedEdges),
     guidance: buildGuidance(algorithmName),
-    layout: pickLayout(nodes.length, algorithmName, usePresetLayout),
+    layout: pickLayout(nodes.length),
   };
 }
 
@@ -531,8 +440,7 @@ const STYLESHEET = [
       opacity: 1,
       "overlay-opacity": 0,
       "text-wrap": "wrap",
-      "text-max-width": 64,
-      "min-zoomed-font-size": 6,
+      "text-max-width": 72,
       "transition-property": "opacity, border-width, border-color, width, height",
       "transition-duration": "120ms",
     },
@@ -665,7 +573,6 @@ function GraphHighlight({ graphData, algorithmName }) {
   const searchListId = useId();
   const cyRef = useRef(null);
   const flashTimeoutRef = useRef(null);
-  const tooltipFrameRef = useRef(null);
   const graphModelRef = useRef(graphModel);
   const selectedIdRef = useRef(null);
   const hoveredIdRef = useRef(null);
@@ -700,9 +607,6 @@ function GraphHighlight({ graphData, algorithmName }) {
   useEffect(() => () => {
     if (flashTimeoutRef.current) {
       clearTimeout(flashTimeoutRef.current);
-    }
-    if (tooltipFrameRef.current) {
-      cancelAnimationFrame(tooltipFrameRef.current);
     }
   }, []);
 
@@ -950,17 +854,13 @@ function GraphHighlight({ graphData, algorithmName }) {
     });
 
     const syncTooltip = () => {
-      if (tooltipFrameRef.current) return;
-      tooltipFrameRef.current = requestAnimationFrame(() => {
-        tooltipFrameRef.current = null;
-        const activeId = hoveredIdRef.current || selectedIdRef.current;
-        if (activeId) {
-          syncTooltipForNodeId(activeId);
-        }
-      });
+      const activeId = hoveredIdRef.current || selectedIdRef.current;
+      if (activeId) {
+        syncTooltipForNodeId(activeId);
+      }
     };
 
-    cy.on("pan zoom dragfree", syncTooltip);
+    cy.on("pan zoom dragfree render", syncTooltip);
   }
 
   if (graphData?.unsupported || graphModel.nodeCount === 0) {
@@ -981,12 +881,9 @@ function GraphHighlight({ graphData, algorithmName }) {
             <strong>{algorithmName}</strong>.
           </p>
         </div>
-        {graphModel.isCapped || graphModel.isEdgeCapped ? (
+        {graphModel.isCapped ? (
           <span className="graph-preview-warning">
             Showing {graphModel.nodeCount} of {graphModel.totalNodes} nodes
-            {graphModel.isEdgeCapped
-              ? ` and ${graphModel.edgeCount} of ${graphModel.totalEdges} edges`
-              : ""}
           </span>
         ) : null}
       </div>
