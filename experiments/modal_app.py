@@ -228,6 +228,12 @@ def run_benchmark(command: str, mcl_host_avail_gb: int = MCL_HOST_AVAIL_GB) -> N
     # only MCL reads it.
     env = os.environ.copy()
     env["MCL_HOST_AVAIL_BYTES"] = str(mcl_host_avail_gb * 1024**3)
+    # Run each (algorithm, mode) unit in a child process so an OS OOM-kill
+    # (SIGKILL / exit -9) of one unit — e.g. the unbounded CuPy gpu_baseline MCL
+    # on a dense-ing ER graph — is recorded as a failed unit and the sweep
+    # continues, instead of killing the whole command.  Also flushes the CSV
+    # after every unit, so completed results survive a later crash/preemption.
+    env["BENCH_ISOLATE_RUNS"] = "1"
 
     cmd = [sys.executable, script, *args]
     print(f"[modal] running: {' '.join(cmd)}", flush=True)

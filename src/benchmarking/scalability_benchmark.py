@@ -45,9 +45,13 @@ import ctypes
 import ctypes.wintypes as _W
 import csv
 import gc
+import json
 import logging
+import os
 import platform
+import subprocess
 import sys
+import tempfile
 import time
 import traceback
 import tracemalloc
@@ -388,6 +392,92 @@ def _run_once_timed(algorithm: str, mode: str, graph_csr: sp.csr_matrix,
 
 
 # ---------------------------------------------------------------------------
+# Optional per-unit process isolation (survives OS OOM-kill / SIGKILL)
+# ---------------------------------------------------------------------------
+#
+# A run that exhausts host RAM (e.g. the CuPy gpu_baseline MCL densifying an
+# Erdős–Rényi graph) is SIGKILL-ed by the cgroup OOM killer (exit -9).  SIGKILL
+# cannot be caught in-process, so it would take the whole sweep down.  When
+# BENCH_ISOLATE_RUNS=1, each (algorithm, mode) unit runs in a child process via
+# _scalability_run_worker; a killed child is recorded as a failed unit and the
+# sweep continues with the next one.  Off by default → unchanged local
+# behaviour; the Modal wrapper turns it on for the shared-GPU environment.
+_ISOLATE_RUNS: bool = os.environ.get("BENCH_ISOLATE_RUNS", "") == "1"
+# Per-unit wall-clock ceiling for the isolated child (warmup + all timed runs).
+# Generous by default; override with BENCH_ISOLATE_TIMEOUT_S.
+_ISOLATE_TIMEOUT_S: int = int(os.environ.get("BENCH_ISOLATE_TIMEOUT_S", str(60 * 60)))
+
+
+def _run_unit_isolated(
+    algorithm: str,
+    mode: str,
+    graph_npz: str,
+    params: dict,
+    network_type: str,
+    n_warmup: int,
+    n_runs: int,
+) -> tuple[list[float], list[float], str]:
+    """Run one (algorithm, mode) unit in a child process.
+
+    Returns ``(times, mems, note)``.  Raises on any failure — a missing result
+    file (child OOM-killed / SIGKILL-ed / crashed), a non-zero worker exit, a
+    timeout, or an error reported by the worker — so the caller's existing
+    try/except records the unit as failed and moves on to the next one.
+    """
+    cfg = {
+        "graph_npz":    graph_npz,
+        "algorithm":    algorithm,
+        "mode":         mode,
+        "network_type": network_type,
+        "params":       params,
+        "n_warmup":     n_warmup,
+        "n_runs":       n_runs,
+    }
+    fd, cfg_path = tempfile.mkstemp(suffix="_bench_cfg.json")
+    os.close(fd)
+    res_path = cfg_path + ".result"
+    try:
+        with open(cfg_path, "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh)
+
+        cmd = [sys.executable, "-m",
+               "src.benchmarking._scalability_run_worker", cfg_path, res_path]
+        try:
+            proc = subprocess.run(cmd, timeout=_ISOLATE_TIMEOUT_S)
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError(
+                f"isolated run exceeded {_ISOLATE_TIMEOUT_S}s"
+            ) from exc
+
+        if not os.path.exists(res_path):
+            # No result file → the worker died before finishing.  A negative
+            # return code is a signal (e.g. -9 == SIGKILL == OOM killer).
+            rc = proc.returncode
+            reason = (f"killed by signal {-rc}" if rc is not None and rc < 0
+                      else f"exited with code {rc}")
+            raise MemoryError(
+                f"isolated run produced no result ({reason}) — "
+                "likely out-of-memory (OOM killed)"
+            )
+
+        with open(res_path, "r", encoding="utf-8") as fh:
+            out = json.load(fh)
+        if not out.get("ok"):
+            raise RuntimeError(out.get("error") or "isolated run failed")
+        return (
+            [float(x) for x in out.get("times", [])],
+            [float(x) for x in out.get("mems", [])],
+            str(out.get("note", "")),
+        )
+    finally:
+        for p in (cfg_path, res_path):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # Scalability record
 # ---------------------------------------------------------------------------
 
@@ -535,6 +625,15 @@ class ScalabilityBenchmarker:
                 actual_n = int(g.shape[0])
                 actual_m = int(g.nnz)
 
+            # For isolated runs, dump this graph once to a temp .npz so each
+            # child worker can load it by path (no large CSR re-passing).  None
+            # when isolation is off → in-process path uses ``g`` directly.
+            graph_npz_path: Optional[str] = None
+            if _ISOLATE_RUNS:
+                _fd, graph_npz_path = tempfile.mkstemp(suffix="_bench_graph.npz")
+                os.close(_fd)
+                sp.save_npz(graph_npz_path, g)
+
             # ---- Algorithm × mode loop (shared by both paths) --------
             for algorithm in algos:
                 params = dict(_DEFAULT_PARAMS.get(algorithm, {}))
@@ -551,36 +650,54 @@ class ScalabilityBenchmarker:
                               done, total, algorithm, graph_type, mode,
                               actual_n, actual_m)
 
-                    # Warmup — discard results, but log so we can confirm
-                    # the kernel compile / JIT cost is paid before timing.
-                    for _ in range(self.warmup_runs):
-                        _LOG.info("Warmup %s/%s n=%d", algorithm, mode, actual_n)
-                        try:
-                            _run_once_timed(algorithm, mode, g, params)
-                        except Exception:
-                            pass  # warmup failure is non-fatal
-
-                    # Timed runs
                     times: list[float] = []
                     mems:  list[float] = []
                     last_note: str = ""
                     err:   Optional[str] = None
 
-                    for _ in range(self.n_runs):
-                        gc.collect()
+                    if _ISOLATE_RUNS and graph_npz_path is not None:
+                        # Isolated: run warmup + timed runs in a child process
+                        # so an OS OOM-kill (SIGKILL) of this unit does not take
+                        # the whole sweep down — it is recorded as a failure and
+                        # the sweep continues with the next unit.
                         try:
-                            t, mb, note = _run_once_timed(algorithm, mode,
-                                                          g, params)
-                            times.append(t)
-                            mems.append(mb)
-                            if note:
-                                last_note = note
+                            times, mems, last_note = _run_unit_isolated(
+                                algorithm, mode, graph_npz_path, params,
+                                self.network_type,
+                                self.warmup_runs, self.n_runs,
+                            )
                         except Exception as exc:
                             err = f"{type(exc).__name__}: {exc}"
-                            _LOG.warning("%s/%s/%s n=%d: %s",
+                            _LOG.warning("%s/%s/%s n=%d (isolated): %s",
                                          algorithm, graph_type, mode,
                                          actual_n, err)
-                            break
+                    else:
+                        # In-process (default).  Warmup — discard results, but
+                        # log so we can confirm the kernel compile / JIT cost is
+                        # paid before timing.
+                        for _ in range(self.warmup_runs):
+                            _LOG.info("Warmup %s/%s n=%d",
+                                      algorithm, mode, actual_n)
+                            try:
+                                _run_once_timed(algorithm, mode, g, params)
+                            except Exception:
+                                pass  # warmup failure is non-fatal
+
+                        for _ in range(self.n_runs):
+                            gc.collect()
+                            try:
+                                t, mb, note = _run_once_timed(algorithm, mode,
+                                                              g, params)
+                                times.append(t)
+                                mems.append(mb)
+                                if note:
+                                    last_note = note
+                            except Exception as exc:
+                                err = f"{type(exc).__name__}: {exc}"
+                                _LOG.warning("%s/%s/%s n=%d: %s",
+                                             algorithm, graph_type, mode,
+                                             actual_n, err)
+                                break
 
                     if times:
                         self.records.append(ScalabilityRecord(
@@ -606,6 +723,23 @@ class ScalabilityBenchmarker:
                             success=False,
                             error=err,
                         ))
+
+                    # Isolated mode: flush the CSV after every unit so completed
+                    # results are durable if a later unit is OOM-killed or the
+                    # container is preempted.  Cheap (small table, one rewrite).
+                    if _ISOLATE_RUNS:
+                        try:
+                            self.write_csv()
+                        except Exception as exc:            # noqa: BLE001
+                            _LOG.warning("incremental write_csv failed: %s", exc)
+
+            # Remove this graph's temp .npz once every unit has run (isolated
+            # mode only).  Keeps the OS temp dir bounded across the sweep.
+            if graph_npz_path is not None:
+                try:
+                    os.remove(graph_npz_path)
+                except OSError:
+                    pass
 
     # ---- CSV output ----
 
