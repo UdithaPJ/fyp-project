@@ -53,6 +53,18 @@ def _reverse_map(node_index_map: dict | None) -> dict[int, str]:
     return {int(v): str(k) for k, v in node_index_map.items()}
 
 
+def _out_degrees(graph_csr: sp.csr_matrix, n: int) -> np.ndarray | None:
+    """Return a length-``n`` out-degree vector, or ``None`` if unavailable."""
+    if graph_csr is None:
+        return None
+    try:
+        if graph_csr.shape[0] != n:
+            return None
+        return np.asarray(graph_csr.sum(axis=1)).ravel()
+    except Exception:  # noqa: BLE001 - defensive: never break viz on a bad csr
+        return None
+
+
 def _empty_payload(reason: str, total_nodes: int = 0) -> dict:
     return {
         "nodes": [],
@@ -186,6 +198,19 @@ def make_highlight_data(
         selected, score_map, highlight = _select_nodes_score(
             inner, algo, n_total, max_nodes
         )
+        # Directed PageRank: highlight the top *regulators* (out-degree > 0)
+        # among the displayed nodes rather than the top scores overall, which
+        # in a GRN / miRNA graph are dominated by heavily-regulated targets.
+        if algo == "pagerank":
+            nt = str(result.get("network_type", "grn")).lower()
+            if nt in ("grn", "mirna"):
+                deg = _out_degrees(graph_csr, n_total)
+                scores = inner.get("scores", []) or []
+                if deg is not None and len(scores) == n_total:
+                    regs = [i for i in selected if deg[i] > 0]
+                    regs.sort(key=lambda i: scores[i], reverse=True)
+                    if regs:
+                        highlight = set(regs[:10])
     elif algo in _CLUSTER_ALGOS:
         selected, community_map, highlight = _select_nodes_cluster(
             inner, algo, n_total, max_nodes

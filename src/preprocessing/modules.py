@@ -413,6 +413,37 @@ class SchemaDetector:
         "distance",
         "cost",
     }
+    # Columns whose NAME marks them as identifiers, never edge weights.
+    # A numeric identifier column (PMID, Entrez id, publication year, row
+    # index, …) must not be auto-selected as a weight — using it would scale
+    # every edge by an arbitrary id and wreck weighted algorithms.
+    IDENTIFIER_ALIASES = {
+        "id",
+        "identifier",
+        "pmid",
+        "pubmed",
+        "pubmedid",
+        "doi",
+        "entrez",
+        "entrezid",
+        "taxon",
+        "taxonid",
+        "index",
+        "idx",
+        "key",
+        "uuid",
+        "accession",
+        "refseq",
+        "ensembl",
+        "year",
+        "rowid",
+    }
+    # Unambiguous identifier tokens: if they appear anywhere in a normalized
+    # column name it is an identifier regardless of surrounding characters.
+    _IDENTIFIER_TOKENS = ("pmid", "pubmed", "entrez", "accession", "ensembl", "refseq", "taxon")
+    # All-integer numeric columns whose magnitude exceeds this look like ids
+    # (PMIDs, database accessions), not weights/counts/scores.
+    _WEIGHT_MAX_MAGNITUDE = 10_000
 
     def detect(self, dataframe: pd.DataFrame) -> SchemaDetectionResult:
         """Detect graph-relevant columns and return mapping confidence."""
@@ -436,6 +467,12 @@ class SchemaDetector:
         }
         entity_columns = [column for column in columns if not numeric_flags[column]]
         numeric_columns = [column for column in columns if numeric_flags[column]]
+        # A numeric column only counts as weight-like if its VALUES resemble a
+        # weight/score/count rather than an identifier (see _looks_like_weight).
+        weightlike_flags = {
+            column: (numeric_flags[column] and self._looks_like_weight(dataframe[column]))
+            for column in columns
+        }
 
         source_scores = {
             column: self._score_endpoint_column(
@@ -463,6 +500,7 @@ class SchemaDetector:
                 numeric_columns=numeric_columns,
                 total_columns=len(columns),
                 normalized_column=normalized_columns[column],
+                is_weight_shaped=weightlike_flags[column],
             )
             for column in columns
         }
@@ -534,22 +572,86 @@ class SchemaDetector:
         numeric_columns: List[str],
         total_columns: int,
         normalized_column: str,
+        is_weight_shaped: bool,
     ) -> float:
-        """Score a column as a likely edge-weight field."""
+        """Score a column as a likely edge-weight field.
+
+        A weight-like NAME (``weight``, ``score``, ``combined_score``, …) is
+        the strongest signal.  Absent that, a numeric column only earns points
+        when its VALUES resemble a weight rather than an identifier — this is
+        what stops a PMID / database-id / year column from being auto-selected
+        as an edge weight (which would silently scale every edge by an
+        arbitrary id and corrupt weighted algorithms).
+        """
 
         score = 0.0
 
+        name_has_weight = (
+            normalized_column in self.WEIGHT_ALIASES
+            or any(alias in normalized_column for alias in self.WEIGHT_ALIASES)
+        )
         if normalized_column in self.WEIGHT_ALIASES:
             score += 0.95
-        elif any(alias in normalized_column for alias in self.WEIGHT_ALIASES):
+        elif name_has_weight:
             score += 0.75
 
-        if column in numeric_columns:
+        # Identifier-named columns are never weights (unless the name ALSO
+        # carries a weight token, e.g. a hypothetical "score_id").
+        if not name_has_weight and self._is_identifier_name(normalized_column):
+            return 0.0
+
+        # Value-based evidence only when the column actually looks like a
+        # weight — identifier-shaped numerics (large, high-cardinality ints)
+        # contribute nothing, so they cannot cross the auto-select threshold
+        # on numeric-ness alone.
+        if column in numeric_columns and is_weight_shaped:
             score += 0.35
             if total_columns >= 3 and numeric_columns and column == numeric_columns[0]:
                 score += 0.10
 
         return round(min(score, 1.0), 3)
+
+    def _is_identifier_name(self, normalized_column: str) -> bool:
+        """Whether a normalized column name denotes an identifier, not a weight."""
+
+        if normalized_column in self.IDENTIFIER_ALIASES:
+            return True
+        if any(token in normalized_column for token in self._IDENTIFIER_TOKENS):
+            return True
+        # Names like "geneid", "protein_id", "node_id" (normalized: "...id").
+        if len(normalized_column) > 2 and normalized_column.endswith("id"):
+            return True
+        return False
+
+    def _looks_like_weight(self, series: pd.Series) -> bool:
+        """Whether a numeric column's VALUES resemble a weight rather than an id.
+
+        Weight-like: contains fractional values (scores/probabilities), or is
+        a bounded small-magnitude integer column (edge counts, 0–1000 style
+        scores).  Identifier-like (rejected): large-magnitude integers such as
+        PMIDs / Entrez ids / accession numbers, especially when nearly every
+        value is distinct.
+        """
+
+        numeric = pd.to_numeric(series.dropna(), errors="coerce").dropna()
+        if numeric.empty:
+            return False
+
+        # Any non-integer value is characteristic of a weight / score.
+        if (numeric != numeric.round()).any():
+            return True
+
+        # All-integer: separate bounded counts/scores from identifiers.
+        max_abs = float(numeric.abs().max())
+        n = len(numeric)
+        unique_ratio = numeric.nunique() / n if n else 0.0
+
+        if max_abs > self._WEIGHT_MAX_MAGNITUDE:
+            return False
+        # Mid-magnitude but almost entirely unique → id-like (row keys, years).
+        if max_abs > 1_000 and unique_ratio > 0.9:
+            return False
+        return True
 
     def _infer_pair_boosts(
         self,
