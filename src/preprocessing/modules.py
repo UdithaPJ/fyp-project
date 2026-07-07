@@ -115,7 +115,12 @@ class FileLoader:
         candidates = list(cls._CANDIDATE_DELIMITERS)
         try:
             sniffed_delimiter = csv.Sniffer().sniff(sample, delimiters="\t,;|: ").delimiter
-            if sniffed_delimiter not in candidates:
+            # A literal single space is subsumed by r"\s+" (already a
+            # candidate) and strictly worse for whitespace-delimited
+            # files: it splits variable-width runs into extra empty
+            # fields, so skip it rather than let it win the tie against
+            # the regex candidate.
+            if sniffed_delimiter not in candidates and sniffed_delimiter != " ":
                 candidates.insert(0, sniffed_delimiter)
         except csv.Error:
             pass
