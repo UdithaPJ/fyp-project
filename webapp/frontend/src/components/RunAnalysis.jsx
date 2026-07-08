@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import {
+  getResults,
   runAlgorithm,
   streamAlgorithmProgress,
 } from "../services/api";
@@ -88,6 +89,48 @@ function RunAnalysis({ uploadId, algorithmConfig, onBack, onComplete }) {
   // Kick off the job exactly once on mount
   useEffect(() => {
     let cancelled = false;
+    let terminal = false;           // have we already transitioned to done/error?
+    let watchdogTimer = null;
+
+    function finishDone(resultData) {
+      if (cancelled || terminal) return;
+      terminal = true;
+      if (watchdogTimer) { clearTimeout(watchdogTimer); watchdogTimer = null; }
+      setResult(resultData);
+      setProgress((prev) => ({ ...prev, percent: 100, stage: "done" }));
+      setPhase("done");
+    }
+
+    function finishError(message) {
+      if (cancelled || terminal) return;
+      terminal = true;
+      if (watchdogTimer) { clearTimeout(watchdogTimer); watchdogTimer = null; }
+      setError(message);
+      setPhase("error");
+    }
+
+    // Safety net: fetch the finished job directly if the terminal SSE event
+    // is missed or the stream stalls after signalling completion.  Polls
+    // GET /results (which 409s until the job is done) a few times.
+    async function recoverFromServer(id) {
+      for (let attempt = 0; attempt < 30; attempt += 1) {
+        if (cancelled || terminal) return;
+        try {
+          const data = await getResults(id);   // resolves only once finished
+          if (cancelled || terminal) return;
+          if (data.status === "completed" && data.result) {
+            finishDone(data.result);
+          } else if (data.status === "failed") {
+            finishError(data.error || "Algorithm failed.");
+          }
+          return;
+        } catch {
+          // 409 — not finished yet; wait and retry.
+          await new Promise((r) => setTimeout(r, 1000));
+        }
+      }
+    }
+
     async function go() {
       if (!uploadId || !algorithmConfig) {
         setError("Missing upload or algorithm configuration.");
@@ -108,34 +151,38 @@ function RunAnalysis({ uploadId, algorithmConfig, onBack, onComplete }) {
         await streamAlgorithmProgress(
           submitResp.job_id,
           (event) => {
-            if (cancelled) return;
+            if (cancelled || terminal) return;
             setProgress({
               stage:   event.stage   || "running",
               percent: event.percent || 0,
               message: event.message || "",
             });
+            // The algorithm has signalled completion but the terminal result
+            // event hasn't arrived yet — arm a watchdog to fetch it directly
+            // if the stream stalls (guards against a lost/oversized event).
+            if ((event.percent >= 100 || event.stage === "done") && !watchdogTimer) {
+              watchdogTimer = setTimeout(() => {
+                recoverFromServer(submitResp.job_id);
+              }, 4000);
+            }
           },
-          (resultData) => {
-            if (cancelled) return;
-            setResult(resultData);
-            setProgress((prev) => ({ ...prev, percent: 100, stage: "done" }));
-            setPhase("done");
-          },
-          (err) => {
-            if (cancelled) return;
-            setError(err.message);
-            setPhase("error");
-          },
+          (resultData) => finishDone(resultData),
+          (err) => finishError(err.message),
         );
+
+        // Stream closed without a terminal transition — recover from the store.
+        if (!cancelled && !terminal) {
+          await recoverFromServer(submitResp.job_id);
+        }
       } catch (err) {
         if (cancelled) return;
-        setError(err.message);
-        setPhase("error");
+        finishError(err.message);
       }
     }
     go();
     return () => {
       cancelled = true;
+      if (watchdogTimer) clearTimeout(watchdogTimer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

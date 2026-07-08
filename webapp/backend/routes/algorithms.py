@@ -29,7 +29,7 @@ from queue import Empty, Queue
 from threading import Thread
 from time import monotonic
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
 CURRENT_DIR  = Path(__file__).resolve().parent
@@ -54,6 +54,59 @@ except ImportError:  # pragma: no cover - fallback for running from backend dire
 
 
 router = APIRouter(prefix="/algorithms", tags=["algorithms"])
+
+
+# ---------------------------------------------------------------------------
+# Lean terminal-event helper
+# ---------------------------------------------------------------------------
+
+# Per-node / per-edge arrays inside ``result["result"]``.  Their length scales
+# with the graph size, so for a large network (e.g. BioGRID, ~100k+ nodes) the
+# full result dict is a multi-megabyte JSON blob.  Shipping that over the live
+# progress stream forces the browser to buffer and parse a huge NDJSON line
+# mid-stream — the observed failure mode where the UI receives every progress
+# event but never processes the terminal ``result`` on large graphs.
+#
+# The RunAnalysis screen only needs the summary/scalar fields and the small
+# top-k lists; the complete result (including these arrays) is always available
+# via ``GET /results/{job_id}``, which ResultsView fetches separately.
+_HEAVY_RESULT_KEYS = frozenset({
+    "scores", "distances", "visited_order", "community_assignments",
+    "cluster_assignments", "hub_scores", "authority_scores", "cascade_by_depth",
+    # Louvain: per-community member lists and the per-level hierarchy both
+    # scale with graph size; the summary only needs num_communities.
+    "top_communities", "hierarchy",
+})
+
+
+def _lean_result(result: dict) -> dict:
+    """Return a copy of *result* with heavy per-node arrays stripped from its
+    inner ``result`` dict, preserving all summary/scalar fields (and the small
+    top-k lists the progress UI's summary line reads)."""
+    if not isinstance(result, dict):
+        return result
+    inner = result.get("result")
+    if not isinstance(inner, dict):
+        return result
+
+    lean_inner: dict = {}
+    for key, value in inner.items():
+        # Also drop the "<field>_indices" companions that `_attach_labels`
+        # mirrors onto index-bearing fields (e.g. visited_order_indices).
+        base = key[:-8] if key.endswith("_indices") else key
+        if base in _HEAVY_RESULT_KEYS:
+            # Preserve a count where the UI derives one from the dropped array.
+            if base == "visited_order" and "num_reached" not in inner:
+                try:
+                    lean_inner["num_reached"] = len(value)
+                except TypeError:
+                    pass
+            continue
+        lean_inner[key] = value
+
+    lean = dict(result)
+    lean["result"] = lean_inner
+    return lean
 
 
 # ---------------------------------------------------------------------------
@@ -85,14 +138,20 @@ def algorithm_catalog() -> list[dict]:
 @router.post("/run", response_model=JobStatusResponse, status_code=202)
 def run_algorithm(
     payload: RunAlgorithmRequest,
-    background_tasks: BackgroundTasks,
 ) -> JobStatusResponse:
     """
-    Submit an algorithm job for background execution.
+    Register an algorithm job and return its ``job_id`` immediately.
 
-    Returns immediately with ``status=pending`` and a ``job_id``.  Clients
-    can then poll ``GET /algorithms/status/{job_id}`` or subscribe to the
-    SSE stream at ``GET /algorithms/run/stream/{job_id}``.
+    Returns with ``status=pending`` and a ``job_id``.  The job is **not**
+    executed here — the client must open the SSE stream at
+    ``GET /algorithms/run/stream/{job_id}``, which runs the job exactly once
+    and streams its progress.
+
+    Rationale: this endpoint previously *also* kicked off the job via
+    ``BackgroundTasks``, while the stream endpoint runs it too.  That meant
+    the same job executed twice, concurrently, on the same ``job_id`` — two
+    full GPU runs contending for VRAM (fatal for large graphs on a 6 GB card)
+    and racing on shared job state.  The stream is now the single executor.
 
     HTTP 202 (Accepted) signals that the request was received but the
     computation has not yet completed.
@@ -123,16 +182,10 @@ def run_algorithm(
         params=payload.params or {},
     )
 
-    background_tasks.add_task(
-        run_algorithm_job,
-        job_id=job_id,
-        upload_id=payload.upload_id,
-        algorithm_name=payload.algorithm,
-        mode=payload.mode,
-        params=payload.params or {},
-        progress_callback=None,  # no SSE stream for plain /run
-    )
-
+    # NOTE: execution is deliberately NOT started here.  The SSE stream
+    # endpoint (`/algorithms/run/stream/{job_id}`) is the single executor —
+    # see the docstring above.  Starting a background task here as well would
+    # run the job twice concurrently.
     job = result_store.get_job(job_id)
     return JobStatusResponse(**job)
 
@@ -176,7 +229,7 @@ def stream_algorithm(job_id: str) -> StreamingResponse:
     if job["status"] in ("completed", "failed"):
         def _already_done():
             if job["status"] == "completed":
-                yield json.dumps({"type": "result", "data": job["result"]}).encode() + b"\n"
+                yield json.dumps({"type": "result", "data": _lean_result(job["result"])}).encode() + b"\n"
             else:
                 yield json.dumps({"type": "error", "message": job.get("error", "unknown error")}).encode() + b"\n"
         return StreamingResponse(_already_done(), media_type="application/x-ndjson")
@@ -255,6 +308,12 @@ def stream_algorithm(job_id: str) -> StreamingResponse:
                     "percent": event.get("percent", last_progress.get("percent", 0)),
                     "message": event.get("message", last_progress.get("message", "")),
                 }
+            elif isinstance(event, dict) and event.get("type") == "result":
+                # Strip heavy per-node arrays before serialising — keeps the
+                # terminal event small even for very large graphs.  Covers both
+                # the reporter.done() result and the worker's status-check
+                # result, since both flow through this loop.
+                event = {"type": "result", "data": _lean_result(event.get("data"))}
 
             yield json.dumps(event).encode() + b"\n"
             last_emit = monotonic()
