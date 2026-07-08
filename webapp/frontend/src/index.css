@@ -1039,6 +1039,14 @@ select {
   text-align: center;
 }
 
+.node-error {
+  padding: 10px 12px;
+  color: #9e2232;
+  background: #fff1f3;
+  border-bottom: 1px solid #f0c7cf;
+  font-size: 0.82rem;
+}
+
 /* ----- Multi-node pills ----- */
 
 .selected-nodes-pills {
