@@ -1,7 +1,43 @@
-igraph==1.0.0
-numpy==2.4.2
-pandas==3.0.0
-python-dateutil==2.9.0.post0
-scipy==1.17.0
-six==1.17.0
-texttable==1.7.0
+--extra-index-url=https://pypi.nvidia.com
+
+# =============================================================================
+# FYP Unified Project — Requirements
+# All processing is local; no cloud dependencies.
+# =============================================================================
+
+# -- Web Framework (FastAPI backend) ------------------------------------------
+fastapi
+uvicorn
+python-multipart
+
+# -- Data Processing -----------------------------------------------------------
+pandas
+openpyxl
+numpy
+scipy
+networkx
+python-graphblas
+
+# -- GPU Acceleration (optional — requires CUDA-capable NVIDIA GPU) -----------
+# Install the variant matching your CUDA version, e.g.:
+#   pip install cupy-cuda11x   (CUDA 11.x)
+#   pip install cupy-cuda12x   (CUDA 12.x)
+# cupy-cuda11x
+pycuda
+cupy-cuda12x
+cugraph-cu12
+# pycuda
+
+# -- Visualization ------------------------------------------------------------
+matplotlib
+seaborn
+
+pytest
+
+# -- Frontend Build -----------------------------------------------------------
+# The React/Vite frontend lives in webapp/frontend/.
+# Run: npm install  (once)
+#      npm run dev  (development server)
+#      npm run build  (production build)
+# Node.js >= 18 required.
+##
