@@ -322,6 +322,21 @@ function TableView({ tableData, algorithmName, rawResult, jobParams }) {
   }
 
   if (algorithmName === "pagerank" || algorithmName === "rwr") {
+    // Directed PageRank (GRN / miRNA) tags each row with a regulator/target
+    // role; surface it as a column so a top-ranked node isn't mistaken for a
+    // driver when it is actually a heavily-regulated target.
+    const hasRole =
+      algorithmName === "pagerank" &&
+      Array.isArray(tableData) &&
+      tableData.some((row) => row && row.role != null);
+    const columns = [
+      { key: "rank", label: "Rank" },
+      { key: "node_label", label: "Node" },
+      { key: "score", label: "Score", render: (v) => scoreCell(v) },
+    ];
+    if (hasRole) {
+      columns.push({ key: "role", label: "Role" });
+    }
     return (
       <SimpleTable
         caption={
@@ -329,11 +344,7 @@ function TableView({ tableData, algorithmName, rawResult, jobParams }) {
             ? `Top-k Results: [ ${jobParams.top_k} ]`
             : "Top-ranked nodes by score."
         }
-        columns={[
-          { key: "rank", label: "Rank" },
-          { key: "node_label", label: "Node" },
-          { key: "score", label: "Score", render: (v) => scoreCell(v) },
-        ]}
+        columns={columns}
         rows={tableData}
       />
     );

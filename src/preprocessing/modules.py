@@ -40,8 +40,39 @@ class FileLoader:
     # OPTIMIZED (upload-time): candidate separators considered when
     # sniffing an unknown (.txt/.tab) delimiter from a small sample,
     # instead of parsing the whole file with the slow python engine.
+    # ``r"\s+"`` (a regex, matched literally further below rather than
+    # escaped) covers whitespace-separated formats such as STRING's
+    # PPI export ("protein1 protein2 combined_score").
     _SNIFF_SAMPLE_BYTES = 8192
-    _CANDIDATE_DELIMITERS = ["\t", ",", ";", "|"]
+    _CANDIDATE_DELIMITERS = ["\t", ",", ";", "|", ":", r"\s+"]
+    # Characters that legitimately occur inside identifiers/values and
+    # must never be guessed as a delimiter just because they appear in
+    # the header (gene/protein IDs commonly contain these).
+    _DELIMITER_EXCLUDE_CHARS = set("_.-'\"")
+
+    @classmethod
+    def _split_line(cls, line: str, delimiter: str) -> List[str]:
+        """Split one sample line on ``delimiter`` (plain char or regex)."""
+
+        pattern = delimiter if delimiter == r"\s+" else re.escape(delimiter)
+        return re.split(pattern, line.strip())
+
+    @classmethod
+    def _header_derived_candidates(cls, header: str) -> List[str]:
+        """Discover extra delimiter candidates from punctuation in the header.
+
+        Lets detection handle separators outside the fixed shortlist
+        (e.g. ``~``, ``#``, ``@``) instead of only recognising a
+        hardcoded set of "known" delimiters.
+        """
+
+        found: List[str] = []
+        for ch in header:
+            if ch.isalnum() or ch.isspace() or ch in cls._DELIMITER_EXCLUDE_CHARS:
+                continue
+            if ch not in found:
+                found.append(ch)
+        return found
 
     @classmethod
     def _sniff_delimiter(cls, sample: str) -> str:
@@ -51,25 +82,78 @@ class FileLoader:
         delimiter but forces the pure-Python parser across the *entire*
         file, which is 10-20x slower than the C engine on large files.
         Sniffing a small sample lets the fast C engine handle the actual
-        parse for the common case (tab/comma/semicolon/pipe-separated
-        edge lists).
+        parse for the common case.
+
+        Every candidate — including csv.Sniffer's guess — is validated
+        by checking that it splits the header into the SAME number of
+        fields as every sampled data row. A delimiter that "looks
+        standard" but disagrees with the header/data-row column count is
+        rejected, so this generalises to whatever a given file actually
+        uses (whitespace runs, colons, arbitrary punctuation) rather than
+        only a hardcoded shortlist. Among candidates that pass, the one
+        producing the most columns wins.
         """
 
-        try:
-            dialect = csv.Sniffer().sniff(sample, delimiters="\t,;|")
-            return dialect.delimiter
-        except csv.Error:
-            pass
-
-        lines = [line for line in sample.splitlines() if line.strip()][:5]
+        lines = [line for line in sample.splitlines() if line.strip()]
         if not lines:
             return ","
-        counts = {
-            delimiter: min(line.count(delimiter) for line in lines)
-            for delimiter in cls._CANDIDATE_DELIMITERS
-        }
-        best_delimiter, best_count = max(counts.items(), key=lambda kv: kv[1])
-        return best_delimiter if best_count > 0 else ","
+        header, *data_lines = lines
+        data_lines = data_lines[:9] or [header]
+
+        def consistent_column_count(delimiter: str) -> Optional[int]:
+            try:
+                expected = len(cls._split_line(header, delimiter))
+            except re.error:
+                return None
+            if expected < 2:
+                return None
+            for line in data_lines:
+                if len(cls._split_line(line, delimiter)) != expected:
+                    return None
+            return expected
+
+        candidates = list(cls._CANDIDATE_DELIMITERS)
+        try:
+            sniffed_delimiter = csv.Sniffer().sniff(sample, delimiters="\t,;|: ").delimiter
+            # A literal single space is subsumed by r"\s+" (already a
+            # candidate) and strictly worse for whitespace-delimited
+            # files: it splits variable-width runs into extra empty
+            # fields, so skip it rather than let it win the tie against
+            # the regex candidate.
+            if sniffed_delimiter not in candidates and sniffed_delimiter != " ":
+                candidates.insert(0, sniffed_delimiter)
+        except csv.Error:
+            pass
+        for ch in cls._header_derived_candidates(header):
+            if ch not in candidates:
+                candidates.append(ch)
+
+        best_delimiter: Optional[str] = None
+        best_columns = 1  # must beat a trivial single-column split
+        for delimiter in candidates:
+            columns = consistent_column_count(delimiter)
+            if columns is not None and columns > best_columns:
+                best_delimiter, best_columns = delimiter, columns
+
+        return best_delimiter if best_delimiter is not None else ","
+
+    @staticmethod
+    def _sep_read_kwargs(detected_sep: str, chunksize: Optional[int] = None) -> dict:
+        """Build ``pd.read_csv`` kwargs appropriate for a detected separator.
+
+        Regex separators (currently only ``r"\\s+"``) aren't supported by
+        pandas' C engine and reject the ``low_memory`` kwarg under the
+        Python engine, so the two paths need slightly different kwargs.
+        """
+
+        kwargs: dict = {"sep": detected_sep}
+        if chunksize is not None:
+            kwargs["chunksize"] = chunksize
+        if detected_sep == r"\s+":
+            kwargs["engine"] = "python"
+        else:
+            kwargs["low_memory"] = True
+        return kwargs
 
     def load(self, file_path: str | Path) -> pd.DataFrame:
         """Load a CSV, TSV, TXT, Excel, or JSON file."""
@@ -158,7 +242,7 @@ class FileLoader:
             detected_sep = self._sniff_delimiter(sample)
             try:
                 return pd.read_csv(
-                    path, sep=detected_sep, chunksize=chunksize, low_memory=True
+                    path, **self._sep_read_kwargs(detected_sep, chunksize=chunksize)
                 )
             except Exception:
                 # Fall back to the slow-but-robust auto-detecting parser.
@@ -167,7 +251,6 @@ class FileLoader:
                     sep=None,
                     engine="python",
                     chunksize=chunksize,
-                    low_memory=True,
                 )
 
         raise ValueError(
@@ -189,9 +272,9 @@ class FileLoader:
                     return pd.DataFrame()
                 detected_sep = self._sniff_delimiter(sample)
                 try:
-                    return pd.read_csv(path, sep=detected_sep, low_memory=True)
+                    return pd.read_csv(path, **self._sep_read_kwargs(detected_sep))
                 except Exception:
-                    return pd.read_csv(path, sep=None, engine="python", low_memory=True)
+                    return pd.read_csv(path, sep=None, engine="python")
             # OPTIMIZED: keep the default fast CSV engine for known delimiters.
             return pd.read_csv(path, sep=sep, low_memory=True)
         except pd.errors.EmptyDataError:
@@ -214,11 +297,11 @@ class FileLoader:
                 detected_sep = self._sniff_delimiter(sample)
                 try:
                     return pd.read_csv(
-                        io.BytesIO(content), sep=detected_sep, low_memory=True
+                        io.BytesIO(content), **self._sep_read_kwargs(detected_sep)
                     )
                 except Exception:
                     return pd.read_csv(
-                        io.BytesIO(content), sep=None, engine="python", low_memory=True
+                        io.BytesIO(content), sep=None, engine="python"
                     )
             # OPTIMIZED: keep the default fast CSV engine for known delimiters.
             return pd.read_csv(io.BytesIO(content), sep=sep, low_memory=True)
@@ -335,6 +418,37 @@ class SchemaDetector:
         "distance",
         "cost",
     }
+    # Columns whose NAME marks them as identifiers, never edge weights.
+    # A numeric identifier column (PMID, Entrez id, publication year, row
+    # index, …) must not be auto-selected as a weight — using it would scale
+    # every edge by an arbitrary id and wreck weighted algorithms.
+    IDENTIFIER_ALIASES = {
+        "id",
+        "identifier",
+        "pmid",
+        "pubmed",
+        "pubmedid",
+        "doi",
+        "entrez",
+        "entrezid",
+        "taxon",
+        "taxonid",
+        "index",
+        "idx",
+        "key",
+        "uuid",
+        "accession",
+        "refseq",
+        "ensembl",
+        "year",
+        "rowid",
+    }
+    # Unambiguous identifier tokens: if they appear anywhere in a normalized
+    # column name it is an identifier regardless of surrounding characters.
+    _IDENTIFIER_TOKENS = ("pmid", "pubmed", "entrez", "accession", "ensembl", "refseq", "taxon")
+    # All-integer numeric columns whose magnitude exceeds this look like ids
+    # (PMIDs, database accessions), not weights/counts/scores.
+    _WEIGHT_MAX_MAGNITUDE = 10_000
 
     def detect(self, dataframe: pd.DataFrame) -> SchemaDetectionResult:
         """Detect graph-relevant columns and return mapping confidence."""
@@ -358,6 +472,12 @@ class SchemaDetector:
         }
         entity_columns = [column for column in columns if not numeric_flags[column]]
         numeric_columns = [column for column in columns if numeric_flags[column]]
+        # A numeric column only counts as weight-like if its VALUES resemble a
+        # weight/score/count rather than an identifier (see _looks_like_weight).
+        weightlike_flags = {
+            column: (numeric_flags[column] and self._looks_like_weight(dataframe[column]))
+            for column in columns
+        }
 
         source_scores = {
             column: self._score_endpoint_column(
@@ -385,6 +505,7 @@ class SchemaDetector:
                 numeric_columns=numeric_columns,
                 total_columns=len(columns),
                 normalized_column=normalized_columns[column],
+                is_weight_shaped=weightlike_flags[column],
             )
             for column in columns
         }
@@ -456,22 +577,86 @@ class SchemaDetector:
         numeric_columns: List[str],
         total_columns: int,
         normalized_column: str,
+        is_weight_shaped: bool,
     ) -> float:
-        """Score a column as a likely edge-weight field."""
+        """Score a column as a likely edge-weight field.
+
+        A weight-like NAME (``weight``, ``score``, ``combined_score``, …) is
+        the strongest signal.  Absent that, a numeric column only earns points
+        when its VALUES resemble a weight rather than an identifier — this is
+        what stops a PMID / database-id / year column from being auto-selected
+        as an edge weight (which would silently scale every edge by an
+        arbitrary id and corrupt weighted algorithms).
+        """
 
         score = 0.0
 
+        name_has_weight = (
+            normalized_column in self.WEIGHT_ALIASES
+            or any(alias in normalized_column for alias in self.WEIGHT_ALIASES)
+        )
         if normalized_column in self.WEIGHT_ALIASES:
             score += 0.95
-        elif any(alias in normalized_column for alias in self.WEIGHT_ALIASES):
+        elif name_has_weight:
             score += 0.75
 
-        if column in numeric_columns:
+        # Identifier-named columns are never weights (unless the name ALSO
+        # carries a weight token, e.g. a hypothetical "score_id").
+        if not name_has_weight and self._is_identifier_name(normalized_column):
+            return 0.0
+
+        # Value-based evidence only when the column actually looks like a
+        # weight — identifier-shaped numerics (large, high-cardinality ints)
+        # contribute nothing, so they cannot cross the auto-select threshold
+        # on numeric-ness alone.
+        if column in numeric_columns and is_weight_shaped:
             score += 0.35
             if total_columns >= 3 and numeric_columns and column == numeric_columns[0]:
                 score += 0.10
 
         return round(min(score, 1.0), 3)
+
+    def _is_identifier_name(self, normalized_column: str) -> bool:
+        """Whether a normalized column name denotes an identifier, not a weight."""
+
+        if normalized_column in self.IDENTIFIER_ALIASES:
+            return True
+        if any(token in normalized_column for token in self._IDENTIFIER_TOKENS):
+            return True
+        # Names like "geneid", "protein_id", "node_id" (normalized: "...id").
+        if len(normalized_column) > 2 and normalized_column.endswith("id"):
+            return True
+        return False
+
+    def _looks_like_weight(self, series: pd.Series) -> bool:
+        """Whether a numeric column's VALUES resemble a weight rather than an id.
+
+        Weight-like: contains fractional values (scores/probabilities), or is
+        a bounded small-magnitude integer column (edge counts, 0–1000 style
+        scores).  Identifier-like (rejected): large-magnitude integers such as
+        PMIDs / Entrez ids / accession numbers, especially when nearly every
+        value is distinct.
+        """
+
+        numeric = pd.to_numeric(series.dropna(), errors="coerce").dropna()
+        if numeric.empty:
+            return False
+
+        # Any non-integer value is characteristic of a weight / score.
+        if (numeric != numeric.round()).any():
+            return True
+
+        # All-integer: separate bounded counts/scores from identifiers.
+        max_abs = float(numeric.abs().max())
+        n = len(numeric)
+        unique_ratio = numeric.nunique() / n if n else 0.0
+
+        if max_abs > self._WEIGHT_MAX_MAGNITUDE:
+            return False
+        # Mid-magnitude but almost entirely unique → id-like (row keys, years).
+        if max_abs > 1_000 and unique_ratio > 0.9:
+            return False
+        return True
 
     def _infer_pair_boosts(
         self,

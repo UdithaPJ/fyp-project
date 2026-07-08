@@ -23,6 +23,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
+
 _SCORE_ALGOS   = {"pagerank", "hits", "rwr"}
 _CLUSTER_ALGOS = {"louvain", "mcl"}
 
@@ -31,6 +33,25 @@ def _reverse_map(node_index_map: dict | None) -> dict[int, str]:
     if not node_index_map:
         return {}
     return {int(v): str(k) for k, v in node_index_map.items()}
+
+
+def _out_degrees(graph_csr: Any, n: int) -> np.ndarray | None:
+    """Return a length-``n`` out-degree vector, or ``None`` if unavailable.
+
+    Used to split a directed GRN / miRNA graph into regulators
+    (out-degree > 0) and pure targets (out-degree == 0) so PageRank
+    visualisations can honour the network-type semantics.  Weighted sum so
+    weighted graphs are handled; a positive value means the node has at
+    least one out-edge.
+    """
+    if graph_csr is None:
+        return None
+    try:
+        if graph_csr.shape[0] != n:
+            return None
+        return np.asarray(graph_csr.sum(axis=1)).ravel()
+    except Exception:  # noqa: BLE001 - defensive: never break viz on a bad csr
+        return None
 
 
 def _unsupported(reason: str) -> dict:
@@ -54,12 +75,21 @@ def make_score_chart_data(
     result: dict,
     node_index_map: dict | None = None,
     top_k: int = 20,
+    graph_csr: Any = None,
 ) -> dict:
     """
     Build a top-K bar chart from a score-producing algorithm result.
 
     Works for pagerank, hits (hub scores), rwr.  HITS additionally
     exposes an authority-score series under ``series_auth``.
+
+    Network-type aware: for a directed GRN / miRNA PageRank result the bars
+    are ranked among **regulators** (out-degree > 0) — the top TFs / miRNAs —
+    and the title reflects that, rather than presenting the top-scoring nodes
+    overall (which in a GRN are dominated by heavily-regulated *target*
+    genes).  ``graph_csr`` supplies the out-degrees needed for that split;
+    when it is absent the ranking falls back to all nodes with an honest
+    "nodes" title (never the misleading "regulators" label).
     """
     algo = result.get("algorithm")
     if algo not in _SCORE_ALGOS:
@@ -69,6 +99,7 @@ def make_score_chart_data(
 
     inner = result.get("result", {})
     reverse = _reverse_map(node_index_map)
+    network_type = str(result.get("network_type", "grn")).lower()
 
     if algo == "hits":
         hub  = inner.get("hub_scores", []) or []
@@ -77,6 +108,18 @@ def make_score_chart_data(
             return _unsupported("hits result has no hub_scores")
         order = sorted(range(len(hub)), key=lambda i: hub[i], reverse=True)[:top_k]
         labels = [reverse.get(int(i), f"node_{i}") for i in order]
+        # PPI symmetrises the graph, so hub_scores == authority_scores; a
+        # second identical series would just be visual noise.  Only GRN /
+        # miRNA (directed) carry a meaningful hub-vs-authority distinction.
+        if network_type == "ppi":
+            return {
+                "chart_type": "bar",
+                "labels":     labels,
+                "values":     [float(hub[i]) for i in order],
+                "title":      f"Top {len(order)} nodes (HITS)",
+                "x_label":    "Node",
+                "y_label":    "Centrality score",
+            }
         return {
             "chart_type": "bar",
             "labels":     labels,
@@ -90,17 +133,56 @@ def make_score_chart_data(
     scores = inner.get("scores", []) or []
     if not scores:
         return _unsupported(f"{algo} result has no scores")
-    order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
 
-    title_by_algo = {
-        "pagerank": f"Top {len(order)} regulators by PageRank",
-        "rwr":      f"Top {len(order)} nodes by RWR proximity",
-    }
+    if algo == "pagerank":
+        return _pagerank_chart(scores, reverse, top_k, network_type, graph_csr)
+
+    # rwr — proximity to the seed set; no regulator/target semantics.
+    order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
     return {
         "chart_type": "bar",
         "labels":     [reverse.get(int(i), f"node_{i}") for i in order],
         "values":     [float(scores[i]) for i in order],
-        "title":      title_by_algo.get(algo, f"Top {len(order)} scores"),
+        "title":      f"Top {len(order)} nodes by RWR proximity",
+        "x_label":    "Node",
+        "y_label":    "Score",
+    }
+
+
+def _pagerank_chart(
+    scores: list[float],
+    reverse: dict[int, str],
+    top_k: int,
+    network_type: str,
+    graph_csr: Any,
+) -> dict:
+    """Network-type-aware PageRank bar chart (see ``make_score_chart_data``)."""
+    n = len(scores)
+
+    # PPI: undirected, all nodes are peers — rank everything.
+    if network_type == "ppi":
+        candidates: list[int] = list(range(n))
+        noun = "nodes"
+    else:
+        # GRN / miRNA: rank among regulators (out-degree > 0) so the chart
+        # actually shows master TFs / miRNAs, matching its title.
+        deg = _out_degrees(graph_csr, n)
+        if deg is None:
+            candidates = list(range(n))
+            noun = "nodes"
+        else:
+            candidates = [i for i in range(n) if deg[i] > 0]
+            noun = "miRNAs" if network_type == "mirna" else "regulators"
+            if not candidates:  # degenerate graph — don't return an empty chart
+                candidates = list(range(n))
+                noun = "nodes"
+
+    order = sorted(candidates, key=lambda i: scores[i], reverse=True)[:top_k]
+    return {
+        "chart_type": "bar",
+        "labels":     [reverse.get(int(i), f"node_{i}") for i in order],
+        "values":     [float(scores[i]) for i in order],
+        "title":      f"Top {len(order)} {noun} by PageRank",
         "x_label":    "Node",
         "y_label":    "Score",
     }

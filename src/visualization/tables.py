@@ -17,10 +17,20 @@ from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
+
 # Algorithms that support each table type
 _SCORE_ALGOS   = {"pagerank", "hits", "rwr"}
 _CLUSTER_ALGOS = {"louvain", "mcl"}
 _CASCADE_ALGOS = {"bfs"}
+
+# Human-readable role labels for directed PageRank results, keyed by
+# network type.  ``(regulator_label, target_label)`` — a node with
+# out-degree > 0 is a regulator, out-degree == 0 is a pure target.
+_PAGERANK_ROLE_LABELS = {
+    "grn":   ("Regulator", "Target"),
+    "mirna": ("miRNA", "Target gene"),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -51,6 +61,23 @@ def _reverse_map(node_index_map: dict | None) -> dict[int, str]:
     return {int(v): str(k) for k, v in node_index_map.items()}
 
 
+def _out_degrees(graph_csr: Any, n: int) -> np.ndarray | None:
+    """Return a length-``n`` out-degree vector, or ``None`` if unavailable.
+
+    Lets the PageRank table tag each ranked node as a regulator
+    (out-degree > 0) or a pure target (out-degree == 0) for directed
+    GRN / miRNA graphs.
+    """
+    if graph_csr is None:
+        return None
+    try:
+        if graph_csr.shape[0] != n:
+            return None
+        return np.asarray(graph_csr.sum(axis=1)).ravel()
+    except Exception:  # noqa: BLE001 - defensive: never break viz on a bad csr
+        return None
+
+
 def _unsupported(reason: str) -> list[dict]:
     """Return a single-row sentinel for unsupported algorithms."""
     return [{"unsupported": True, "reason": reason}]
@@ -64,6 +91,7 @@ def make_top_nodes_table(
     result: dict,
     node_index_map: dict | None = None,
     top_k: int = 10,
+    graph_csr: Any = None,
 ) -> list[dict]:
     """
     Build a ranked-node table from a score-producing algorithm result.
@@ -71,6 +99,14 @@ def make_top_nodes_table(
     Works for pagerank (``scores``), hits (``hub_scores`` + ``authority_scores``),
     and rwr (``scores``).  Returns a list of ``{"rank", "node_label", "score", ...}``
     dicts.  For HITS, hub and authority scores are both included on each row.
+
+    Network-type aware for PageRank: on a directed GRN / miRNA graph each row
+    also carries a ``role`` ("Regulator"/"Target" or "miRNA"/"Target gene")
+    derived from the node's out-degree, so the reader can tell at a glance
+    whether a highly-ranked node is a driver or a heavily-regulated sink
+    (e.g. CDKN1A ranks first by PageRank in TRRUST but is a pure *target*).
+    ``graph_csr`` supplies those out-degrees; without it the ``role`` column
+    is simply omitted.
 
     Returns an "unsupported" sentinel for cluster/cascade algorithms.
     """
@@ -104,15 +140,29 @@ def make_top_nodes_table(
     if not scores:
         return []
     order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
-    return [
-        {
+
+    # For directed PageRank, resolve each node's regulator/target role.
+    role_labels = None
+    degrees = None
+    if algo == "pagerank":
+        network_type = str(result.get("network_type", "grn")).lower()
+        role_labels = _PAGERANK_ROLE_LABELS.get(network_type)
+        if role_labels is not None:
+            degrees = _out_degrees(graph_csr, len(scores))
+
+    rows: list[dict] = []
+    for rank, i in enumerate(order):
+        row = {
             "rank":       rank + 1,
             "node_index": int(i),
             "node_label": reverse.get(int(i), f"node_{i}"),
             "score":      float(scores[i]),
         }
-        for rank, i in enumerate(order)
-    ]
+        if role_labels is not None and degrees is not None:
+            reg_label, tgt_label = role_labels
+            row["role"] = reg_label if degrees[i] > 0 else tgt_label
+        rows.append(row)
+    return rows
 
 
 # ---------------------------------------------------------------------------
