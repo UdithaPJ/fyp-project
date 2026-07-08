@@ -41,7 +41,6 @@ USAGE
   python benchmark/runner.py --algorithm bfs      --dataset trrust --modes cpu_single gpu
 
   python benchmark/runner.py --algorithm mcl --dataset trrust --modes cpu_single
-  python benchmark/runner.py --algorithm mcl --dataset trrust --modes cpu_multi
   python benchmark/runner.py --algorithm mcl --dataset trrust --modes gpu
   python benchmark/runner.py --algorithm mcl --dataset trrust --modes cpu_single gpu
   python benchmark/runner.py --algorithm mcl --dataset trrust --modes cpu_single cpu_multi
